@@ -16,8 +16,8 @@ SUPABASE_STORAGE_BUCKET="resumes"
 # --- Google Configuration ---
 GEMINI_FIRST_API_KEY = os.environ.get("GEMINI_FIRST_API_KEY")
 GEMINI_SECOND_API_KEY = os.environ.get("GEMINI_SECOND_API_KEY")
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
-GEMINI_SECONDARY_MODEL_NAME = "gemini-2.0-flash-lite"
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_SECONDARY_MODEL_NAME = "gemini-2.5-flash-lite"
 
 # --- Resume Scoring Configuration ---
 JOBS_TO_SCORE_PER_RUN = 10 # Limit jobs processed per script execution (respects API limits)

@@ -1,3 +1,122 @@
+Skip to content
+thomasmaerz
+job-scraper
+Repository navigation
+Code
+Pull requests
+Actions
+Projects
+Security
+Insights
+Settings
+Files
+Go to file
+t
+.github
+supabase_setup
+.gitignore
+LICENSE
+README.md
+analyze_jobs.py
+config.py
+custom_resume_generator.py
+job_manager.py
+models.py
+parse_resume_with_ai.py
+pdf_generator.py
+requirements.txt
+resume.pdf
+resume_parser.py
+score_jobs.py
+scraper.py
+supabase_utils.py
+user_agents.py
+job-scraper
+/
+analyze_jobs.py
+in
+main
+
+Edit
+
+Preview
+Indent mode
+
+Spaces
+Indent size
+
+4
+Line wrap mode
+
+No wrap
+Editing analyze_jobs.py file contents
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+ 11
+ 12
+ 13
+ 14
+ 15
+ 16
+ 17
+ 18
+ 19
+ 20
+ 21
+ 22
+ 23
+ 24
+ 25
+ 26
+ 27
+ 28
+ 29
+ 30
+ 31
+ 32
+ 33
+ 34
+ 35
+ 36
+ 37
+ 38
+ 39
+ 40
+ 41
+ 42
+ 43
+ 44
+ 45
+ 46
+ 47
+ 48
+ 49
+ 50
+ 51
+ 52
+ 53
+ 54
+ 55
+ 56
+ 57
+ 58
+ 59
+ 60
+ 61
+ 62
+ 63
+ 64
+ 65
+ 66
+ 67
 import logging
 import json
 import time
@@ -65,130 +184,5 @@ def fetch_unanalyzed_jobs() -> list:
 
 
 def extract_keywords_from_batch(batch: list) -> List[KeywordItem]:
-    """Send a batch of job descriptions to Gemini and extract keywords."""
-    combined = ""
-    for i, job in enumerate(batch):
-        combined += f"\n\n--- JOB {i+1}: {job.get('job_title', 'Unknown')} ---\n{job.get('description', '')}"
-
-    prompt = f"""
-Extract all requested skills, technologies, certifications, and candidate attributes from the following {len(batch)} job description(s).
-
-{combined}
-"""
-
-    try:
-        response = client.models.generate_content(
-            model=config.GEMINI_MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type='application/json',
-                response_schema=KeywordList,
-            )
-        )
-        parsed = KeywordList.model_validate_json(response.text.strip())
-        logging.info(f"Extracted {len(parsed.keywords)} keywords from batch of {len(batch)}")
-        return parsed.keywords
-    except Exception as e:
-        logging.error(f"Error extracting keywords from batch: {e}")
-        return []
-
-
-def aggregate_keywords(all_keywords: List[KeywordItem]) -> dict:
-    """Aggregate keyword counts by (keyword, category)."""
-    counts = defaultdict(int)
-    for item in all_keywords:
-        key = (item.keyword.strip().title(), item.category.strip().lower())
-        counts[key] += 1
-    return counts
-
-
-def upsert_insights(counts: dict):
-    """
-    Increment existing keyword counts rather than wiping and recomputing.
-    """
-    if not counts:
-        logging.warning("No keywords to upsert.")
-        return
-
-    db = supabase_utils.supabase
-
-    # Fetch existing counts for the keywords we're about to upsert
-    keywords_list = [kw for (kw, _) in counts.keys()]
-    existing_response = db.table("keyword_insights") \
-        .select("keyword, category, count") \
-        .in_("keyword", keywords_list) \
-        .execute()
-
-    existing = {}
-    for row in (existing_response.data or []):
-        existing[(row["keyword"], row["category"])] = row["count"]
-
-    rows = []
-    now = datetime.now(timezone.utc).isoformat()
-    for (keyword, category), new_count in counts.items():
-        prior = existing.get((keyword, category), 0)
-        rows.append({
-            "keyword": keyword,
-            "category": category,
-            "count": prior + new_count,
-            "last_updated": now,
-        })
-
-    # Upsert in batches of 100
-    for i in range(0, len(rows), 100):
-        chunk = rows[i:i+100]
-        db.table("keyword_insights") \
-            .upsert(chunk, on_conflict="keyword,category") \
-            .execute()
-
-    logging.info(f"Upserted {len(rows)} keyword insight rows.")
-
-
-def mark_jobs_analyzed(job_ids: list):
-    """Stamp insights_analyzed_at on all processed jobs."""
-    if not job_ids:
-        return
-    now = datetime.now(timezone.utc).isoformat()
-    supabase_utils.supabase.table(config.SUPABASE_TABLE_NAME) \
-        .update({"insights_analyzed_at": now}) \
-        .in_("job_id", job_ids) \
-        .execute()
-    logging.info(f"Marked {len(job_ids)} jobs as analyzed.")
-
-
-def run():
-    logging.info("Starting job insights analysis...")
-
-    jobs = fetch_unanalyzed_jobs()
-    if not jobs:
-        logging.info("No new jobs to analyze. Exiting.")
-        return
-
-    all_keywords = []
-    processed_job_ids = []
-
-    for i in range(0, len(jobs), BATCH_SIZE):
-        batch = jobs[i:i + BATCH_SIZE]
-        logging.info(f"Processing batch {i // BATCH_SIZE + 1} ({len(batch)} jobs)...")
-        keywords = extract_keywords_from_batch(batch)
-        all_keywords.extend(keywords)
-        processed_job_ids.extend(job["job_id"] for job in batch)
-        if i + BATCH_SIZE < len(jobs):
-            logging.info(f"Sleeping {SLEEP_BETWEEN}s before next batch...")
-            time.sleep(SLEEP_BETWEEN)
-
-    logging.info(f"Total keywords extracted: {len(all_keywords)}")
-
-    counts = aggregate_keywords(all_keywords)
-    logging.info(f"Unique keyword/category pairs: {len(counts)}")
-
-    upsert_insights(counts)
-    mark_jobs_analyzed(processed_job_ids)
-
-    logging.info("Insights analysis complete.")
-
-
-if __name__ == "__main__":
-    run()
+Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
+Editing job-scraper/analyze_jobs.py at main · thomasmaerz/job-scraper

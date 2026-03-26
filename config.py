@@ -45,7 +45,7 @@ ACTIVE_CHECK_RETRY_DELAY = 10 # Base delay for retrying active check
 # --- DO NOT MODITY THE ABOVE SECTION ---
 
 # --- LinkedIn Search Configuration ---
-LINKEDIN_SEARCH_QUERIES = [title:("IT Project Manager" OR "Technical Project Manager" OR "Information Technology Project Manager" OR "Technical Program Manager") NOT (Mercor OR "Crossing Hurdles")]
+LINKEDIN_SEARCH_QUERIES = ['title:("IT Project Manager" OR "Technical Project Manager" OR "Information Technology Project Manager" OR "Technical Program Manager") NOT (Mercor OR "Crossing Hurdles")']
 LINKEDIN_LOCATION = "Canada"
 LINKEDIN_GEO_ID = 101174742 # Canada
 LINKEDIN_JOB_TYPE = "F" # Full-time

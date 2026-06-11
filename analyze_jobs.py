@@ -67,16 +67,14 @@ def parse_keyword_response(raw_response: str) -> dict[str, list[KeywordItem]]:
     return {job.job_id: job.keywords for job in parsed.jobs}
 
 
-def fetch_unanalyzed_jobs(db=None, limit=None) -> list:
+def fetch_unanalyzed_jobs(db=None, limit=None, backfill_all: bool = False) -> list:
     db = db or _get_db()
-    query = (
-        db.table(config.SUPABASE_TABLE_NAME)
-        .select("job_id, job_title, description")
-        .eq("is_active", True)
-        .eq("job_state", "new")
-        .is_("insights_analyzed_at", None)
-        .not_.is_("description", None)
-    )
+    query = db.table(config.SUPABASE_TABLE_NAME).select("job_id, job_title, description")
+
+    if not backfill_all:
+        query = query.eq("is_active", True).eq("job_state", "new")
+
+    query = query.is_("insights_analyzed_at", None).not_.is_("description", None)
 
     if limit is None:
         limit = config.JOB_INSIGHTS_MAX_JOBS
@@ -109,7 +107,14 @@ def extract_keywords_from_batch(batch, client=None, max_retries=None) -> dict[st
                 temperature=0.0,
                 response_format=JobKeywordResultList,
             )
-            return parse_keyword_response(raw_response)
+            parsed = parse_keyword_response(raw_response)
+            expected_job_ids = {str(job.get("job_id")) for job in batch if job.get("job_id") is not None}
+            missing_job_ids = sorted(job_id for job_id in expected_job_ids if job_id not in parsed)
+            if missing_job_ids:
+                raise ValueError(
+                    f"Missing keyword results for job_ids: {', '.join(missing_job_ids)}"
+                )
+            return parsed
         except Exception as exc:
             last_error = exc
             logger.warning("Keyword extraction failed on attempt %s: %s", attempt + 1, exc)
@@ -245,7 +250,11 @@ def run(backfill_all: bool = False):
     processed_jobs = 0
 
     while True:
-        jobs = fetch_unanalyzed_jobs(db=db, limit=config.JOB_INSIGHTS_MAX_JOBS)
+        jobs = fetch_unanalyzed_jobs(
+            db=db,
+            limit=config.JOB_INSIGHTS_MAX_JOBS,
+            backfill_all=backfill_all,
+        )
         if not jobs:
             if processed_jobs == 0:
                 logger.info("No unanalyzed jobs found.")

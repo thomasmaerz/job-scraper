@@ -149,6 +149,83 @@ def test_fetch_unanalyzed_jobs_queries_expected_filters():
     assert ("limit", 25) in db.query.calls
 
 
+def test_fetch_unanalyzed_jobs_for_backfill_omits_new_and_active_filters():
+    class FakeQuery:
+        def __init__(self):
+            self.calls = []
+
+        def select(self, value):
+            self.calls.append(("select", value))
+            return self
+
+        def eq(self, key, value):
+            self.calls.append(("eq", key, value))
+            return self
+
+        def is_(self, key, value):
+            self.calls.append(("is_", key, value))
+            return self
+
+        @property
+        def not_(self):
+            self.calls.append(("not_",))
+            return self
+
+        def limit(self, value):
+            self.calls.append(("limit", value))
+            return self
+
+        def execute(self):
+            self.calls.append(("execute",))
+            return SimpleNamespace(data=[])
+
+    class FakeDb:
+        def __init__(self):
+            self.query = FakeQuery()
+
+        def table(self, name):
+            assert name == "jobs"
+            return self.query
+
+    db = FakeDb()
+
+    analyze_jobs.fetch_unanalyzed_jobs(db=db, limit=25, backfill_all=True)
+
+    assert ("is_", "insights_analyzed_at", None) in db.query.calls
+    assert ("is_", "description", None) in db.query.calls
+    assert ("eq", "is_active", True) not in db.query.calls
+    assert ("eq", "job_state", "new") not in db.query.calls
+
+
+def test_extract_keywords_from_batch_raises_if_any_job_id_missing_from_response():
+    class FakeClient:
+        def generate_content(self, **kwargs):
+            return json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "job_id": "1",
+                            "keywords": [
+                                {"keyword": "Python", "category": "technology"},
+                            ],
+                        }
+                    ]
+                }
+            )
+
+    batch = [
+        {"job_id": "1", "job_title": "A", "description": "Needs Python"},
+        {"job_id": "2", "job_title": "B", "description": "Needs SQL"},
+    ]
+
+    try:
+        analyze_jobs.extract_keywords_from_batch(batch, client=FakeClient(), max_retries=1)
+    except ValueError as exc:
+        assert "Missing keyword results for job_ids: 2" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for omitted job_id")
+
+
 def test_mark_jobs_analyzed_updates_timestamp_for_ids():
     calls = []
 
@@ -319,7 +396,11 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     marked = []
 
     monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
-    monkeypatch.setattr(analyze_jobs, "fetch_unanalyzed_jobs", lambda db=None, limit=None: batches.pop(0))
+    monkeypatch.setattr(
+        analyze_jobs,
+        "fetch_unanalyzed_jobs",
+        lambda db=None, limit=None, backfill_all=False: batches.pop(0),
+    )
     monkeypatch.setattr(analyze_jobs, "extract_keywords_from_batch", lambda batch, client=None, max_retries=None: extracted_batches.pop(0))
 
     def fake_upsert_facts(facts, db=None):

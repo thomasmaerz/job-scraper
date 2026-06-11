@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS "public"."jobs" (
     "is_interested" boolean,
     "customized_resume_id" "uuid",
     "provider" "text",
-    "posted_at" timestamp with time zone
+    "posted_at" timestamp with time zone,
+    "insights_analyzed_at" timestamp with time zone
 );
 
 
@@ -560,6 +561,21 @@ CREATE TABLE IF NOT EXISTS "public"."customized_resumes" (
 ALTER TABLE "public"."customized_resumes" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
+    "keyword" text NOT NULL,
+    "category" text NOT NULL,
+    "count" integer DEFAULT 0 NOT NULL,
+    "last_updated" timestamp with time zone DEFAULT now(),
+    CONSTRAINT "keyword_insights_category_check"
+        CHECK ("category" IN ('skill', 'technology', 'certification', 'attribute')),
+    CONSTRAINT "keyword_insights_count_check"
+        CHECK ("count" >= 0)
+);
+
+
+ALTER TABLE "public"."keyword_insights" OWNER TO "postgres";
+
+
 
 
 
@@ -576,6 +592,10 @@ ALTER TABLE "public"."customized_resumes" OWNER TO "postgres";
 
 ALTER TABLE ONLY "public"."customized_resumes"
     ADD CONSTRAINT "customized_resumes_pkey" PRIMARY KEY ("id");
+
+
+ALTER TABLE ONLY "public"."keyword_insights"
+    ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("keyword", "category");
 
 
 
@@ -607,6 +627,9 @@ CREATE INDEX "idx_jobs_job_title" ON "public"."jobs" USING "btree" ("job_title")
 CREATE INDEX "idx_jobs_last_checked" ON "public"."jobs" USING "btree" ("last_checked");
 
 
+CREATE INDEX "idx_jobs_insights_analyzed_at" ON "public"."jobs" USING "btree" ("insights_analyzed_at");
+
+
 
 CREATE INDEX "idx_jobs_resume_score" ON "public"."jobs" USING "btree" ("resume_score");
 
@@ -619,8 +642,17 @@ CREATE INDEX "idx_jobs_scraped_at" ON "public"."jobs" USING "btree" ("scraped_at
 CREATE INDEX "idx_jobs_status" ON "public"."jobs" USING "btree" ("status");
 
 
+CREATE INDEX "idx_keyword_insights_category" ON "public"."keyword_insights" USING "btree" ("category");
+
+
+CREATE INDEX "idx_keyword_insights_count" ON "public"."keyword_insights" USING "btree" ("count" DESC);
+
+
 
 CREATE OR REPLACE TRIGGER "update_customized_resumes_last_updated" BEFORE UPDATE ON "public"."customized_resumes" FOR EACH ROW EXECUTE FUNCTION "public"."update_last_updated_column"();
+
+
+CREATE OR REPLACE TRIGGER "update_keyword_insights_last_updated" BEFORE UPDATE ON "public"."keyword_insights" FOR EACH ROW EXECUTE FUNCTION "public"."update_last_updated_column"();
 
 
 
@@ -630,6 +662,9 @@ ALTER TABLE ONLY "public"."jobs"
 
 
 ALTER TABLE "public"."customized_resumes" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."keyword_insights" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."jobs" ENABLE ROW LEVEL SECURITY;
@@ -711,6 +746,11 @@ GRANT ALL ON FUNCTION "public"."update_last_updated_column"() TO "service_role";
 GRANT ALL ON TABLE "public"."customized_resumes" TO "anon";
 GRANT ALL ON TABLE "public"."customized_resumes" TO "authenticated";
 GRANT ALL ON TABLE "public"."customized_resumes" TO "service_role";
+
+
+GRANT ALL ON TABLE "public"."keyword_insights" TO "anon";
+GRANT ALL ON TABLE "public"."keyword_insights" TO "authenticated";
+GRANT ALL ON TABLE "public"."keyword_insights" TO "service_role";
 
 
 

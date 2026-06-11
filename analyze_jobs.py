@@ -223,13 +223,13 @@ def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], db=None) ->
     return inserted
 
 
-def update_keyword_insights_from_facts(source_facts: list[dict], db=None):
-    if not source_facts:
+def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affected_keys=None):
+    if not source_facts and not affected_keys:
         return
 
     db = db or _get_db()
     timestamp = datetime.now(timezone.utc).isoformat()
-    affected_keys = {(fact["keyword"], fact["category"]) for fact in source_facts}
+    affected_keys = affected_keys or {(fact["keyword"], fact["category"]) for fact in source_facts}
     counts = defaultdict(int)
     offset = 0
     page_size = config.JOB_INSIGHTS_DB_PAGE_SIZE
@@ -257,13 +257,75 @@ def update_keyword_insights_from_facts(source_facts: list[dict], db=None):
             "count": counts[(keyword, category)],
             "last_updated": timestamp,
         }
-        for (keyword, category), count in counts.items()
+        for (keyword, category) in affected_keys
     ]
 
     batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
         db.table("keyword_insights").upsert(batch, on_conflict="keyword,category").execute()
+
+
+def rebuild_keyword_insights(db=None):
+    db = db or _get_db()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    counts = defaultdict(int)
+    offset = 0
+    page_size = config.JOB_INSIGHTS_DB_PAGE_SIZE
+
+    while True:
+        rows = (
+            db.table("job_keyword_insights")
+            .select("keyword, category")
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            break
+
+        for row in rows:
+            counts[(row["keyword"], row["category"])] += 1
+        offset += page_size
+
+    rebuilt_rows = [
+        {
+            "keyword": keyword,
+            "category": category,
+            "count": count,
+            "last_updated": timestamp,
+        }
+        for (keyword, category), count in counts.items()
+    ]
+
+    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
+    for start in range(0, len(rebuilt_rows), batch_size):
+        batch = rebuilt_rows[start : start + batch_size]
+        db.table("keyword_insights").upsert(batch, on_conflict="keyword,category").execute()
+
+    rebuilt_keys = set(counts.keys())
+    existing_keys = set()
+    offset = 0
+    while True:
+        rows = (
+            db.table("keyword_insights")
+            .select("keyword, category")
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            break
+
+        for row in rows:
+            existing_keys.add((row["keyword"], row["category"]))
+        offset += page_size
+
+    stale_keys = existing_keys - rebuilt_keys
+    for keyword, category in stale_keys:
+        db.table("keyword_insights").delete().eq("keyword", keyword).eq("category", category).execute()
 
 
 def mark_jobs_analyzed(job_ids: list, db=None):
@@ -298,7 +360,7 @@ def run(backfill_all: bool = False):
             facts = build_job_keyword_facts(batch, extracted)
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
             replace_job_keyword_facts(analyzed_job_ids, facts, db=db)
-            update_keyword_insights_from_facts(facts, db=db)
+            rebuild_keyword_insights(db=db)
             mark_jobs_analyzed(analyzed_job_ids, db=db)
             processed_jobs += len(analyzed_job_ids)
 

@@ -512,6 +512,272 @@ def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts(
     assert by_key[("PMP", "certification")]["count"] == 1
 
 
+def test_update_keyword_insights_recomputes_removed_keywords_to_zero():
+    upserted = []
+
+    class FactsSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "job_id, keyword, category"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(
+                data=[
+                    {"job_id": "2", "keyword": "Azure", "category": "technology"},
+                ]
+            )
+
+    class KeywordInsightsTable:
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "keyword,category"
+
+            class FakeUpsertQuery:
+                def execute(self_inner):
+                    upserted.extend(rows)
+                    return SimpleNamespace(data=rows)
+
+            return FakeUpsertQuery()
+
+    class JobKeywordInsightsTable:
+        def select(self, value):
+            return FactsSelectQuery().select(value)
+
+    class FakeDb:
+        def table(self, name):
+            if name == "keyword_insights":
+                return KeywordInsightsTable()
+            if name == "job_keyword_insights":
+                return JobKeywordInsightsTable()
+            raise AssertionError(name)
+
+    affected_facts = [
+        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+        {"job_id": "2", "keyword": "Azure", "category": "technology"},
+    ]
+
+    analyze_jobs.update_keyword_insights_from_facts(affected_facts, db=FakeDb())
+
+    by_key = {(row["keyword"], row["category"]): row for row in upserted}
+    assert by_key[("AWS", "technology")]["count"] == 0
+    assert by_key[("Azure", "technology")]["count"] == 1
+
+
+def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
+    operations = []
+
+    class FactsSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(
+                data=[
+                    {"keyword": "SQL", "category": "technology"},
+                    {"keyword": "SQL", "category": "technology"},
+                    {"keyword": "PMP", "category": "certification"},
+                ]
+            )
+
+    class ExistingAggregateSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(
+                data=[
+                    {"keyword": "AWS", "category": "technology"},
+                    {"keyword": "SQL", "category": "technology"},
+                    {"keyword": "PMP", "category": "certification"},
+                ]
+            )
+
+    class DeleteQuery:
+        def __init__(self):
+            self.filters = []
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def execute(self):
+            operations.append(("delete", tuple(self.filters)))
+            return SimpleNamespace(data=[])
+
+    class UpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            operations.append(("upsert", self.rows))
+            return SimpleNamespace(data=self.rows)
+
+    class JobKeywordInsightsTable:
+        def select(self, value):
+            return FactsSelectQuery().select(value)
+
+    class KeywordInsightsTable:
+        def select(self, value):
+            return ExistingAggregateSelectQuery().select(value)
+
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "keyword,category"
+            return UpsertQuery(rows)
+
+        def delete(self):
+            return DeleteQuery()
+
+    class FakeDb:
+        def table(self, name):
+            if name == "job_keyword_insights":
+                return JobKeywordInsightsTable()
+            if name == "keyword_insights":
+                return KeywordInsightsTable()
+            raise AssertionError(name)
+
+    analyze_jobs.rebuild_keyword_insights(db=FakeDb())
+
+    assert operations[0][0] == "upsert"
+    rows = operations[0][1]
+    by_key = {(row["keyword"], row["category"]): row for row in rows}
+    assert by_key[("SQL", "technology")]["count"] == 2
+    assert by_key[("PMP", "certification")]["count"] == 1
+    assert operations[1] == (
+        "delete",
+        (("keyword", "AWS"), ("category", "technology")),
+    )
+
+
+def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeypatch):
+    operations = []
+
+    class FactsSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(data=[{"keyword": "SQL", "category": "technology"}])
+
+    class ExistingAggregateSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(data=[{"keyword": "AWS", "category": "technology"}])
+
+    class DeleteQuery:
+        def __init__(self):
+            self.filters = []
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def execute(self):
+            operations.append(("delete", tuple(self.filters)))
+            return SimpleNamespace(data=[])
+
+    class UpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            operations.append(("upsert", self.rows))
+            raise RuntimeError("upsert interrupted")
+
+    class JobKeywordInsightsTable:
+        def select(self, value):
+            return FactsSelectQuery().select(value)
+
+    class KeywordInsightsTable:
+        def select(self, value):
+            return ExistingAggregateSelectQuery().select(value)
+
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "keyword,category"
+            return UpsertQuery(rows)
+
+        def delete(self):
+            return DeleteQuery()
+
+    class FakeDb:
+        def table(self, name):
+            if name == "job_keyword_insights":
+                return JobKeywordInsightsTable()
+            if name == "keyword_insights":
+                return KeywordInsightsTable()
+            raise AssertionError(name)
+
+    try:
+        analyze_jobs.rebuild_keyword_insights(db=FakeDb())
+    except RuntimeError as exc:
+        assert str(exc) == "upsert interrupted"
+    else:
+        raise AssertionError("Expected interrupted upsert")
+
+    assert operations == [
+        (
+            "upsert",
+            [
+                {
+                    "keyword": "SQL",
+                    "category": "technology",
+                    "count": 1,
+                    "last_updated": operations[0][1][0]["last_updated"],
+                }
+            ],
+        )
+    ]
+
+
 def test_build_job_keyword_facts_uses_job_keyed_results_not_cross_product():
     batch = [
         {"job_id": "1", "job_title": "A", "description": "Needs AWS"},
@@ -541,8 +807,8 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
         {"2": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]},
     ]
     fact_calls = []
+    rebuild_calls = []
     marked = []
-
     monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
     monkeypatch.setattr(
         analyze_jobs,
@@ -556,20 +822,102 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
         return facts
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace_facts)
-    monkeypatch.setattr(analyze_jobs, "update_keyword_insights_from_facts", lambda facts, db=None: None)
+    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: rebuild_calls.append(True))
     monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", lambda job_ids, db=None: marked.append(job_ids))
 
     processed = analyze_jobs.run(backfill_all=True)
 
     assert processed == 2
     assert len(fact_calls) == 2
+    assert rebuild_calls == [True, True]
     assert marked == [["1"], ["2"]]
+
+
+def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(monkeypatch):
+    fetch_batches = [
+        [{"job_id": "1", "job_title": "A", "description": "Needs SQL"}],
+        [{"job_id": "1", "job_title": "A", "description": "Needs SQL"}],
+        [],
+    ]
+    extracted = {"1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]}
+    replace_calls = []
+    rebuild_calls = []
+    mark_calls = []
+    failed_once = {"value": False}
+
+    class FakeDb:
+        pass
+
+    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: FakeDb())
+    monkeypatch.setattr(
+        analyze_jobs,
+        "fetch_unanalyzed_jobs",
+        lambda db=None, limit=None, backfill_all=False: fetch_batches.pop(0),
+    )
+    monkeypatch.setattr(
+        analyze_jobs,
+        "extract_keywords_from_batch",
+        lambda batch, client=None, max_retries=None: extracted,
+    )
+
+    def fake_replace(job_ids, facts, db=None):
+        replace_calls.append((job_ids, facts))
+        return facts
+
+    def fake_rebuild(db=None):
+        rebuild_calls.append(True)
+        if not failed_once["value"]:
+            failed_once["value"] = True
+            raise RuntimeError("crash after replace")
+
+    def fake_mark(job_ids, db=None):
+        mark_calls.append(job_ids)
+
+    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
+    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", fake_rebuild)
+    monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
+
+    try:
+        analyze_jobs.run(backfill_all=True)
+    except RuntimeError as exc:
+        assert str(exc) == "crash after replace"
+    else:
+        raise AssertionError("Expected simulated crash on first rebuild")
+
+    processed = analyze_jobs.run(backfill_all=True)
+
+    assert processed == 1
+    assert len(replace_calls) == 2
+    assert len(rebuild_calls) == 2
+    assert mark_calls == [["1"]]
 
 
 def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
     calls = []
 
-    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
+    class FakePreviousFactsQuery:
+        def select(self, value):
+            assert value == "job_id, keyword, category"
+            return self
+
+        def in_(self, key, values):
+            assert key == "job_id"
+            assert values == ["1"]
+            return self
+
+        def execute(self):
+            return SimpleNamespace(
+                data=[
+                    {"job_id": "1", "keyword": "AWS", "category": "technology"},
+                ]
+            )
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "job_keyword_insights"
+            return FakePreviousFactsQuery()
+
+    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: FakeDb())
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
@@ -589,19 +937,19 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
         calls.append(("replace", job_ids, facts))
         return facts
 
-    def fake_update(facts, db=None):
-        calls.append(("update", facts))
+    def fake_rebuild(db=None):
+        calls.append(("rebuild",))
 
     def fake_mark(job_ids, db=None):
         calls.append(("mark", job_ids))
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
-    monkeypatch.setattr(analyze_jobs, "update_keyword_insights_from_facts", fake_update)
+    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", fake_rebuild)
     monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
 
     processed = analyze_jobs.run(backfill_all=False)
 
     assert processed == 1
     assert calls[0][0] == "replace"
-    assert calls[1][0] == "update"
+    assert calls[1][0] == "rebuild"
     assert calls[2] == ("mark", ["1"])

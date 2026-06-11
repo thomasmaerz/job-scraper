@@ -81,11 +81,28 @@ CREATE TABLE IF NOT EXISTS "public"."jobs" (
     "is_interested" boolean,
     "customized_resume_id" "uuid",
     "provider" "text",
-    "posted_at" timestamp with time zone
+    "posted_at" timestamp with time zone,
+    "is_filtered" boolean DEFAULT false,
+    "filter_reason" "text",
+    "is_entry_level_filtered" boolean DEFAULT false
 );
 
 
 ALTER TABLE "public"."jobs" OWNER TO "postgres";
+
+
+-- Migration: add job filter columns
+ALTER TABLE "public"."jobs"
+    ADD COLUMN IF NOT EXISTS "is_filtered" boolean DEFAULT false,
+    ADD COLUMN IF NOT EXISTS "filter_reason" "text",
+    ADD COLUMN IF NOT EXISTS "is_entry_level_filtered" boolean DEFAULT false;
+
+COMMENT ON COLUMN "public"."jobs"."is_filtered" IS 'True if this job was flagged by the post-scrape filter as irrelevant (wrong domain, non-PM role, etc). Excluded from LLM scoring.';
+COMMENT ON COLUMN "public"."jobs"."filter_reason" IS 'Which filter rule triggered the flag, e.g. "title:construction" or "desc:construction firm". Used for auditing and regex refinement.';
+COMMENT ON COLUMN "public"."jobs"."is_entry_level_filtered" IS 'True if filtered specifically because of an entry-level/coordinator title (regardless of industry). UI can expose these separately — pivot from IT PM to construction coordinator is feasible, PM to construction senior PM is not.';
+
+CREATE INDEX IF NOT EXISTS "idx_jobs_is_filtered" ON "public"."jobs" ("is_filtered");
+CREATE INDEX IF NOT EXISTS "idx_jobs_is_entry_level_filtered" ON "public"."jobs" ("is_entry_level_filtered");
 
 
 COMMENT ON COLUMN "public"."jobs"."job_id" IS 'LinkedIn''s unique job ID (from URN, e.g., ''3884913367'')';

@@ -7,6 +7,15 @@ ADD COLUMN IF NOT EXISTS "insights_analyzed_at" timestamp with time zone;
 ALTER TABLE "public"."jobs"
 ADD COLUMN IF NOT EXISTS "insights_reanalyzed_at" timestamp with time zone;
 
+CREATE OR REPLACE FUNCTION "public"."update_last_updated_column"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+   NEW.last_updated = now();
+   RETURN NEW;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
     "keyword" text NOT NULL,
     "category" text NOT NULL,

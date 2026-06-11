@@ -307,12 +307,12 @@ def test_upsert_job_keyword_facts_ignores_existing_job_keyword_pairs():
 def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
     upserted = []
 
-    class FakeSelectQuery:
+    class FactsSelectQuery:
         def __init__(self):
             self.offset = 0
 
         def select(self, value):
-            assert value == "keyword, category, count"
+            assert value == "job_id, keyword, category"
             return self
 
         def range(self, start, end):
@@ -323,8 +323,17 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
             if self.offset == 0:
                 return SimpleNamespace(
                     data=[
-                        {"keyword": "AWS", "category": "technology", "count": 10},
-                        {"keyword": "PMP", "category": "certification", "count": 4},
+                        *[
+                            {"job_id": str(i), "keyword": "AWS", "category": "technology"}
+                            for i in range(1, 11)
+                        ],
+                        *[
+                            {"job_id": f"p{i}", "keyword": "PMP", "category": "certification"}
+                            for i in range(1, 5)
+                        ],
+                        {"job_id": "11", "keyword": "AWS", "category": "technology"},
+                        {"job_id": "12", "keyword": "AWS", "category": "technology"},
+                        {"job_id": "p5", "keyword": "PMP", "category": "certification"},
                     ]
                 )
             return SimpleNamespace(data=[])
@@ -339,7 +348,7 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
 
     class FakeTable:
         def select(self, value):
-            return FakeSelectQuery().select(value)
+            return FactsSelectQuery().select(value)
 
         def upsert(self, rows, on_conflict):
             assert on_conflict == "keyword,category"
@@ -347,8 +356,92 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
 
     class FakeDb:
         def table(self, name):
-            assert name == "keyword_insights"
-            return FakeTable()
+            if name == "job_keyword_insights":
+                return FakeTable()
+            if name == "keyword_insights":
+                return FakeTable()
+            raise AssertionError(name)
+
+    source_facts = [
+        {"job_id": "11", "keyword": "AWS", "category": "technology"},
+        {"job_id": "12", "keyword": "AWS", "category": "technology"},
+        {"job_id": "p5", "keyword": "PMP", "category": "certification"},
+    ]
+
+    analyze_jobs.update_keyword_insights_from_facts(source_facts, db=FakeDb())
+
+    by_key = {(row["keyword"], row["category"]): row for row in upserted}
+    assert by_key[("AWS", "technology")]["count"] == 12
+    assert by_key[("PMP", "certification")]["count"] == 5
+    assert all("last_updated" in row for row in upserted)
+
+
+def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts():
+    upserted = []
+
+    class KeywordInsightsSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category, count"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[])
+
+    class FactsSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "job_id, keyword, category"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(
+                data=[
+                    {"job_id": "1", "keyword": "AWS", "category": "technology"},
+                    {"job_id": "2", "keyword": "AWS", "category": "technology"},
+                    {"job_id": "2", "keyword": "PMP", "category": "certification"},
+                ]
+            )
+
+    class KeywordInsightsTable:
+        def select(self, value):
+            return KeywordInsightsSelectQuery().select(value)
+
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "keyword,category"
+
+            class FakeUpsertQuery:
+                def execute(self_inner):
+                    upserted.extend(rows)
+                    return SimpleNamespace(data=rows)
+
+            return FakeUpsertQuery()
+
+    class JobKeywordInsightsTable:
+        def select(self, value):
+            return FactsSelectQuery().select(value)
+
+    class FakeDb:
+        def table(self, name):
+            if name == "keyword_insights":
+                return KeywordInsightsTable()
+            if name == "job_keyword_insights":
+                return JobKeywordInsightsTable()
+            raise AssertionError(name)
 
     inserted_facts = [
         {"job_id": "1", "keyword": "AWS", "category": "technology"},
@@ -359,9 +452,8 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
     analyze_jobs.update_keyword_insights_from_facts(inserted_facts, db=FakeDb())
 
     by_key = {(row["keyword"], row["category"]): row for row in upserted}
-    assert by_key[("AWS", "technology")]["count"] == 12
-    assert by_key[("PMP", "certification")]["count"] == 5
-    assert all("last_updated" in row for row in upserted)
+    assert by_key[("AWS", "technology")]["count"] == 2
+    assert by_key[("PMP", "certification")]["count"] == 1
 
 
 def test_build_job_keyword_facts_uses_job_keyed_results_not_cross_product():

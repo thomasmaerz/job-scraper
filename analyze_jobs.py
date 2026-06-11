@@ -191,23 +191,20 @@ def upsert_job_keyword_facts(facts: list[dict], db=None) -> list[dict]:
     return inserted
 
 
-def update_keyword_insights_from_facts(inserted_facts: list[dict], db=None):
-    if not inserted_facts:
+def update_keyword_insights_from_facts(source_facts: list[dict], db=None):
+    if not source_facts:
         return
 
     db = db or _get_db()
     timestamp = datetime.now(timezone.utc).isoformat()
+    affected_keys = {(fact["keyword"], fact["category"]) for fact in source_facts}
     counts = defaultdict(int)
-    for fact in inserted_facts:
-        counts[(fact["keyword"], fact["category"])] += 1
-
-    existing = {}
     offset = 0
     page_size = config.JOB_INSIGHTS_DB_PAGE_SIZE
     while True:
         rows = (
-            db.table("keyword_insights")
-            .select("keyword, category, count")
+            db.table("job_keyword_insights")
+            .select("job_id, keyword, category")
             .range(offset, offset + page_size - 1)
             .execute()
             .data
@@ -216,14 +213,16 @@ def update_keyword_insights_from_facts(inserted_facts: list[dict], db=None):
         if not rows:
             break
         for row in rows:
-            existing[(row["keyword"], row["category"])] = row["count"]
+            key = (row["keyword"], row["category"])
+            if key in affected_keys:
+                counts[key] += 1
         offset += page_size
 
     rows = [
         {
             "keyword": keyword,
             "category": category,
-            "count": existing.get((keyword, category), 0) + count,
+            "count": counts[(keyword, category)],
             "last_updated": timestamp,
         }
         for (keyword, category), count in counts.items()
@@ -265,8 +264,8 @@ def run(backfill_all: bool = False):
             batch = jobs[start : start + batch_size]
             extracted = extract_keywords_from_batch(batch)
             facts = build_job_keyword_facts(batch, extracted)
-            inserted_facts = upsert_job_keyword_facts(facts, db=db)
-            update_keyword_insights_from_facts(inserted_facts, db=db)
+            upsert_job_keyword_facts(facts, db=db)
+            update_keyword_insights_from_facts(facts, db=db)
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
             mark_jobs_analyzed(analyzed_job_ids, db=db)
             processed_jobs += len(analyzed_job_ids)

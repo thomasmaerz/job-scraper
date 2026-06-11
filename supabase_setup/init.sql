@@ -662,10 +662,10 @@ CREATE INDEX "idx_jobs_job_title" ON "public"."jobs" USING "btree" ("job_title")
 CREATE INDEX "idx_jobs_last_checked" ON "public"."jobs" USING "btree" ("last_checked");
 
 
-CREATE INDEX "idx_jobs_insights_analyzed_at" ON "public"."jobs" USING "btree" ("insights_analyzed_at");
+CREATE INDEX IF NOT EXISTS "idx_jobs_insights_analyzed_at" ON "public"."jobs" USING "btree" ("insights_analyzed_at");
 
 
-CREATE INDEX "idx_jobs_insights_reanalyzed_at" ON "public"."jobs" USING "btree" ("insights_reanalyzed_at");
+CREATE INDEX IF NOT EXISTS "idx_jobs_insights_reanalyzed_at" ON "public"."jobs" USING "btree" ("insights_reanalyzed_at");
 
 
 
@@ -680,16 +680,16 @@ CREATE INDEX "idx_jobs_scraped_at" ON "public"."jobs" USING "btree" ("scraped_at
 CREATE INDEX "idx_jobs_status" ON "public"."jobs" USING "btree" ("status");
 
 
-CREATE INDEX "idx_keyword_insights_category" ON "public"."keyword_insights" USING "btree" ("category");
+CREATE INDEX IF NOT EXISTS "idx_keyword_insights_category" ON "public"."keyword_insights" USING "btree" ("category");
 
 
-CREATE INDEX "idx_keyword_insights_count" ON "public"."keyword_insights" USING "btree" ("count" DESC);
+CREATE INDEX IF NOT EXISTS "idx_keyword_insights_count" ON "public"."keyword_insights" USING "btree" ("count" DESC);
 
 
-CREATE INDEX "idx_job_keyword_insights_job_id" ON "public"."job_keyword_insights" USING "btree" ("job_id");
+CREATE INDEX IF NOT EXISTS "idx_job_keyword_insights_job_id" ON "public"."job_keyword_insights" USING "btree" ("job_id");
 
 
-CREATE INDEX "idx_job_keyword_insights_keyword_category" ON "public"."job_keyword_insights" USING "btree" ("keyword", "category");
+CREATE INDEX IF NOT EXISTS "idx_job_keyword_insights_keyword_category" ON "public"."job_keyword_insights" USING "btree" ("keyword", "category");
 
 
 

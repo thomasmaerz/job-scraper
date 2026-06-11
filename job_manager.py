@@ -276,7 +276,7 @@ async def main():
 
     await mark_expired_jobs()
     await check_linkedin_job_activity()
-    await delete_old_inactive_jobs()
+    # await delete_old_inactive_jobs()  # disabled per user request
 
     end_time = time.time()
     logging.info(f"Job Management Script finished in {end_time - start_time:.2f} seconds.")

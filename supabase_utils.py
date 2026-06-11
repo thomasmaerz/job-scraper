@@ -4,6 +4,7 @@ from typing import Optional, Any, Dict
 from models import Resume
 import datetime # Import datetime module
 import logging # Import logging
+import re # Import re for filter pattern matching
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -119,10 +120,112 @@ def save_jobs_to_supabase(jobs_data: list):
         # print(f"Failed data: {processed_jobs_data}")
 
 
+def flag_filtered_jobs() -> int:
+    """
+    Pre-pass filter that scans ALL jobs where is_filtered=False and flags irrelevant ones.
+    Runs against the whole DB (backfill-safe) — jobs already flagged are skipped.
+
+    Filter order (short-circuits on first match per job):
+      1. Company blocklist  → is_filtered=True, filter_reason="company:<pattern>"
+      2. Entry-level title  → is_filtered=True, is_entry_level_filtered=True, filter_reason="title_entry_level:<pattern>"
+      3. Title blocklist    → is_filtered=True, filter_reason="title:<pattern>"
+      4. Desc blocklist     → is_filtered=True, filter_reason="desc:<pattern>"
+
+    Returns count of newly flagged jobs.
+    """
+    batch_size = 1000
+    offset = 0
+    newly_flagged = 0
+
+    company_patterns   = [(p, re.compile(p, re.IGNORECASE)) for p in config.COMPANY_BLOCKLIST]
+    entry_patterns     = [(p, re.compile(p, re.IGNORECASE)) for p in config.TITLE_ENTRY_LEVEL_BLOCKLIST]
+    title_patterns     = [(p, re.compile(p, re.IGNORECASE)) for p in config.TITLE_BLOCKLIST]
+    desc_patterns      = [(p, re.compile(p, re.IGNORECASE)) for p in config.DESC_BLOCKLIST]
+
+    try:
+        while True:
+            response = (
+                supabase.table(config.SUPABASE_TABLE_NAME)
+                .select("job_id, job_title, company, description")
+                .eq("is_filtered", False)
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            batch = response.data
+            if not batch:
+                break
+
+            for job in batch:
+                job_id  = job.get("job_id", "")
+                title   = job.get("job_title") or ""
+                company = job.get("company") or ""
+                desc    = job.get("description") or ""
+
+                flag          = False
+                reason        = None
+                entry_level   = False
+
+                # 1. Company blocklist
+                for raw_pattern, compiled in company_patterns:
+                    if compiled.search(company):
+                        flag   = True
+                        reason = f"company:{raw_pattern}"
+                        break
+
+                # 2. Entry-level title blocklist
+                if not flag:
+                    for raw_pattern, compiled in entry_patterns:
+                        if compiled.search(title):
+                            flag        = True
+                            entry_level = True
+                            reason      = f"title_entry_level:{raw_pattern}"
+                            break
+
+                # 3. Title blocklist
+                if not flag:
+                    for raw_pattern, compiled in title_patterns:
+                        if compiled.search(title):
+                            flag   = True
+                            reason = f"title:{raw_pattern}"
+                            break
+
+                # 4. Description blocklist
+                if not flag:
+                    for raw_pattern, compiled in desc_patterns:
+                        if compiled.search(desc):
+                            flag   = True
+                            reason = f"desc:{raw_pattern}"
+                            break
+
+                if flag:
+                    update_payload = {
+                        "is_filtered": True,
+                        "filter_reason": reason,
+                        "is_entry_level_filtered": entry_level,
+                    }
+                    try:
+                        supabase.table(config.SUPABASE_TABLE_NAME)\
+                                .update(update_payload)\
+                                .eq("job_id", job_id)\
+                                .execute()
+                        newly_flagged += 1
+                        logging.info(f"Filtered job {job_id} [{company}] '{title}' — reason: {reason}")
+                    except Exception as e:
+                        logging.error(f"Failed to update filter flag for job_id {job_id}: {e}")
+
+            offset += batch_size
+
+    except Exception as e:
+        logging.error(f"Error during flag_filtered_jobs scan: {e}")
+
+    logging.info(f"flag_filtered_jobs complete. Newly flagged: {newly_flagged}")
+    return newly_flagged
+
+
 def get_jobs_to_score(limit: int) -> list:
     """
     Fetches jobs from the Supabase 'jobs' table that need scoring.
-    Filters by is_active = true and resume_score = null.
+    Filters by is_active = true, resume_score = null, and is_filtered = false.
     Selects only necessary fields (job_id, job_title, description).
     Orders by scraped_at ascending to process older jobs first.
     """
@@ -136,6 +239,7 @@ def get_jobs_to_score(limit: int) -> list:
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
                            .select("job_id, job_title, company, description, level")\
                            .eq("is_active", True)\
+                           .eq("is_filtered", False)\
                            .is_("resume_score", None)\
                            .order("scraped_at", desc=False)\
                            .limit(limit)\

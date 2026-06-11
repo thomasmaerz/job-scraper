@@ -277,6 +277,11 @@ def main():
     logging.info("--- Starting Job Scoring Script ---")
     overall_start_time = time.time()
 
+    # --- Pre-pass: Flag irrelevant jobs before any LLM scoring ---
+    logging.info("--- Pre-pass: Flagging filtered jobs ---")
+    flagged_count = supabase_utils.flag_filtered_jobs()
+    logging.info(f"Pre-pass complete. {flagged_count} job(s) newly flagged as filtered.")
+
     # --- Phase 1: Initial Scoring with Default Resume ---
     logging.info("--- Phase 1: Initial Scoring with Default Resume ---")
     initial_score_start_time = time.time()

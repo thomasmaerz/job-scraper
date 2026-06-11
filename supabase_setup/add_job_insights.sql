@@ -4,6 +4,9 @@
 ALTER TABLE "public"."jobs"
 ADD COLUMN IF NOT EXISTS "insights_analyzed_at" timestamp with time zone;
 
+ALTER TABLE "public"."jobs"
+ADD COLUMN IF NOT EXISTS "insights_reanalyzed_at" timestamp with time zone;
+
 CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
     "keyword" text NOT NULL,
     "category" text NOT NULL,
@@ -28,6 +31,9 @@ CREATE TABLE IF NOT EXISTS "public"."job_keyword_insights" (
 
 CREATE INDEX IF NOT EXISTS "idx_jobs_insights_analyzed_at"
 ON "public"."jobs" USING btree ("insights_analyzed_at");
+
+CREATE INDEX IF NOT EXISTS "idx_jobs_insights_reanalyzed_at"
+ON "public"."jobs" USING btree ("insights_reanalyzed_at");
 
 CREATE INDEX IF NOT EXISTS "idx_keyword_insights_category"
 ON "public"."keyword_insights" USING btree ("category");

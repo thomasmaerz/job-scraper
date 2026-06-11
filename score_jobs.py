@@ -9,7 +9,7 @@ import os
 
 import config
 import supabase_utils
-from llm_client import primary_client
+from llm_client import job_scoring_client
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -139,8 +139,9 @@ def get_resume_score_from_ai(resume_text: str, job_details: Dict[str, Any]) -> O
 
     try:
         logging.info(f"Requesting score for job_id: {job_details.get('job_id')}")
-        score_text = primary_client.generate_content(
+        score_text = job_scoring_client.generate_content(
             prompt=prompt,
+            reasoning_effort="medium",
         )
 
         # Attempt to parse the score

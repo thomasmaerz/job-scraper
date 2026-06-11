@@ -80,6 +80,7 @@ class LLMClient:
         retry_base_delay: int = 10,
         daily_budget: int = 0,
         request_delay: float = 0,
+        model_chain: Optional[list[str]] = None,
     ):
         """
         Initialize the LLM client.
@@ -99,6 +100,7 @@ class LLMClient:
         self.retry_base_delay = retry_base_delay
         self.daily_budget = daily_budget
         self.request_delay = request_delay
+        self.model_chain = model_chain
         self.rate_limiter = RateLimiter(max_rpm)
 
         # Daily budget tracking
@@ -147,9 +149,10 @@ class LLMClient:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
-        temperature: float = 1,
+        temperature: Optional[float] = None,
         response_format: Optional[Type[BaseModel]] = None,
         model_override: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
         """
         Generate content using the configured LLM.
@@ -178,10 +181,10 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
 
         # Build base kwargs for litellm.completion
-        base_kwargs = {
-            "messages": messages,
-            "temperature": temperature,
-        }
+        base_kwargs = {"messages": messages}
+
+        if temperature is not None:
+            base_kwargs["temperature"] = temperature
 
         # Add API key if set
         if self.api_key:
@@ -191,19 +194,24 @@ class LLMClient:
         if response_format is not None:
             base_kwargs["response_format"] = response_format
 
+        if reasoning_effort is not None:
+            base_kwargs["reasoning_effort"] = reasoning_effort
+
         last_exception = None
 
-        is_dynamic_gemini = model.lower() in ("gemini", "google")
-        gemini_pool = [
+        is_dynamic_gemini = model.lower() in ("gemini", "google") and not self.model_chain and not model_override
+        gemini_pool = self.model_chain or [
             "gemini/gemini-3.1-flash-lite-preview",
             "gemini/gemini-3-flash-preview",
             "gemini/gemini-2.5-flash",
             "gemini/gemini-2.5-flash-lite",
         ]
         pool_index = 0
-        
+
+        use_model_pool = (bool(self.model_chain) and not model_override) or is_dynamic_gemini
+
         # Ensure we retry enough times to try all models in the pool if dynamic
-        max_attempts = max(self.max_retries + 1, len(gemini_pool)) if is_dynamic_gemini else self.max_retries + 1
+        max_attempts = max(self.max_retries + 1, len(gemini_pool)) if use_model_pool else self.max_retries + 1
 
         for attempt in range(max_attempts):
             try:
@@ -214,7 +222,7 @@ class LLMClient:
                 if self.request_delay > 0 and attempt == 0:
                     time.sleep(self.request_delay)
                     
-                current_model = gemini_pool[pool_index % len(gemini_pool)] if is_dynamic_gemini else model
+                current_model = gemini_pool[pool_index % len(gemini_pool)] if use_model_pool else model
                 kwargs = base_kwargs.copy()
                 kwargs["model"] = current_model
 
@@ -243,7 +251,7 @@ class LLMClient:
                 ])
 
                 if is_rate_limit and attempt < max_attempts - 1:
-                    if is_dynamic_gemini:
+                    if use_model_pool:
                         pool_index += 1
                         delay = random.uniform(1, 4) # Short delay when switching models
                         logger.warning(
@@ -273,6 +281,7 @@ class LLMClient:
 def _create_client(
     model: str,
     api_key: Optional[str] = None,
+    model_chain: Optional[list[str]] = None,
 ) -> LLMClient:
     """Create an LLMClient instance with config-based defaults."""
     return LLMClient(
@@ -283,6 +292,7 @@ def _create_client(
         retry_base_delay=config.LLM_RETRY_BASE_DELAY,
         daily_budget=config.LLM_DAILY_REQUEST_BUDGET,
         request_delay=config.LLM_REQUEST_DELAY_SECONDS,
+        model_chain=model_chain,
     )
 
 
@@ -292,4 +302,16 @@ def _create_client(
 primary_client = _create_client(
     model=config.LLM_MODEL,
     api_key=config.LLM_API_KEY,
+)
+
+job_scoring_client = _create_client(
+    model=config.LLM_MODEL,
+    api_key=config.LLM_API_KEY,
+    model_chain=config.JOB_SCORING_MODEL_CHAIN,
+)
+
+job_insights_client = _create_client(
+    model=config.LLM_MODEL,
+    api_key=config.LLM_API_KEY,
+    model_chain=config.JOB_INSIGHTS_MODEL_CHAIN,
 )

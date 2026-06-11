@@ -191,6 +191,38 @@ def upsert_job_keyword_facts(facts: list[dict], db=None) -> list[dict]:
     return inserted
 
 
+def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], db=None) -> list[dict]:
+    db = db or _get_db()
+
+    if job_ids:
+        db.table("job_keyword_insights").delete().in_("job_id", job_ids).execute()
+
+    if not facts:
+        return []
+
+    deduped = []
+    seen = set()
+    for fact in facts:
+        key = (fact["job_id"], fact["keyword"], fact["category"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(fact)
+
+    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
+    inserted = []
+    for start in range(0, len(deduped), batch_size):
+        batch = deduped[start : start + batch_size]
+        response = (
+            db.table("job_keyword_insights")
+            .upsert(batch, on_conflict="job_id,keyword,category")
+            .execute()
+        )
+        inserted.extend(response.data or [])
+
+    return inserted
+
+
 def update_keyword_insights_from_facts(source_facts: list[dict], db=None):
     if not source_facts:
         return
@@ -264,9 +296,9 @@ def run(backfill_all: bool = False):
             batch = jobs[start : start + batch_size]
             extracted = extract_keywords_from_batch(batch)
             facts = build_job_keyword_facts(batch, extracted)
-            upsert_job_keyword_facts(facts, db=db)
-            update_keyword_insights_from_facts(facts, db=db)
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
+            replace_job_keyword_facts(analyzed_job_ids, facts, db=db)
+            update_keyword_insights_from_facts(facts, db=db)
             mark_jobs_analyzed(analyzed_job_ids, db=db)
             processed_jobs += len(analyzed_job_ids)
 

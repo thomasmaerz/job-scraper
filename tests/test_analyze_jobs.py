@@ -304,6 +304,62 @@ def test_upsert_job_keyword_facts_ignores_existing_job_keyword_pairs():
     assert inserted == [{"job_id": "1", "keyword": "AWS", "category": "technology"}]
 
 
+def test_replace_job_keyword_facts_replaces_existing_rows_for_job_ids():
+    calls = []
+    inserted_rows = []
+
+    class FakeDeleteQuery:
+        def delete(self):
+            calls.append(("delete",))
+            return self
+
+        def in_(self, key, values):
+            calls.append(("in_", key, values))
+            return self
+
+        def execute(self):
+            calls.append(("delete_execute",))
+            return SimpleNamespace(data=[])
+
+    class FakeUpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            inserted_rows.extend(self.rows)
+            calls.append(("upsert_execute",))
+            return SimpleNamespace(data=self.rows)
+
+    class FakeTable:
+        def delete(self):
+            return FakeDeleteQuery().delete()
+
+        def upsert(self, rows, on_conflict):
+            calls.append(("upsert", on_conflict, rows))
+            assert on_conflict == "job_id,keyword,category"
+            return FakeUpsertQuery(rows)
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "job_keyword_insights"
+            return FakeTable()
+
+    facts = [
+        {"job_id": "1", "keyword": "SQL", "category": "technology"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+    ]
+
+    inserted = analyze_jobs.replace_job_keyword_facts(["1"], facts, db=FakeDb())
+
+    assert calls[0] == ("delete",)
+    assert calls[1] == ("in_", "job_id", ["1"])
+    assert calls[2] == ("delete_execute",)
+    assert calls[3][0] == "upsert"
+    assert calls[4] == ("upsert_execute",)
+    assert inserted == inserted_rows
+    assert inserted == facts
+
+
 def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
     upserted = []
 
@@ -495,11 +551,11 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     )
     monkeypatch.setattr(analyze_jobs, "extract_keywords_from_batch", lambda batch, client=None, max_retries=None: extracted_batches.pop(0))
 
-    def fake_upsert_facts(facts, db=None):
+    def fake_replace_facts(job_ids, facts, db=None):
         fact_calls.append(facts)
         return facts
 
-    monkeypatch.setattr(analyze_jobs, "upsert_job_keyword_facts", fake_upsert_facts)
+    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace_facts)
     monkeypatch.setattr(analyze_jobs, "update_keyword_insights_from_facts", lambda facts, db=None: None)
     monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", lambda job_ids, db=None: marked.append(job_ids))
 
@@ -508,3 +564,44 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     assert processed == 2
     assert len(fact_calls) == 2
     assert marked == [["1"], ["2"]]
+
+
+def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
+    monkeypatch.setattr(
+        analyze_jobs,
+        "fetch_unanalyzed_jobs",
+        lambda db=None, limit=None, backfill_all=False: [
+            {"job_id": "1", "job_title": "A", "description": "Needs SQL"}
+        ],
+    )
+    monkeypatch.setattr(
+        analyze_jobs,
+        "extract_keywords_from_batch",
+        lambda batch, client=None, max_retries=None: {
+            "1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]
+        },
+    )
+
+    def fake_replace(job_ids, facts, db=None):
+        calls.append(("replace", job_ids, facts))
+        return facts
+
+    def fake_update(facts, db=None):
+        calls.append(("update", facts))
+
+    def fake_mark(job_ids, db=None):
+        calls.append(("mark", job_ids))
+
+    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
+    monkeypatch.setattr(analyze_jobs, "update_keyword_insights_from_facts", fake_update)
+    monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
+
+    processed = analyze_jobs.run(backfill_all=False)
+
+    assert processed == 1
+    assert calls[0][0] == "replace"
+    assert calls[1][0] == "update"
+    assert calls[2] == ("mark", ["1"])

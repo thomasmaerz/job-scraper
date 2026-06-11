@@ -9,7 +9,7 @@ This project is a comprehensive suite of tools designed to automate and enhance 
   - Extracts text from PDF resumes using `pdfplumber`. ([resume_parser.py](resume_parser.py))
   - Utilizes Google Gemini AI to parse resume text into structured data ([parse_resume_with_ai.py](parse_resume_with_ai.py))
 - **Job Scoring**: Scores job descriptions against a parsed resume using AI to determine suitability. ([score_jobs.py](score_jobs.py))
-- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. ([analyze_jobs.py](analyze_jobs.py))
+- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. Scheduled runs analyze only new unanalyzed jobs; manual replacement backfill is available for one-time reanalysis of previously analyzed jobs. ([analyze_jobs.py](analyze_jobs.py))
 - **Universal LLM Support**: Supports 400+ model providers (Gemini, OpenAI, Anthropic, Ollama, Groq, etc.) via a unified abstraction layer. ([llm_client.py](llm_client.py))
 - **Job Management**:
   - Tracks the status of job applications.
@@ -19,7 +19,7 @@ This project is a comprehensive suite of tools designed to automate and enhance 
 - **Data Storage**: Uses Supabase to store job data, resume details, and application statuses. (Utility functions in [supabase_utils.py](supabase_utils.py))
 - **Custom PDF Resume Generation**: Generates ATS-friendly PDF resumes from structured resume data. ([pdf_generator.py](pdf_generator.py))
 - **AI-Powered Text Processing**: Leverages any configured LLM for tasks like resume parsing and job description formatting.
-- **Quota Management**: Built-in rate limiting, exponential backoff, and daily budget tracking for LLM API calls. Features dynamic model rotation (e.g., automatically switching between Gemini models) to bypass rate limitations.
+- **Quota Management**: Built-in rate limiting, exponential backoff, and daily budget tracking for LLM API calls. Features task-specific Gemini fallback chains for job scoring and job insights extraction.
 - **Automated Workflows**: Includes optimized GitHub Actions for running tasks on a schedule without exhausting quotas. ([workflows](.github/workflows/))
 
 ## Tech Stack
@@ -51,7 +51,8 @@ This project is designed to run primarily through GitHub Actions. Follow these s
     - Go to [Supabase](https://supabase.com/) and create a new project.
     - Once your project is created, navigate to the "SQL Editor" section.
     - Open the `supabase_setup/init.sql` file from this repository, copy its content, and run it in your Supabase SQL Editor. This will set up the necessary tables (like `jobs`, `customized_resumes`, `keyword_insights`, `job_keyword_insights`, and `base_resume`) and storage buckets (`resumes`, `personalized_resumes`).
-    - If you already have an existing Supabase project using an older schema, run `supabase_setup/add_job_insights.sql` once in the Supabase SQL Editor to add `jobs.insights_analyzed_at`, `keyword_insights`, and `job_keyword_insights`.
+    - If you already have an existing Supabase project using an older schema, run `supabase_setup/add_job_insights.sql` once in the Supabase SQL Editor to add `jobs.insights_analyzed_at`, `jobs.insights_reanalyzed_at`, `keyword_insights`, and `job_keyword_insights`.
+    - Scheduled `Analyze Job Insights` runs only process new unanalyzed jobs. Use the manual `replacement_backfill` workflow input only when you explicitly want a one-time reanalysis of previously analyzed jobs.
 
 3.  **Obtain API Keys for Your LLM Provider:**
     - Get API key(s) from your chosen provider (e.g., [Google AI Studio](https://aistudio.google.com/app/apikey), [OpenAI](https://platform.openai.com/api-keys), [Anthropic](https://console.anthropic.com/), etc.).

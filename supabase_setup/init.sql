@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS "public"."jobs" (
     "provider" "text",
     "posted_at" timestamp with time zone,
     "insights_analyzed_at" timestamp with time zone,
+    "insights_reanalyzed_at" timestamp with time zone,
     "is_filtered" boolean DEFAULT false,
     "filter_reason" "text",
     "is_entry_level_filtered" boolean DEFAULT false
@@ -662,6 +663,9 @@ CREATE INDEX "idx_jobs_last_checked" ON "public"."jobs" USING "btree" ("last_che
 
 
 CREATE INDEX "idx_jobs_insights_analyzed_at" ON "public"."jobs" USING "btree" ("insights_analyzed_at");
+
+
+CREATE INDEX "idx_jobs_insights_reanalyzed_at" ON "public"."jobs" USING "btree" ("insights_reanalyzed_at");
 
 
 

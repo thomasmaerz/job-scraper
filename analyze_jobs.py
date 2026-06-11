@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel
 
 import config
-from llm_client import primary_client
+from llm_client import job_insights_client
 
 
 logger = logging.getLogger(__name__)
@@ -67,14 +67,19 @@ def parse_keyword_response(raw_response: str) -> dict[str, list[KeywordItem]]:
     return {job.job_id: job.keywords for job in parsed.jobs}
 
 
-def fetch_unanalyzed_jobs(db=None, limit=None, backfill_all: bool = False) -> list:
+def fetch_unanalyzed_jobs(db=None, limit=None, backfill_all: bool = False, replacement_backfill: bool = False) -> list:
     db = db or _get_db()
     query = db.table(config.SUPABASE_TABLE_NAME).select("job_id, job_title, description")
 
-    if not backfill_all:
+    if not backfill_all and not replacement_backfill:
         query = query.eq("is_active", True).eq("job_state", "new")
 
-    query = query.is_("insights_analyzed_at", None).not_.is_("description", None)
+    if replacement_backfill:
+        query = query.not_.is_("insights_analyzed_at", None).is_("insights_reanalyzed_at", None)
+    else:
+        query = query.is_("insights_analyzed_at", None)
+
+    query = query.not_.is_("description", None)
 
     if limit is None:
         limit = config.JOB_INSIGHTS_MAX_JOBS
@@ -83,7 +88,7 @@ def fetch_unanalyzed_jobs(db=None, limit=None, backfill_all: bool = False) -> li
 
 
 def extract_keywords_from_batch(batch, client=None, max_retries=None) -> dict[str, list[KeywordItem]]:
-    client = client or primary_client
+    client = client or job_insights_client
     max_retries = config.JOB_INSIGHTS_MAX_RETRIES if max_retries is None else max_retries
 
     prompt_lines = [
@@ -104,7 +109,7 @@ def extract_keywords_from_batch(batch, client=None, max_retries=None) -> dict[st
             raw_response = client.generate_content(
                 prompt=prompt,
                 system_prompt=SYSTEM_PROMPT,
-                temperature=0.0,
+                reasoning_effort="low",
                 response_format=JobKeywordResultList,
             )
             parsed = parse_keyword_response(raw_response)
@@ -328,17 +333,20 @@ def rebuild_keyword_insights(db=None):
         db.table("keyword_insights").delete().eq("keyword", keyword).eq("category", category).execute()
 
 
-def mark_jobs_analyzed(job_ids: list, db=None):
+def mark_jobs_analyzed(job_ids: list, db=None, replacement_backfill: bool = False):
     if not job_ids:
         return
 
     db = db or _get_db()
-    db.table(config.SUPABASE_TABLE_NAME).update(
-        {"insights_analyzed_at": datetime.now(timezone.utc).isoformat()}
-    ).in_("job_id", job_ids).execute()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    payload = {"insights_analyzed_at": timestamp}
+    if replacement_backfill:
+        payload["insights_reanalyzed_at"] = timestamp
+
+    db.table(config.SUPABASE_TABLE_NAME).update(payload).in_("job_id", job_ids).execute()
 
 
-def run(backfill_all: bool = False):
+def run(backfill_all: bool = False, replacement_backfill: bool = False):
     db = _get_db()
     processed_jobs = 0
 
@@ -347,6 +355,7 @@ def run(backfill_all: bool = False):
             db=db,
             limit=config.JOB_INSIGHTS_MAX_JOBS,
             backfill_all=backfill_all,
+            replacement_backfill=replacement_backfill,
         )
         if not jobs:
             if processed_jobs == 0:
@@ -361,13 +370,16 @@ def run(backfill_all: bool = False):
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
             replace_job_keyword_facts(analyzed_job_ids, facts, db=db)
             rebuild_keyword_insights(db=db)
-            mark_jobs_analyzed(analyzed_job_ids, db=db)
+            mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill)
             processed_jobs += len(analyzed_job_ids)
 
-        if not backfill_all:
+        if not backfill_all and not replacement_backfill:
             return processed_jobs
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run(backfill_all=os.getenv("JOB_INSIGHTS_BACKFILL_ALL", "false").lower() == "true")
+    run(
+        backfill_all=os.getenv("JOB_INSIGHTS_BACKFILL_ALL", "false").lower() == "true",
+        replacement_backfill=os.getenv("JOB_INSIGHTS_REPLACEMENT_BACKFILL", "false").lower() == "true",
+    )

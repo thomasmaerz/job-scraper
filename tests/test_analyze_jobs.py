@@ -92,7 +92,8 @@ def test_extract_keywords_from_batch_uses_llm_client_response_format():
         ]
     }
     assert len(calls) == 1
-    assert calls[0]["temperature"] == 0.0
+    assert "temperature" not in calls[0]
+    assert calls[0]["reasoning_effort"] == "low"
     assert calls[0]["response_format"] is analyze_jobs.JobKeywordResultList
     assert "Project Manager" in calls[0]["prompt"]
     assert "Must know Agile and Python." in calls[0]["prompt"]
@@ -197,6 +198,60 @@ def test_fetch_unanalyzed_jobs_for_backfill_omits_new_and_active_filters():
     assert ("eq", "job_state", "new") not in db.query.calls
 
 
+def test_fetch_jobs_for_replacement_backfill_selects_previously_analyzed_jobs():
+    class FakeQuery:
+        def __init__(self):
+            self.calls = []
+
+        def select(self, value):
+            self.calls.append(("select", value))
+            return self
+
+        def eq(self, key, value):
+            self.calls.append(("eq", key, value))
+            return self
+
+        def is_(self, key, value):
+            self.calls.append(("is_", key, value))
+            return self
+
+        @property
+        def not_(self):
+            self.calls.append(("not_",))
+            return self
+
+        def limit(self, value):
+            self.calls.append(("limit", value))
+            return self
+
+        def execute(self):
+            self.calls.append(("execute",))
+            return SimpleNamespace(data=[])
+
+    class FakeDb:
+        def __init__(self):
+            self.query = FakeQuery()
+
+        def table(self, name):
+            assert name == "jobs"
+            return self.query
+
+    db = FakeDb()
+
+    analyze_jobs.fetch_unanalyzed_jobs(
+        db=db,
+        limit=25,
+        replacement_backfill=True,
+    )
+
+    assert ("eq", "is_active", True) not in db.query.calls
+    assert ("eq", "job_state", "new") not in db.query.calls
+    analyzed_idx = db.query.calls.index(("is_", "insights_analyzed_at", None))
+    assert db.query.calls[analyzed_idx - 1] == ("not_",)
+    assert ("is_", "insights_reanalyzed_at", None) in db.query.calls
+    assert ("is_", "description", None) in db.query.calls
+
+
 def test_extract_keywords_from_batch_raises_if_any_job_id_missing_from_response():
     class FakeClient:
         def generate_content(self, **kwargs):
@@ -251,6 +306,36 @@ def test_mark_jobs_analyzed_updates_timestamp_for_ids():
 
     assert calls[0][0] == "update"
     assert "insights_analyzed_at" in calls[0][1]
+    assert calls[1] == ("in_", "job_id", ["1", "2"])
+    assert calls[2] == ("execute",)
+
+
+def test_mark_jobs_analyzed_sets_reanalyzed_timestamp_for_replacement_backfill():
+    calls = []
+
+    class FakeQuery:
+        def update(self, payload):
+            calls.append(("update", payload))
+            return self
+
+        def in_(self, key, values):
+            calls.append(("in_", key, values))
+            return self
+
+        def execute(self):
+            calls.append(("execute",))
+            return SimpleNamespace(data=[])
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "jobs"
+            return FakeQuery()
+
+    analyze_jobs.mark_jobs_analyzed(["1", "2"], db=FakeDb(), replacement_backfill=True)
+
+    assert calls[0][0] == "update"
+    assert "insights_analyzed_at" in calls[0][1]
+    assert "insights_reanalyzed_at" in calls[0][1]
     assert calls[1] == ("in_", "job_id", ["1", "2"])
     assert calls[2] == ("execute",)
 
@@ -813,7 +898,7 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
-        lambda db=None, limit=None, backfill_all=False: batches.pop(0),
+        lambda db=None, limit=None, backfill_all=False, replacement_backfill=False: batches.pop(0),
     )
     monkeypatch.setattr(analyze_jobs, "extract_keywords_from_batch", lambda batch, client=None, max_retries=None: extracted_batches.pop(0))
 
@@ -823,7 +908,11 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace_facts)
     monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: rebuild_calls.append(True))
-    monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", lambda job_ids, db=None: marked.append(job_ids))
+    monkeypatch.setattr(
+        analyze_jobs,
+        "mark_jobs_analyzed",
+        lambda job_ids, db=None, replacement_backfill=False: marked.append(job_ids),
+    )
 
     processed = analyze_jobs.run(backfill_all=True)
 
@@ -852,7 +941,7 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
-        lambda db=None, limit=None, backfill_all=False: fetch_batches.pop(0),
+        lambda db=None, limit=None, backfill_all=False, replacement_backfill=False: fetch_batches.pop(0),
     )
     monkeypatch.setattr(
         analyze_jobs,
@@ -870,7 +959,7 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
             failed_once["value"] = True
             raise RuntimeError("crash after replace")
 
-    def fake_mark(job_ids, db=None):
+    def fake_mark(job_ids, db=None, replacement_backfill=False):
         mark_calls.append(job_ids)
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
@@ -921,7 +1010,7 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
-        lambda db=None, limit=None, backfill_all=False: [
+        lambda db=None, limit=None, backfill_all=False, replacement_backfill=False: [
             {"job_id": "1", "job_title": "A", "description": "Needs SQL"}
         ],
     )
@@ -940,7 +1029,7 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
     def fake_rebuild(db=None):
         calls.append(("rebuild",))
 
-    def fake_mark(job_ids, db=None):
+    def fake_mark(job_ids, db=None, replacement_backfill=False):
         calls.append(("mark", job_ids))
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
@@ -953,3 +1042,36 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
     assert calls[0][0] == "replace"
     assert calls[1][0] == "rebuild"
     assert calls[2] == ("mark", ["1"])
+
+
+def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
+    calls = []
+    batches = [[{"job_id": "1", "job_title": "A", "description": "Needs SQL"}], []]
+
+    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
+
+    def fake_fetch(db=None, limit=None, backfill_all=False, replacement_backfill=False):
+        calls.append(("fetch", backfill_all, replacement_backfill))
+        return batches.pop(0)
+
+    monkeypatch.setattr(analyze_jobs, "fetch_unanalyzed_jobs", fake_fetch)
+    monkeypatch.setattr(
+        analyze_jobs,
+        "extract_keywords_from_batch",
+        lambda batch, client=None, max_retries=None: {
+            "1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]
+        },
+    )
+    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", lambda job_ids, facts, db=None: facts)
+    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: None)
+
+    def fake_mark(job_ids, db=None, replacement_backfill=False):
+        calls.append(("mark", job_ids, replacement_backfill))
+
+    monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
+
+    processed = analyze_jobs.run(replacement_backfill=True)
+
+    assert processed == 1
+    assert calls[0] == ("fetch", False, True)
+    assert calls[1] == ("mark", ["1"], True)

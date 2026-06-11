@@ -10,6 +10,10 @@ on:
         description: "Continue processing until no unanalyzed jobs remain"
         required: false
         default: "false"
+      replacement_backfill:
+        description: "Reanalyze previously analyzed jobs once"
+        required: false
+        default: "false"
 
 jobs:
   analyze:
@@ -38,4 +42,5 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           JOB_INSIGHTS_BACKFILL_ALL: ${{ github.event.inputs.drain_backlog || 'false' }}
+          JOB_INSIGHTS_REPLACEMENT_BACKFILL: ${{ github.event.inputs.replacement_backfill || 'false' }}
         run: python analyze_jobs.py

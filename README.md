@@ -1,6 +1,6 @@
 # Job Scraper & Application Assistant
 
-This project is a comprehensive suite of tools designed to automate and enhance the job searching process, primarily focusing on LinkedIn. It scrapes job postings, parses resumes, scores job suitability against a candidate's resume, manages job application statuses, and can even generate custom PDF resumes. The system leverages AI (Google Gemini) for advanced text processing and Supabase for data storage.
+This project is a comprehensive suite of tools designed to automate and enhance the job searching process, primarily focusing on LinkedIn. It scrapes job postings, parses resumes, scores job suitability against a candidate's resume, analyzes job market keywords, manages job application statuses, and can even generate custom PDF resumes. The system leverages AI through a unified LLM client and Supabase for data storage.
 
 ## Features
 
@@ -9,6 +9,7 @@ This project is a comprehensive suite of tools designed to automate and enhance 
   - Extracts text from PDF resumes using `pdfplumber`. ([resume_parser.py](resume_parser.py))
   - Utilizes Google Gemini AI to parse resume text into structured data ([parse_resume_with_ai.py](parse_resume_with_ai.py))
 - **Job Scoring**: Scores job descriptions against a parsed resume using AI to determine suitability. ([score_jobs.py](score_jobs.py))
+- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into the `keyword_insights` table using `analyze_jobs.py` for downstream reporting and trend analysis. ([analyze_jobs.py](analyze_jobs.py))
 - **Universal LLM Support**: Supports 400+ model providers (Gemini, OpenAI, Anthropic, Ollama, Groq, etc.) via a unified abstraction layer. ([llm_client.py](llm_client.py))
 - **Job Management**:
   - Tracks the status of job applications.
@@ -49,7 +50,8 @@ This project is designed to run primarily through GitHub Actions. Follow these s
 2.  **Create a Supabase Project:**
     - Go to [Supabase](https://supabase.com/) and create a new project.
     - Once your project is created, navigate to the "SQL Editor" section.
-    - Open the `supabase_setup/init.sql` file from this repository, copy its content, and run it in your Supabase SQL Editor. This will set up the necessary tables (like `jobs`, `customized_resumes`, and `base_resume`) and storage buckets (`resumes`, `personalized_resumes`).
+    - Open the `supabase_setup/init.sql` file from this repository, copy its content, and run it in your Supabase SQL Editor. This will set up the necessary tables (like `jobs`, `customized_resumes`, `keyword_insights`, and `base_resume`) and storage buckets (`resumes`, `personalized_resumes`).
+    - If you already have an existing Supabase project using an older schema, run `supabase_setup/add_job_insights.sql` once in the Supabase SQL Editor to add the `jobs.insights_analyzed_at` column and the `keyword_insights` table.
 
 3.  **Obtain API Keys for Your LLM Provider:**
     - Get API key(s) from your chosen provider (e.g., [Google AI Studio](https://aistudio.google.com/app/apikey), [OpenAI](https://platform.openai.com/api-keys), [Anthropic](https://console.anthropic.com/), etc.).
@@ -116,7 +118,7 @@ This project is designed to run primarily through GitHub Actions. Follow these s
 8.  **Enable GitHub Actions:**
     - Go to the "Actions" tab in your forked GitHub repository.
     - You will see a message saying "Workflows aren't running on this repository". Click the "Enable Actions on this repository" button (or a similar prompt) to allow the scheduled workflows to run automatically.
-    - Ensure all workflows listed (e.g., `scrape_jobs.yml`, `score_jobs.yml`, `job_manager.yml`) are enabled. If any are disabled, you may need to enable them individually.
+    - Ensure all workflows listed (e.g., `scrape_jobs.yml`, `score_jobs.yml`, `job_manager.yml`, `analyze_jobs.yml`) are enabled. If any are disabled, you may need to enable them individually.
 
 ## Automated Workflows
 
@@ -125,6 +127,7 @@ Once the setup is complete and GitHub Actions are enabled, the workflows defined
 - **`scrape_jobs.yml`**: Periodically scrapes new job postings from LinkedIn and CareersFuture based on your `config.py` settings and saves them to your Supabase database.
 - **`score_jobs.yml`**: Periodically scores the newly scraped jobs and jobs with custom resumes against your parsed resume / custom resume and updates the scores in the database.
 - **`job_manager.yml`**: Periodically manages job statuses (e.g., marks old jobs as expired, checks if active jobs are still available).
+- **`analyze_jobs.yml`**: Runs `analyze_jobs.py` on a schedule or manually to extract recurring market keywords from new jobs and update `keyword_insights`.
 - **`hourly_resume_customization.yml`**: (If enabled and configured) May run tasks related to customizing resumes for specific jobs.
 
 You can monitor the execution of these actions in the "Actions" tab of your repository.
@@ -137,10 +140,11 @@ You can interact with the data directly through your Supabase dashboard to view 
 
 ### Web Interface for Viewing Data
 
-A Next.js web application is available to view and manage the scraped jobs, your resume details, and job scores from the database.
+A Next.js web application is available to view and manage the scraped jobs, your resume details, job scores, and job market insights from the database.
 
 - **Repository:** [jobs-scrapper-web](https://github.com/anandanair/jobs-scraper-web)
 - **Setup:** To use the web interface, clone the `jobs-scrapper-web` repository and follow the setup instructions provided in its `README.md` file to run it locally. This will typically involve configuring it to connect to your Supabase instance.
+- **Insights UI:** The companion `zeroluck/job-scraper-web` application displays records from `keyword_insights` on its Insights page.
 
 The individual Python scripts can still be run locally for development or testing, but this requires setting up a local Python environment, installing dependencies from `requirements.txt`, and creating a local `.env` file with the necessary credentials (mirroring the GitHub secrets).
 
@@ -191,11 +195,13 @@ The individual Python scripts can still be run locally for development or testin
 .
 ├── .github/                    # GitHub Actions workflows
 │   └── workflows/
+│       ├── analyze_jobs.yml
 │       ├── hourly_resume_customization.yml
 │       ├── job_manager.yml
 │       ├── parse_resume.yml
 │       ├── score_jobs.yml
 │       └── scrape_jobs.yml
+├── analyze_jobs.py              # Extracts recurring keyword insights from new jobs
 ├── .gitignore                  # Specifies intentionally untracked files that Git should ignore
 ├── README.md                   # This file
 ├── config.py                   # Configuration settings (API keys, search parameters)
@@ -209,6 +215,7 @@ The individual Python scripts can still be run locally for development or testin
 ├── score_jobs.py               # Scores job suitability against resumes
 ├── scraper.py                  # Core scraping logic for LinkedIn and CareersFuture
 ├── supabase_setup/             # SQL scripts for Supabase database initialization
+│   ├── add_job_insights.sql
 │   └── init.sql
 ├── supabase_utils.py           # Utility functions for interacting with Supabase
 └── user_agents.py              # List of user-agents for web scraping

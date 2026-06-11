@@ -15,7 +15,7 @@ def test_aggregate_keywords_normalizes_keyword_case_and_category():
 
     assert counts == {
         ("Python", "technology"): 2,
-        ("Pmp", "certification"): 1,
+        ("PMP", "certification"): 1,
     }
 
 
@@ -33,19 +33,26 @@ def test_aggregate_keywords_ignores_invalid_categories():
 def test_parse_keyword_response_validates_structured_json():
     raw = json.dumps(
         {
-            "keywords": [
-                {"keyword": "Azure", "category": "technology"},
-                {"keyword": "PMP", "category": "certification"},
+            "jobs": [
+                {
+                    "job_id": "job-1",
+                    "keywords": [
+                        {"keyword": "Azure", "category": "technology"},
+                        {"keyword": "PMP", "category": "certification"},
+                    ],
+                }
             ]
         }
     )
 
     parsed = analyze_jobs.parse_keyword_response(raw)
 
-    assert parsed == [
-        analyze_jobs.KeywordItem(keyword="Azure", category="technology"),
-        analyze_jobs.KeywordItem(keyword="PMP", category="certification"),
-    ]
+    assert parsed == {
+        "job-1": [
+            analyze_jobs.KeywordItem(keyword="Azure", category="technology"),
+            analyze_jobs.KeywordItem(keyword="PMP", category="certification"),
+        ]
+    }
 
 
 def test_extract_keywords_from_batch_uses_llm_client_response_format():
@@ -56,9 +63,14 @@ def test_extract_keywords_from_batch_uses_llm_client_response_format():
             calls.append(kwargs)
             return json.dumps(
                 {
-                    "keywords": [
-                        {"keyword": "Python", "category": "technology"},
-                        {"keyword": "Agile", "category": "skill"},
+                    "jobs": [
+                        {
+                            "job_id": "1",
+                            "keywords": [
+                                {"keyword": "Python", "category": "technology"},
+                                {"keyword": "Agile", "category": "skill"},
+                            ],
+                        }
                     ]
                 }
             )
@@ -73,13 +85,15 @@ def test_extract_keywords_from_batch_uses_llm_client_response_format():
 
     result = analyze_jobs.extract_keywords_from_batch(batch, client=FakeClient())
 
-    assert result == [
-        analyze_jobs.KeywordItem(keyword="Python", category="technology"),
-        analyze_jobs.KeywordItem(keyword="Agile", category="skill"),
-    ]
+    assert result == {
+        "1": [
+            analyze_jobs.KeywordItem(keyword="Python", category="technology"),
+            analyze_jobs.KeywordItem(keyword="Agile", category="skill"),
+        ]
+    }
     assert len(calls) == 1
     assert calls[0]["temperature"] == 0.0
-    assert calls[0]["response_format"] is analyze_jobs.KeywordList
+    assert calls[0]["response_format"] is analyze_jobs.JobKeywordResultList
     assert "Project Manager" in calls[0]["prompt"]
     assert "Must know Agile and Python." in calls[0]["prompt"]
 
@@ -135,60 +149,6 @@ def test_fetch_unanalyzed_jobs_queries_expected_filters():
     assert ("limit", 25) in db.query.calls
 
 
-def test_upsert_insights_merges_existing_counts_and_batches_rows():
-    upserted = []
-
-    class FakeSelectQuery:
-        def __init__(self):
-            self.offset = 0
-
-        def select(self, value):
-            assert value == "keyword, category, count"
-            return self
-
-        def range(self, start, end):
-            self.offset = start
-            return self
-
-        def execute(self):
-            if self.offset == 0:
-                return SimpleNamespace(
-                    data=[{"keyword": "Python", "category": "technology", "count": 4}]
-                )
-            return SimpleNamespace(data=[])
-
-    class FakeUpsertQuery:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def execute(self):
-            upserted.extend(self.rows)
-            return SimpleNamespace(data=self.rows)
-
-    class FakeTable:
-        def select(self, value):
-            return FakeSelectQuery().select(value)
-
-        def upsert(self, rows, on_conflict):
-            assert on_conflict == "keyword,category"
-            return FakeUpsertQuery(rows)
-
-    class FakeDb:
-        def table(self, name):
-            assert name == "keyword_insights"
-            return FakeTable()
-
-    analyze_jobs.upsert_insights(
-        {("Python", "technology"): 3, ("Pmp", "certification"): 2},
-        db=FakeDb(),
-    )
-
-    by_key = {(row["keyword"], row["category"]): row for row in upserted}
-    assert by_key[("Python", "technology")]["count"] == 7
-    assert by_key[("Pmp", "certification")]["count"] == 2
-    assert all("last_updated" in row for row in upserted)
-
-
 def test_mark_jobs_analyzed_updates_timestamp_for_ids():
     calls = []
 
@@ -216,3 +176,162 @@ def test_mark_jobs_analyzed_updates_timestamp_for_ids():
     assert "insights_analyzed_at" in calls[0][1]
     assert calls[1] == ("in_", "job_id", ["1", "2"])
     assert calls[2] == ("execute",)
+
+
+def test_aggregate_keywords_preserves_acronyms_and_uppercase_keywords():
+    items = [
+        analyze_jobs.KeywordItem(keyword="AWS", category="technology"),
+        analyze_jobs.KeywordItem(keyword="SQL", category="technology"),
+        analyze_jobs.KeywordItem(keyword="PMP", category="certification"),
+    ]
+
+    counts = analyze_jobs.aggregate_keywords(items)
+
+    assert counts == {
+        ("AWS", "technology"): 1,
+        ("SQL", "technology"): 1,
+        ("PMP", "certification"): 1,
+    }
+
+
+def test_upsert_job_keyword_facts_ignores_existing_job_keyword_pairs():
+    inserted_rows = []
+
+    class FakeUpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            inserted_rows.extend(self.rows[:1])
+            return SimpleNamespace(data=self.rows[:1])
+
+    class FakeTable:
+        def upsert(self, rows, on_conflict, ignore_duplicates):
+            assert on_conflict == "job_id,keyword,category"
+            assert ignore_duplicates is True
+            return FakeUpsertQuery(rows)
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "job_keyword_insights"
+            return FakeTable()
+
+    facts = [
+        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+    ]
+
+    inserted = analyze_jobs.upsert_job_keyword_facts(facts, db=FakeDb())
+
+    assert inserted == inserted_rows
+    assert inserted == [{"job_id": "1", "keyword": "AWS", "category": "technology"}]
+
+
+def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
+    upserted = []
+
+    class FakeSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category, count"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset == 0:
+                return SimpleNamespace(
+                    data=[
+                        {"keyword": "AWS", "category": "technology", "count": 10},
+                        {"keyword": "PMP", "category": "certification", "count": 4},
+                    ]
+                )
+            return SimpleNamespace(data=[])
+
+    class FakeUpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            upserted.extend(self.rows)
+            return SimpleNamespace(data=self.rows)
+
+    class FakeTable:
+        def select(self, value):
+            return FakeSelectQuery().select(value)
+
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "keyword,category"
+            return FakeUpsertQuery(rows)
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "keyword_insights"
+            return FakeTable()
+
+    inserted_facts = [
+        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+        {"job_id": "2", "keyword": "AWS", "category": "technology"},
+        {"job_id": "2", "keyword": "PMP", "category": "certification"},
+    ]
+
+    analyze_jobs.update_keyword_insights_from_facts(inserted_facts, db=FakeDb())
+
+    by_key = {(row["keyword"], row["category"]): row for row in upserted}
+    assert by_key[("AWS", "technology")]["count"] == 12
+    assert by_key[("PMP", "certification")]["count"] == 5
+    assert all("last_updated" in row for row in upserted)
+
+
+def test_build_job_keyword_facts_uses_job_keyed_results_not_cross_product():
+    batch = [
+        {"job_id": "1", "job_title": "A", "description": "Needs AWS"},
+        {"job_id": "2", "job_title": "B", "description": "Needs PMP"},
+    ]
+    extracted = {
+        "1": [analyze_jobs.KeywordItem(keyword="AWS", category="technology")],
+        "2": [analyze_jobs.KeywordItem(keyword="PMP", category="certification")],
+    }
+
+    facts = analyze_jobs.build_job_keyword_facts(batch, extracted)
+
+    assert facts == [
+        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+        {"job_id": "2", "keyword": "PMP", "category": "certification"},
+    ]
+
+
+def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
+    batches = [
+        [{"job_id": "1", "job_title": "A", "description": "Needs AWS"}],
+        [{"job_id": "2", "job_title": "B", "description": "Needs SQL"}],
+        [],
+    ]
+    extracted_batches = [
+        {"1": [analyze_jobs.KeywordItem(keyword="AWS", category="technology")]},
+        {"2": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]},
+    ]
+    fact_calls = []
+    marked = []
+
+    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
+    monkeypatch.setattr(analyze_jobs, "fetch_unanalyzed_jobs", lambda db=None, limit=None: batches.pop(0))
+    monkeypatch.setattr(analyze_jobs, "extract_keywords_from_batch", lambda batch, client=None, max_retries=None: extracted_batches.pop(0))
+
+    def fake_upsert_facts(facts, db=None):
+        fact_calls.append(facts)
+        return facts
+
+    monkeypatch.setattr(analyze_jobs, "upsert_job_keyword_facts", fake_upsert_facts)
+    monkeypatch.setattr(analyze_jobs, "update_keyword_insights_from_facts", lambda facts, db=None: None)
+    monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", lambda job_ids, db=None: marked.append(job_ids))
+
+    processed = analyze_jobs.run(backfill_all=True)
+
+    assert processed == 2
+    assert len(fact_calls) == 2
+    assert marked == [["1"], ["2"]]

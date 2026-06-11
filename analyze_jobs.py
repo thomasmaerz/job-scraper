@@ -1,5 +1,5 @@
-import json
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -31,6 +31,15 @@ class KeywordList(BaseModel):
     keywords: list[KeywordItem]
 
 
+class JobKeywordResult(BaseModel):
+    job_id: str
+    keywords: list[KeywordItem]
+
+
+class JobKeywordResultList(BaseModel):
+    jobs: list[JobKeywordResult]
+
+
 def _get_db():
     from supabase import create_client
 
@@ -41,16 +50,21 @@ def _get_db():
 
 
 def _normalize_keyword(keyword: str) -> str:
-    return keyword.strip().title()
+    cleaned = keyword.strip()
+    if not cleaned:
+        return ""
+    if cleaned.isupper():
+        return cleaned
+    return " ".join(part[:1].upper() + part[1:] for part in cleaned.split())
 
 
 def _normalize_category(category: str) -> str:
     return category.strip().lower()
 
 
-def parse_keyword_response(raw_response: str) -> list[KeywordItem]:
-    parsed = KeywordList.model_validate_json(raw_response)
-    return parsed.keywords
+def parse_keyword_response(raw_response: str) -> dict[str, list[KeywordItem]]:
+    parsed = JobKeywordResultList.model_validate_json(raw_response)
+    return {job.job_id: job.keywords for job in parsed.jobs}
 
 
 def fetch_unanalyzed_jobs(db=None, limit=None) -> list:
@@ -70,12 +84,12 @@ def fetch_unanalyzed_jobs(db=None, limit=None) -> list:
     return query.limit(limit).execute().data or []
 
 
-def extract_keywords_from_batch(batch, client=None, max_retries=None) -> list[KeywordItem]:
+def extract_keywords_from_batch(batch, client=None, max_retries=None) -> dict[str, list[KeywordItem]]:
     client = client or primary_client
     max_retries = config.JOB_INSIGHTS_MAX_RETRIES if max_retries is None else max_retries
 
     prompt_lines = [
-        "Extract recurring job-market keywords from these job postings.",
+        "Extract keywords for each job posting individually.",
         "Return only structured JSON.",
     ]
     for job in batch:
@@ -93,7 +107,7 @@ def extract_keywords_from_batch(batch, client=None, max_retries=None) -> list[Ke
                 prompt=prompt,
                 system_prompt=SYSTEM_PROMPT,
                 temperature=0.0,
-                response_format=KeywordList,
+                response_format=JobKeywordResultList,
             )
             return parse_keyword_response(raw_response)
         except Exception as exc:
@@ -123,11 +137,68 @@ def aggregate_keywords(all_keywords: list[KeywordItem]) -> dict:
     return dict(counts)
 
 
-def _fetch_existing_insights(db) -> dict:
+def build_job_keyword_facts(batch: list, extracted_keywords: dict[str, list[KeywordItem]]) -> list[dict]:
+    facts = []
+    for job in batch:
+        job_id = job.get("job_id")
+        if job_id is None:
+            continue
+        for item in extracted_keywords.get(str(job_id), []):
+            category = _normalize_category(item.category)
+            keyword = _normalize_keyword(item.keyword)
+            if not keyword or category not in VALID_CATEGORIES:
+                continue
+            facts.append(
+                {
+                    "job_id": str(job_id),
+                    "keyword": keyword,
+                    "category": category,
+                }
+            )
+    return facts
+
+
+def upsert_job_keyword_facts(facts: list[dict], db=None) -> list[dict]:
+    if not facts:
+        return []
+
+    db = db or _get_db()
+    deduped = []
+    seen = set()
+    for fact in facts:
+        key = (fact["job_id"], fact["keyword"], fact["category"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(fact)
+
+    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
+    inserted = []
+    for start in range(0, len(deduped), batch_size):
+        batch = deduped[start : start + batch_size]
+        response = (
+            db.table("job_keyword_insights")
+            .upsert(batch, on_conflict="job_id,keyword,category", ignore_duplicates=True)
+            .execute()
+        )
+        inserted.extend(response.data or [])
+
+    return inserted
+
+
+def update_keyword_insights_from_facts(inserted_facts: list[dict], db=None):
+    if not inserted_facts:
+        return
+
+    db = db or _get_db()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    counts = defaultdict(int)
+    for fact in inserted_facts:
+        counts[(fact["keyword"], fact["category"])] += 1
+
     existing = {}
     offset = 0
     page_size = config.JOB_INSIGHTS_DB_PAGE_SIZE
-
     while True:
         rows = (
             db.table("keyword_insights")
@@ -139,32 +210,19 @@ def _fetch_existing_insights(db) -> dict:
         )
         if not rows:
             break
-
         for row in rows:
             existing[(row["keyword"], row["category"])] = row["count"]
         offset += page_size
 
-    return existing
-
-
-def upsert_insights(counts: dict, db=None):
-    if not counts:
-        return
-
-    db = db or _get_db()
-    existing = _fetch_existing_insights(db)
-    timestamp = datetime.now(timezone.utc).isoformat()
-
-    rows = []
-    for (keyword, category), count in counts.items():
-        rows.append(
-            {
-                "keyword": keyword,
-                "category": category,
-                "count": existing.get((keyword, category), 0) + count,
-                "last_updated": timestamp,
-            }
-        )
+    rows = [
+        {
+            "keyword": keyword,
+            "category": category,
+            "count": existing.get((keyword, category), 0) + count,
+            "last_updated": timestamp,
+        }
+        for (keyword, category), count in counts.items()
+    ]
 
     batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
     for start in range(0, len(rows), batch_size):
@@ -182,28 +240,32 @@ def mark_jobs_analyzed(job_ids: list, db=None):
     ).in_("job_id", job_ids).execute()
 
 
-def run():
+def run(backfill_all: bool = False):
     db = _get_db()
-    jobs = fetch_unanalyzed_jobs(db=db, limit=config.JOB_INSIGHTS_MAX_JOBS)
-    if not jobs:
-        logger.info("No unanalyzed jobs found.")
-        return
+    processed_jobs = 0
 
-    all_keywords = []
-    analyzed_job_ids = []
-    batch_size = config.JOB_INSIGHTS_BATCH_SIZE
+    while True:
+        jobs = fetch_unanalyzed_jobs(db=db, limit=config.JOB_INSIGHTS_MAX_JOBS)
+        if not jobs:
+            if processed_jobs == 0:
+                logger.info("No unanalyzed jobs found.")
+            return processed_jobs
 
-    for start in range(0, len(jobs), batch_size):
-        batch = jobs[start : start + batch_size]
-        extracted = extract_keywords_from_batch(batch)
-        all_keywords.extend(extracted)
-        analyzed_job_ids.extend(str(job["job_id"]) for job in batch if job.get("job_id") is not None)
+        batch_size = config.JOB_INSIGHTS_BATCH_SIZE
+        for start in range(0, len(jobs), batch_size):
+            batch = jobs[start : start + batch_size]
+            extracted = extract_keywords_from_batch(batch)
+            facts = build_job_keyword_facts(batch, extracted)
+            inserted_facts = upsert_job_keyword_facts(facts, db=db)
+            update_keyword_insights_from_facts(inserted_facts, db=db)
+            analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
+            mark_jobs_analyzed(analyzed_job_ids, db=db)
+            processed_jobs += len(analyzed_job_ids)
 
-    counts = aggregate_keywords(all_keywords)
-    upsert_insights(counts, db=db)
-    mark_jobs_analyzed(analyzed_job_ids, db=db)
+        if not backfill_all:
+            return processed_jobs
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run()
+    run(backfill_all=os.getenv("JOB_INSIGHTS_BACKFILL_ALL", "false").lower() == "true")

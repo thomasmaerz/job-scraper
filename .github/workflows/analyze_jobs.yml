@@ -5,6 +5,11 @@ on:
     # Weekly on Monday at 06:00 UTC to control LLM usage.
     - cron: "0 6 * * 1"
   workflow_dispatch:
+    inputs:
+      drain_backlog:
+        description: "Continue processing until no unanalyzed jobs remain"
+        required: false
+        default: "false"
 
 jobs:
   analyze:
@@ -32,4 +37,5 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          JOB_INSIGHTS_BACKFILL_ALL: ${{ github.event.inputs.drain_backlog || 'false' }}
         run: python analyze_jobs.py

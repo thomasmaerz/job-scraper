@@ -576,6 +576,19 @@ CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
 ALTER TABLE "public"."keyword_insights" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."job_keyword_insights" (
+    "job_id" text NOT NULL,
+    "keyword" text NOT NULL,
+    "category" text NOT NULL,
+    "analyzed_at" timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT "job_keyword_insights_category_check"
+        CHECK ("category" IN ('skill', 'technology', 'certification', 'attribute'))
+);
+
+
+ALTER TABLE "public"."job_keyword_insights" OWNER TO "postgres";
+
+
 
 
 
@@ -596,6 +609,10 @@ ALTER TABLE ONLY "public"."customized_resumes"
 
 ALTER TABLE ONLY "public"."keyword_insights"
     ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("keyword", "category");
+
+
+ALTER TABLE ONLY "public"."job_keyword_insights"
+    ADD CONSTRAINT "job_keyword_insights_pkey" PRIMARY KEY ("job_id", "keyword", "category");
 
 
 
@@ -648,6 +665,12 @@ CREATE INDEX "idx_keyword_insights_category" ON "public"."keyword_insights" USIN
 CREATE INDEX "idx_keyword_insights_count" ON "public"."keyword_insights" USING "btree" ("count" DESC);
 
 
+CREATE INDEX "idx_job_keyword_insights_job_id" ON "public"."job_keyword_insights" USING "btree" ("job_id");
+
+
+CREATE INDEX "idx_job_keyword_insights_keyword_category" ON "public"."job_keyword_insights" USING "btree" ("keyword", "category");
+
+
 
 CREATE OR REPLACE TRIGGER "update_customized_resumes_last_updated" BEFORE UPDATE ON "public"."customized_resumes" FOR EACH ROW EXECUTE FUNCTION "public"."update_last_updated_column"();
 
@@ -665,6 +688,9 @@ ALTER TABLE "public"."customized_resumes" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."keyword_insights" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."job_keyword_insights" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."jobs" ENABLE ROW LEVEL SECURITY;
@@ -751,6 +777,11 @@ GRANT ALL ON TABLE "public"."customized_resumes" TO "service_role";
 GRANT ALL ON TABLE "public"."keyword_insights" TO "anon";
 GRANT ALL ON TABLE "public"."keyword_insights" TO "authenticated";
 GRANT ALL ON TABLE "public"."keyword_insights" TO "service_role";
+
+
+GRANT ALL ON TABLE "public"."job_keyword_insights" TO "anon";
+GRANT ALL ON TABLE "public"."job_keyword_insights" TO "authenticated";
+GRANT ALL ON TABLE "public"."job_keyword_insights" TO "service_role";
 
 
 

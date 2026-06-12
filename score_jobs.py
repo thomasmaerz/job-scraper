@@ -141,7 +141,6 @@ def get_resume_score_from_ai(resume_text: str, job_details: Dict[str, Any]) -> O
         logging.info(f"Requesting score for job_id: {job_details.get('job_id')}")
         score_text = job_scoring_client.generate_content(
             prompt=prompt,
-            reasoning_effort="medium",
         )
 
         # Attempt to parse the score

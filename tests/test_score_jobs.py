@@ -3,7 +3,7 @@ import sys
 from types import SimpleNamespace
 
 
-def test_get_resume_score_uses_job_scoring_client_with_medium_reasoning(monkeypatch):
+def test_get_resume_score_uses_job_scoring_client_without_reasoning(monkeypatch):
     fake_supabase_utils = SimpleNamespace()
     monkeypatch.setitem(sys.modules, "supabase_utils", fake_supabase_utils)
     score_jobs = importlib.import_module("score_jobs")
@@ -29,5 +29,5 @@ def test_get_resume_score_uses_job_scoring_client_with_medium_reasoning(monkeypa
     )
 
     assert result == 87
-    assert calls[0]["reasoning_effort"] == "medium"
+    assert "reasoning_effort" not in calls[0]
     assert "temperature" not in calls[0]

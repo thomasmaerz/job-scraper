@@ -99,3 +99,16 @@ def test_generate_content_omits_temperature_when_not_provided(monkeypatch):
 
     assert result == "ok"
     assert "temperature" not in calls[0]
+
+
+def test_job_scoring_model_chain_prefers_flash_lite_then_gemma_31b():
+    import config
+
+    assert config.JOB_SCORING_MODEL_CHAIN == [
+        "gemini/gemini-3.1-flash-lite",
+        "gemini/gemma-4-31b-it",
+        "gemini/gemini-3-flash-preview",
+        "gemini/gemma-4-26b-a4b-it",
+        "gemini/gemini-2.5-flash",
+        "gemini/gemini-2.5-flash-lite",
+    ]

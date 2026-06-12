@@ -22,6 +22,12 @@ This project is a comprehensive suite of tools designed to automate and enhance 
 - **Quota Management**: Built-in rate limiting, exponential backoff, and daily budget tracking for LLM API calls. Features task-specific Gemini fallback chains for job scoring and job insights extraction.
 - **Automated Workflows**: Includes optimized GitHub Actions for running tasks on a schedule without exhausting quotas. ([workflows](.github/workflows/))
 
+### LLM Routing Notes
+
+- Job scoring uses a task-specific scoring chain via `job_scoring_client`.
+- Job insights analysis uses a task-specific extraction chain via `job_insights_client`.
+- Resume parsing and resume generation still use the generic `primary_client` and are not yet routed through dedicated task-specific chains.
+
 ## Tech Stack
 
 - **Programming Language**: Python 3.11.9

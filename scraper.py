@@ -4,14 +4,70 @@ from datetime import datetime, timedelta
 import time 
 import random 
 import logging
+import re
 import config
 import user_agents
 import supabase_utils
 from markdownify import markdownify as md
 import json
+from urllib.parse import urlparse
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def _parse_salary_fields(text: str) -> dict:
+    if not text:
+        return {"salary_text": None, "salary_min": None, "salary_max": None, "salary_currency": None}
+
+    match = re.search(r'(\$[\d,]+)\s*-\s*(\$[\d,]+)\s*(CAD|USD)?', text, re.IGNORECASE)
+    if not match:
+        return {"salary_text": None, "salary_min": None, "salary_max": None, "salary_currency": None}
+
+    raw_min, raw_max, currency = match.groups()
+    return {
+        "salary_text": match.group(0),
+        "salary_min": int(raw_min.replace("$", "").replace(",", "")),
+        "salary_max": int(raw_max.replace("$", "").replace(",", "")),
+        "salary_currency": currency.upper() if currency else None,
+    }
+
+def _extract_recruiter_identifier(profile_url: str | None) -> str | None:
+    if not profile_url:
+        return None
+    path = urlparse(profile_url).path.strip("/")
+    return path.removeprefix("in/") if path.startswith("in/") else (path or None)
+
+def _extract_linkedin_detail_metadata(soup: BeautifulSoup) -> dict:
+    result = {
+        "applicant_count": None,
+        "salary_text": None,
+        "salary_min": None,
+        "salary_max": None,
+        "salary_currency": None,
+        "recruiter_name": None,
+        "recruiter_profile_url": None,
+        "recruiter_identifier": None,
+    }
+
+    applicant_span = soup.find("span", {"class": re.compile(r"num-applicants__caption")})
+    if applicant_span:
+        text = applicant_span.get_text(" ", strip=True)
+        match = re.search(r'(\d+)', text.replace(",", ""))
+        if match:
+            result["applicant_count"] = int(match.group(1))
+
+    recruiter_link = soup.find("a", href=re.compile(r"linkedin\.com/in/"))
+    if recruiter_link:
+        result["recruiter_profile_url"] = recruiter_link.get("href")
+        result["recruiter_identifier"] = _extract_recruiter_identifier(result["recruiter_profile_url"])
+        text = recruiter_link.get_text(" ", strip=True)
+        if text and len(text.split()) <= 5 and "message the hiring team" not in text.lower():
+            result["recruiter_name"] = text
+
+    description_div = soup.find("div", {"class": "show-more-less-html__markup"})
+    description_text = description_div.get_text(" ", strip=True) if description_div else ""
+    result.update(_parse_salary_fields(description_text))
+    return result
 
 def _extract_linkedin_search_cards(job_elements: list) -> list[dict]:
     results = []
@@ -347,6 +403,8 @@ def _fetch_linkedin_job_details(job_id: str) -> dict | None:
         else:
             job_details["description"] = None 
             logging.warning(f"Description HTML was empty for job ID {job_id}. Skipping conversion.") 
+
+        job_details.update(_extract_linkedin_detail_metadata(soup))
 
         # --- Set Provider ---
         job_details["provider"] = "linkedin"

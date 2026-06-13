@@ -259,6 +259,39 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
 
     return existing_ids, existing_company_title_keys
 
+
+def get_filter_profile(archetype: str | None) -> dict:
+    resolved = archetype or config.DEFAULT_ARCHETYPE
+    profile = config.ARCHETYPE_CONFIGS.get(resolved)
+    if profile is None:
+        return config.ARCHETYPE_CONFIGS[config.DEFAULT_ARCHETYPE]
+    return profile
+
+
+def match_filter_reason(job: dict) -> tuple[str | None, bool]:
+    title = job.get("job_title") or ""
+    company = job.get("company") or ""
+    desc = job.get("description") or ""
+    profile = get_filter_profile(job.get("archetype"))
+
+    for raw_pattern in profile["company_blocklist"]:
+        if re.compile(raw_pattern, re.IGNORECASE).search(company):
+            return f"company:{raw_pattern}", False
+
+    for raw_pattern in profile["title_entry_level_blocklist"]:
+        if re.compile(raw_pattern, re.IGNORECASE).search(title):
+            return f"title_entry_level:{raw_pattern}", True
+
+    for raw_pattern in profile["title_blocklist"]:
+        if re.compile(raw_pattern, re.IGNORECASE).search(title):
+            return f"title:{raw_pattern}", False
+
+    for raw_pattern in profile["desc_blocklist"]:
+        if re.compile(raw_pattern, re.IGNORECASE).search(desc):
+            return f"desc:{raw_pattern}", False
+
+    return None, False
+
 def save_jobs_to_supabase(jobs_data: list):
     """
     Saves or updates a list of job data dictionaries to the Supabase table using upsert.
@@ -270,6 +303,49 @@ def save_jobs_to_supabase(jobs_data: list):
 
     # Ensure job_id is present and potentially convert to the correct type if needed
     # (Assuming job_id in jobs_data is already the correct string type for your 'text' column)
+    allowed_fields = {
+        "job_id",
+        "company",
+        "job_title",
+        "level",
+        "location",
+        "description",
+        "status",
+        "is_active",
+        "application_date",
+        "resume_score",
+        "notes",
+        "scraped_at",
+        "last_checked",
+        "job_state",
+        "resume_score_stage",
+        "is_interested",
+        "customized_resume_id",
+        "provider",
+        "posted_at",
+        "search_query",
+        "archetype",
+        "filter_profile",
+        "canonical_key",
+        "original_job_id",
+        "latest_job_id",
+        "first_seen_at",
+        "last_seen_at",
+        "last_seen_posted_at",
+        "seen_count",
+        "repost_count",
+        "listing_instances",
+        "description_fingerprint",
+        "posted_relative_text",
+        "applicant_count",
+        "salary_text",
+        "salary_min",
+        "salary_max",
+        "salary_currency",
+        "recruiter_name",
+        "recruiter_profile_url",
+        "recruiter_identifier",
+    }
     processed_jobs_data = []
     for job in jobs_data:
         if 'job_id' in job and job['job_id'] is not None:
@@ -280,8 +356,9 @@ def save_jobs_to_supabase(jobs_data: list):
              # except (ValueError, TypeError):
              #     print(f"Warning: Invalid job_id format found: {job.get('job_id')}. Skipping.")
              # Since it's text, just ensure it's a string (it likely already is)
-             job['job_id'] = str(job['job_id'])
-             processed_jobs_data.append(job)
+             filtered_job = {key: value for key, value in job.items() if key in allowed_fields}
+             filtered_job['job_id'] = str(job['job_id'])
+             processed_jobs_data.append(filtered_job)
         else:
             print(f"Warning: Job data missing job_id. Skipping: {job}")
 
@@ -332,70 +409,52 @@ def flag_filtered_jobs() -> int:
     Returns count of newly flagged jobs.
     """
     batch_size = 1000
-    offset = 0
+    last_job_id = None
     newly_flagged = 0
-
-    company_patterns   = [(p, re.compile(p, re.IGNORECASE)) for p in config.COMPANY_BLOCKLIST]
-    entry_patterns     = [(p, re.compile(p, re.IGNORECASE)) for p in config.TITLE_ENTRY_LEVEL_BLOCKLIST]
-    title_patterns     = [(p, re.compile(p, re.IGNORECASE)) for p in config.TITLE_BLOCKLIST]
-    desc_patterns      = [(p, re.compile(p, re.IGNORECASE)) for p in config.DESC_BLOCKLIST]
+    select_fields = "job_id, job_title, company, description, archetype"
+    fallback_fields = "job_id, job_title, company, description"
+    use_fallback_select = False
 
     try:
         while True:
-            response = (
-                supabase.table(config.SUPABASE_TABLE_NAME)
-                .select("job_id, job_title, company, description")
-                .eq("is_filtered", False)
-                .range(offset, offset + batch_size - 1)
-                .execute()
-            )
+            fields = fallback_fields if use_fallback_select else select_fields
+            try:
+                query = (
+                    supabase.table(config.SUPABASE_TABLE_NAME)
+                    .select(fields)
+                    .eq("is_filtered", False)
+                    .order("job_id", desc=False)
+                )
+                if last_job_id is not None:
+                    query = query.gt("job_id", last_job_id)
+                response = query.range(0, batch_size - 1).execute()
+            except Exception as e:
+                if (not use_fallback_select) and 'column "archetype" does not exist' in str(e):
+                    use_fallback_select = True
+                    query = (
+                        supabase.table(config.SUPABASE_TABLE_NAME)
+                        .select(fallback_fields)
+                        .eq("is_filtered", False)
+                        .order("job_id", desc=False)
+                    )
+                    if last_job_id is not None:
+                        query = query.gt("job_id", last_job_id)
+                    response = query.range(0, batch_size - 1).execute()
+                else:
+                    raise
             batch = response.data
             if not batch:
                 break
+
+            last_job_id = batch[-1].get("job_id")
 
             for job in batch:
                 job_id  = job.get("job_id", "")
                 title   = job.get("job_title") or ""
                 company = job.get("company") or ""
-                desc    = job.get("description") or ""
+                reason, entry_level = match_filter_reason(job)
 
-                flag          = False
-                reason        = None
-                entry_level   = False
-
-                # 1. Company blocklist
-                for raw_pattern, compiled in company_patterns:
-                    if compiled.search(company):
-                        flag   = True
-                        reason = f"company:{raw_pattern}"
-                        break
-
-                # 2. Entry-level title blocklist
-                if not flag:
-                    for raw_pattern, compiled in entry_patterns:
-                        if compiled.search(title):
-                            flag        = True
-                            entry_level = True
-                            reason      = f"title_entry_level:{raw_pattern}"
-                            break
-
-                # 3. Title blocklist
-                if not flag:
-                    for raw_pattern, compiled in title_patterns:
-                        if compiled.search(title):
-                            flag   = True
-                            reason = f"title:{raw_pattern}"
-                            break
-
-                # 4. Description blocklist
-                if not flag:
-                    for raw_pattern, compiled in desc_patterns:
-                        if compiled.search(desc):
-                            flag   = True
-                            reason = f"desc:{raw_pattern}"
-                            break
-
-                if flag:
+                if reason is not None:
                     update_payload = {
                         "is_filtered": True,
                         "filter_reason": reason,
@@ -410,14 +469,43 @@ def flag_filtered_jobs() -> int:
                         logging.info(f"Filtered job {job_id} [{company}] '{title}' — reason: {reason}")
                     except Exception as e:
                         logging.error(f"Failed to update filter flag for job_id {job_id}: {e}")
-
-            offset += batch_size
-
     except Exception as e:
         logging.error(f"Error during flag_filtered_jobs scan: {e}")
 
     logging.info(f"flag_filtered_jobs complete. Newly flagged: {newly_flagged}")
     return newly_flagged
+
+
+def backfill_job_archetypes(
+    archetype: str = "software_tpm",
+    provider: str = "linkedin",
+    filter_profile: str = "software_tpm_v1",
+) -> int:
+    response = (
+        supabase.table(config.SUPABASE_TABLE_NAME)
+        .update({
+            "archetype": archetype,
+            "filter_profile": filter_profile,
+        })
+        .eq("provider", provider)
+        .is_("archetype", None)
+        .execute()
+    )
+    return len(response.data or [])
+
+
+def clear_removed_aerospace_defense_filter() -> int:
+    response = (
+        supabase.table(config.SUPABASE_TABLE_NAME)
+        .update({
+            "is_filtered": False,
+            "filter_reason": None,
+            "is_entry_level_filtered": False,
+        })
+        .eq("filter_reason", r"desc:aerospace.*defense|defense.*aerospace")
+        .execute()
+    )
+    return len(response.data or [])
 
 
 def get_jobs_to_score(limit: int) -> list:
@@ -471,6 +559,7 @@ def get_top_scored_jobs_to_apply(limit: int) -> list:
                            .select("job_id, job_title, company, resume_score")\
                            .eq("is_active", True)\
                            .eq("status", "new")\
+                           .eq("is_filtered", False)\
                            .not_.is_("resume_score", None)\
                            .order("resume_score", desc=True)\
                            .limit(limit)\

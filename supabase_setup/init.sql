@@ -99,12 +99,24 @@ ALTER TABLE "public"."jobs"
     ADD COLUMN IF NOT EXISTS "filter_reason" "text",
     ADD COLUMN IF NOT EXISTS "is_entry_level_filtered" boolean DEFAULT false;
 
+ALTER TABLE "public"."jobs"
+    ADD COLUMN IF NOT EXISTS "search_query" text,
+    ADD COLUMN IF NOT EXISTS "archetype" text,
+    ADD COLUMN IF NOT EXISTS "filter_profile" text;
+
 COMMENT ON COLUMN "public"."jobs"."is_filtered" IS 'True if this job was flagged by the post-scrape filter as irrelevant (wrong domain, non-PM role, etc). Excluded from LLM scoring.';
 COMMENT ON COLUMN "public"."jobs"."filter_reason" IS 'Which filter rule triggered the flag, e.g. "title:construction" or "desc:construction firm". Used for auditing and regex refinement.';
 COMMENT ON COLUMN "public"."jobs"."is_entry_level_filtered" IS 'True if filtered specifically because of an entry-level/coordinator title (regardless of industry). UI can expose these separately — pivot from IT PM to construction coordinator is feasible, PM to construction senior PM is not.';
+COMMENT ON COLUMN "public"."jobs"."archetype" IS 'Normalized search family used for filtering and insights partitioning. Current default: software_tpm.';
+COMMENT ON COLUMN "public"."jobs"."search_query" IS 'Exact query string used when the job was scraped.';
+COMMENT ON COLUMN "public"."jobs"."filter_profile" IS 'Versioned filter ruleset applied to the job when evaluating is_filtered.';
 
 CREATE INDEX IF NOT EXISTS "idx_jobs_is_filtered" ON "public"."jobs" ("is_filtered");
 CREATE INDEX IF NOT EXISTS "idx_jobs_is_entry_level_filtered" ON "public"."jobs" ("is_entry_level_filtered");
+CREATE INDEX IF NOT EXISTS "idx_jobs_archetype" ON "public"."jobs" ("archetype");
+CREATE INDEX IF NOT EXISTS "idx_jobs_provider_archetype" ON "public"."jobs" ("provider", "archetype");
+CREATE INDEX IF NOT EXISTS "idx_jobs_archetype_filtered" ON "public"."jobs" ("archetype", "is_filtered");
+CREATE INDEX IF NOT EXISTS "idx_jobs_search_query" ON "public"."jobs" ("search_query");
 
 -- Migration: add canonical role storage and repost tracking columns
 ALTER TABLE "public"."jobs"
@@ -375,6 +387,7 @@ BEGIN
         j.is_active = TRUE
         AND j.status = 'new'
         AND j.job_state = 'new'
+        AND j.is_filtered = FALSE
         AND j.customized_resume_id IS NOT NULL
         AND cr.resume_link IS NOT NULL
         AND j.resume_score_stage = 'initial'
@@ -420,6 +433,7 @@ BEGIN
         j.is_active = TRUE
         AND j.status = 'new'
         AND j.job_state = 'new'
+        AND j.is_filtered = FALSE
         AND j.resume_score >= 50
         AND j.customized_resume_id IS NULL -- Key new filter
     ORDER BY
@@ -471,6 +485,7 @@ BEGIN
         j.is_active = TRUE
         AND j.status = 'new'
         AND j.job_state = 'new'
+        AND j.is_filtered = FALSE
         AND j.resume_score >= p_min_score
         AND j.resume_score <= p_max_score
         AND (p_provider IS NULL OR j.provider = p_provider)
@@ -536,6 +551,7 @@ BEGIN
         j.is_active = TRUE
         AND j.status = 'new'
         AND j.job_state = 'new'
+        AND j.is_filtered = FALSE
         AND j.resume_score >= p_min_score
         AND j.resume_score <= p_max_score
         AND (p_provider IS NULL OR j.provider = p_provider)
@@ -610,9 +626,11 @@ ALTER TABLE "public"."customized_resumes" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
+    "archetype" text NOT NULL,
     "keyword" text NOT NULL,
     "category" text NOT NULL,
     "count" integer DEFAULT 0 NOT NULL,
+    "provider" text,
     "last_updated" timestamp with time zone DEFAULT now(),
     CONSTRAINT "keyword_insights_category_check"
         CHECK ("category" IN ('skill', 'technology', 'certification', 'attribute')),
@@ -626,8 +644,10 @@ ALTER TABLE "public"."keyword_insights" OWNER TO "postgres";
 
 CREATE TABLE IF NOT EXISTS "public"."job_keyword_insights" (
     "job_id" text NOT NULL,
+    "archetype" text NOT NULL,
     "keyword" text NOT NULL,
     "category" text NOT NULL,
+    "provider" text,
     "analyzed_at" timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT "job_keyword_insights_category_check"
         CHECK ("category" IN ('skill', 'technology', 'certification', 'attribute'))
@@ -656,11 +676,11 @@ ALTER TABLE ONLY "public"."customized_resumes"
 
 
 ALTER TABLE ONLY "public"."keyword_insights"
-    ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("keyword", "category");
+    ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "keyword", "category");
 
 
 ALTER TABLE ONLY "public"."job_keyword_insights"
-    ADD CONSTRAINT "job_keyword_insights_pkey" PRIMARY KEY ("job_id", "keyword", "category");
+    ADD CONSTRAINT "job_keyword_insights_pkey" PRIMARY KEY ("job_id", "archetype", "keyword", "category");
 
 
 
@@ -713,10 +733,16 @@ CREATE INDEX "idx_jobs_status" ON "public"."jobs" USING "btree" ("status");
 CREATE INDEX IF NOT EXISTS "idx_keyword_insights_category" ON "public"."keyword_insights" USING "btree" ("category");
 
 
+CREATE INDEX IF NOT EXISTS "idx_keyword_insights_archetype_category" ON "public"."keyword_insights" USING "btree" ("archetype", "category");
+
+
 CREATE INDEX IF NOT EXISTS "idx_keyword_insights_count" ON "public"."keyword_insights" USING "btree" ("count" DESC);
 
 
 CREATE INDEX IF NOT EXISTS "idx_job_keyword_insights_job_id" ON "public"."job_keyword_insights" USING "btree" ("job_id");
+
+
+CREATE INDEX IF NOT EXISTS "idx_job_keyword_insights_archetype" ON "public"."job_keyword_insights" USING "btree" ("archetype");
 
 
 CREATE INDEX IF NOT EXISTS "idx_job_keyword_insights_keyword_category" ON "public"."job_keyword_insights" USING "btree" ("keyword", "category");

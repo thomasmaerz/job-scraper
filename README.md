@@ -196,6 +196,20 @@ The individual Python scripts can still be run locally for development or testin
     python job_manager.py
     ```
 
+### Safe backfill order for archetype-aware filtering and insights
+
+1. Apply `supabase_setup/init.sql` and `supabase_setup/add_job_insights.sql`.
+2. Run `python backfill_filter.py` to stamp legacy LinkedIn rows with `software_tpm`, clear the removed aerospace-defense filter, and reapply archetype-aware filters.
+3. Run `JOB_INSIGHTS_REPLACEMENT_BACKFILL=true JOB_INSIGHTS_ARCHETYPE=software_tpm python analyze_jobs.py` to rebuild facts and aggregates from the clean corpus.
+
+### End-to-end rebuild verification for clean insights
+
+1. Start from a clean archetype-scoped corpus by completing the safe backfill order above.
+2. Run `JOB_INSIGHTS_REPLACEMENT_BACKFILL=true JOB_INSIGHTS_ARCHETYPE=software_tpm python analyze_jobs.py` so `job_keyword_insights` is fully replaced for the scoped corpus before `keyword_insights` is rebuilt.
+3. Verify the rebuilt `keyword_insights` rows remain separated by `archetype`, `keyword`, and `category` rather than collapsing shared keywords across archetypes.
+4. Confirm the rebuilt aggregate contains the expected `software_tpm` / `Python` / `technology` row with count `2` when the source facts include two matching software TPM rows.
+5. In the web app, verify the Insights page category tabs filter only within the already-scoped `software_tpm` dataset returned from Supabase, so switching tabs never reintroduces rows from a different archetype.
+
 ## Project Structure
 
 ```

@@ -31,6 +31,14 @@ logging.basicConfig(
 )
 
 if __name__ == "__main__":
-    logging.info("=== Starting full-DB filter backfill ===")
+    logging.info("=== Backfilling archetype provenance ===")
+    provenance_count = supabase_utils.backfill_job_archetypes()
+    logging.info("Backfilled archetype provenance on %s jobs", provenance_count)
+
+    logging.info("=== Clearing removed aerospace-defense filter ===")
+    unfiltered_count = supabase_utils.clear_removed_aerospace_defense_filter()
+    logging.info("Cleared outdated filter on %s jobs", unfiltered_count)
+
+    logging.info("=== Re-running archetype-aware filters ===")
     flagged = supabase_utils.flag_filtered_jobs()
-    logging.info(f"=== Backfill complete. Total newly flagged: {flagged} ===")
+    logging.info("Newly flagged %s jobs", flagged)

@@ -420,7 +420,13 @@ def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) ->
          logging.error(f"General Error processing details for job ID {job_id} after successful fetch: {e}")
          return None
 
-def process_linkedin_query(search_query: str, location: str, limit: int = None) -> list:
+def process_linkedin_query(
+    search_query: str,
+    location: str,
+    limit: int = None,
+    archetype: str | None = None,
+    filter_profile: str | None = None,
+) -> list:
     """
     Orchestrates scraping and detail fetching for a single query,
     filtering against existing jobs in Supabase BEFORE fetching details.
@@ -433,7 +439,14 @@ def process_linkedin_query(search_query: str, location: str, limit: int = None) 
         logging.info("No job IDs found in Phase 1. Skipping detail fetching.")
         return []
 
-    card_by_job_id = {card['job_id']: card for card in scraped_cards}
+    normalized_cards = []
+    for card in scraped_cards:
+        if isinstance(card, dict):
+            normalized_cards.append(card)
+        else:
+            normalized_cards.append({"job_id": str(card)})
+
+    card_by_job_id = {card['job_id']: card for card in normalized_cards}
     unique_linkedin_job_ids = list(card_by_job_id.keys())
 
     logging.info(f"Found {len(scraped_cards)} raw job cards, {len(unique_linkedin_job_ids)} unique IDs after scraping.")
@@ -468,10 +481,15 @@ def process_linkedin_query(search_query: str, location: str, limit: int = None) 
     processed_count = 0
 
     ids_to_fetch = new_job_ids_to_process
+    resolved_archetype = archetype or config.DEFAULT_ARCHETYPE
+    resolved_filter_profile = filter_profile or config.ARCHETYPE_CONFIGS[resolved_archetype]["filter_profile"]
 
     for job_id in ids_to_fetch:
         details = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
         if details:
+            details["search_query"] = search_query
+            details["archetype"] = resolved_archetype
+            details["filter_profile"] = resolved_filter_profile
             description = details.get('description')
             if description and description.strip(): 
                 if 'job_id' in details and details['job_id'] is not None:
@@ -789,19 +807,29 @@ if __name__ == "__main__":
     if "linkedin" in config.SCRAPING_SOURCES:
         logging.info("\n--- Starting LinkedIn Job Scraping ---")
         max_jobs_per_search = config.MAX_JOBS_PER_SEARCH.get("linkedin", getattr(config, 'DEFAULT_MAX_JOBS_PER_SEARCH', 10))
-        for query in config.LINKEDIN_SEARCH_QUERIES:
-            print(f"\n{'='*20} Processing Search Query: '{query}' {'='*20}")
+        for archetype_name, archetype_config in config.ARCHETYPE_CONFIGS.items():
+            if archetype_config["provider"] != "linkedin":
+                continue
 
-            # 1. Process the query: Scrape IDs, filter, fetch new details
-            new_linkedin_job_details = process_linkedin_query(query, config.LINKEDIN_LOCATION, limit=max_jobs_per_search)
+            for query in archetype_config["search_queries"]:
+                print(f"\n{'='*20} Processing Search Query: '{query}' {'='*20}")
 
-            # 2. Save the NEW scraped data to Supabase
-            if new_linkedin_job_details:
-                print(f"\n--- Saving {len(new_linkedin_job_details)} new job(s) for query '{query}' ---")
-                supabase_utils.save_linkedin_jobs_canonicalized(new_linkedin_job_details)
-                total_new_jobs_saved += len(new_linkedin_job_details)
-            else:
-                print(f"\nNo new job details were fetched or processed for query '{query}'.")
+                # 1. Process the query: Scrape IDs, filter, fetch new details
+                new_linkedin_job_details = process_linkedin_query(
+                    search_query=query,
+                    location=archetype_config["location"],
+                    limit=max_jobs_per_search,
+                    archetype=archetype_name,
+                    filter_profile=archetype_config["filter_profile"],
+                )
+
+                # 2. Save the NEW scraped data to Supabase
+                if new_linkedin_job_details:
+                    print(f"\n--- Saving {len(new_linkedin_job_details)} new job(s) for query '{query}' ---")
+                    supabase_utils.save_linkedin_jobs_canonicalized(new_linkedin_job_details)
+                    total_new_jobs_saved += len(new_linkedin_job_details)
+                else:
+                    print(f"\nNo new job details were fetched or processed for query '{query}'.")
     else:
         logging.info("\n--- Skipping LinkedIn Job Scraping per config ---")
 

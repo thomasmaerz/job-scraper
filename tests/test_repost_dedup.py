@@ -292,6 +292,44 @@ def test_get_recent_canonical_candidates_selects_fields_needed_for_partial_repos
     )
 
 
+def test_save_jobs_to_supabase_preserves_canonical_and_task2_metadata_fields(monkeypatch):
+    query = _RecordingQuery(response_data=[])
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+
+    job = {
+        "job_id": "4426608777",
+        "provider": "linkedin",
+        "company": "Chandos Construction",
+        "job_title": "Industrial Construction - Senior Project Manager",
+        "location": "Chalk River, Ontario, Canada",
+        "description": "We are Chandos. Inclusion, collaboration, innovation.",
+        "posted_at": "2026-06-12",
+        "search_query": "Technical Program Manager",
+        "archetype": "software_tpm",
+        "filter_profile": "software_tpm_v1",
+    }
+
+    payload = supabase_utils.prepare_canonical_insert_payload(job)
+
+    supabase_utils.save_jobs_to_supabase([payload])
+
+    saved = query.upsert_payloads[0][0]
+
+    assert saved["search_query"] == "Technical Program Manager"
+    assert saved["archetype"] == "software_tpm"
+    assert saved["filter_profile"] == "software_tpm_v1"
+    assert saved["canonical_key"] == payload["canonical_key"]
+    assert saved["original_job_id"] == "4426608777"
+    assert saved["latest_job_id"] == "4426608777"
+    assert saved["first_seen_at"] == payload["first_seen_at"]
+    assert saved["last_seen_at"] == payload["last_seen_at"]
+    assert saved["last_seen_posted_at"] == "2026-06-12"
+    assert saved["seen_count"] == 1
+    assert saved["repost_count"] == 0
+    assert saved["listing_instances"] == payload["listing_instances"]
+    assert saved["description_fingerprint"] == payload["description_fingerprint"]
+
+
 def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_company_variants(monkeypatch):
     existing = {
         "job_id": "4394716706",

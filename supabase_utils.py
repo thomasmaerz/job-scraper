@@ -8,6 +8,7 @@ import logging # Import logging
 import re # Import re for filter pattern matching
 import string
 import unicodedata
+from datetime import datetime, timezone
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -70,6 +71,65 @@ def make_description_fingerprint(description: str) -> str | None:
     if len(normalized) < min_len:
         return None
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def build_listing_instance(job: dict) -> dict:
+    return {
+        "job_id": str(job.get("job_id")),
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "posted_at": job.get("posted_at"),
+        "posted_relative_text": job.get("posted_relative_text"),
+        "applicant_count": job.get("applicant_count"),
+        "salary_text": job.get("salary_text"),
+        "recruiter_name": job.get("recruiter_name"),
+        "recruiter_profile_url": job.get("recruiter_profile_url"),
+        "recruiter_identifier": job.get("recruiter_identifier"),
+    }
+
+
+def prepare_canonical_insert_payload(job: dict) -> dict:
+    canonical_key = build_canonical_key(
+        job.get("provider"),
+        job.get("company"),
+        job.get("job_title"),
+        job.get("location"),
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = dict(job)
+    payload["canonical_key"] = canonical_key
+    payload["original_job_id"] = str(job.get("job_id"))
+    payload["latest_job_id"] = str(job.get("job_id"))
+    payload["first_seen_at"] = now_iso
+    payload["last_seen_at"] = now_iso
+    payload["last_seen_posted_at"] = job.get("posted_at")
+    payload["seen_count"] = 1
+    payload["repost_count"] = 0
+    payload["listing_instances"] = [build_listing_instance(job)]
+    payload["description_fingerprint"] = make_description_fingerprint(job.get("description"))
+    return payload
+
+
+def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
+    listing_instances = list(existing.get("listing_instances") or [])
+    listing_instances.append(build_listing_instance(new_job))
+    return {
+        "job_id": existing["job_id"],
+        "latest_job_id": str(new_job.get("job_id")),
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen_posted_at": new_job.get("posted_at"),
+        "posted_relative_text": new_job.get("posted_relative_text"),
+        "applicant_count": new_job.get("applicant_count"),
+        "salary_text": new_job.get("salary_text"),
+        "salary_min": new_job.get("salary_min"),
+        "salary_max": new_job.get("salary_max"),
+        "salary_currency": new_job.get("salary_currency"),
+        "recruiter_name": new_job.get("recruiter_name"),
+        "recruiter_profile_url": new_job.get("recruiter_profile_url"),
+        "recruiter_identifier": new_job.get("recruiter_identifier"),
+        "seen_count": int(existing.get("seen_count") or 0) + 1,
+        "repost_count": int(existing.get("repost_count") or 0) + 1,
+        "listing_instances": listing_instances,
+    }
 
 # --- Supabase Functions ---
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:

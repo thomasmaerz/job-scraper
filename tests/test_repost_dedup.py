@@ -81,3 +81,48 @@ def test_description_fingerprint_normalizes_unicode_punctuation_for_long_equival
     assert fingerprint_plain is not None
     assert fingerprint_formatted is not None
     assert fingerprint_plain == fingerprint_formatted
+
+
+def test_prepare_canonical_insert_payload():
+    job = {
+        "job_id": "4426608777",
+        "provider": "linkedin",
+        "company": "Chandos Construction",
+        "job_title": "Industrial Construction - Senior Project Manager",
+        "location": "Chalk River, Ontario, Canada",
+        "description": "We are Chandos. Inclusion, collaboration, innovation.",
+        "posted_at": "2026-06-12",
+        "posted_relative_text": "18 hours ago",
+        "applicant_count": 26,
+    }
+
+    payload = supabase_utils.prepare_canonical_insert_payload(job)
+
+    assert payload["original_job_id"] == "4426608777"
+    assert payload["latest_job_id"] == "4426608777"
+    assert payload["seen_count"] == 1
+    assert payload["repost_count"] == 0
+    assert payload["listing_instances"][0]["job_id"] == "4426608777"
+
+
+def test_prepare_repost_update_payload():
+    existing = {
+        "job_id": "4394716706",
+        "listing_instances": [{"job_id": "4394716706", "scraped_at": "2026-05-29T12:00:00Z"}],
+        "seen_count": 1,
+        "repost_count": 0,
+    }
+    new_job = {
+        "job_id": "4426608777",
+        "posted_at": "2026-06-12",
+        "posted_relative_text": "18 hours ago",
+        "applicant_count": 26,
+        "salary_text": "$120,000-$135,000 CAD",
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, new_job)
+
+    assert update["latest_job_id"] == "4426608777"
+    assert update["seen_count"] == 2
+    assert update["repost_count"] == 1
+    assert len(update["listing_instances"]) == 2

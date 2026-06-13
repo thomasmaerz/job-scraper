@@ -259,7 +259,7 @@ def _fetch_linkedin_job_ids(search_query: str, location: str) -> list:
     logging.info(f"--- Finished Phase 1: Found {len(scraped_cards)} unique job IDs during scraping ---")
     return scraped_cards
 
-def _fetch_linkedin_job_details(job_id: str) -> dict | None:
+def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) -> dict | None:
     """Fetches detailed information for a single job ID with delays, rotating user agents, and retries."""
 
     job_detail_url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
@@ -408,6 +408,10 @@ def _fetch_linkedin_job_details(job_id: str) -> dict | None:
 
         # --- Set Provider ---
         job_details["provider"] = "linkedin"
+
+        if search_card:
+            job_details["posted_at"] = search_card.get("posted_at")
+            job_details["posted_relative_text"] = search_card.get("posted_relative_text")
         
         return job_details
 
@@ -466,7 +470,7 @@ def process_linkedin_query(search_query: str, location: str, limit: int = None) 
     ids_to_fetch = new_job_ids_to_process
 
     for job_id in ids_to_fetch:
-        details = _fetch_linkedin_job_details(job_id)
+        details = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
         if details:
             description = details.get('description')
             if description and description.strip(): 

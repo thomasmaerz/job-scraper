@@ -57,7 +57,7 @@ def test_process_linkedin_query_raises_clear_error_for_missing_filter_profile(mo
 
     with patch.object(scraper, "_fetch_linkedin_job_ids", return_value=["123"]), \
          patch.object(scraper.supabase_utils, "get_existing_jobs_from_supabase", return_value=(set(), set())):
-        with pytest.raises(ValueError, match="missing required config key\(s\): filter_profile"):
+        with pytest.raises(ValueError, match=r"missing required config key\(s\): filter_profile"):
             scraper.process_linkedin_query(
                 search_query="Technical Program Manager",
                 location="Canada",

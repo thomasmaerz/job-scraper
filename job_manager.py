@@ -159,7 +159,7 @@ async def check_linkedin_job_activity():
         # Limit the number of checks per run
         excluded_statuses = ['applied', 'offer', 'interviewing'] # Add any status that means "don't expire"
         query = supabase.table(config.SUPABASE_TABLE_NAME)\
-            .select("job_id, last_checked")\
+            .select("job_id, latest_job_id, last_checked")\
             .eq("is_active", True)\
             .eq("provider", "linkedin")\
             .not_.in_("status", excluded_statuses)\
@@ -184,7 +184,8 @@ async def check_linkedin_job_activity():
     async with httpx.AsyncClient() as client:
         tasks = []
         for job in jobs_to_check:
-            tasks.append(_check_single_linkedin_job_active(job['job_id'], client))
+            live_job_id = job.get("latest_job_id") or job.get("job_id")
+            tasks.append(_check_single_linkedin_job_active(live_job_id, client))
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     inactive_job_ids = []

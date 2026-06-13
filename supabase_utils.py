@@ -494,7 +494,7 @@ def backfill_job_archetypes(
     return len(response.data or [])
 
 
-def clear_removed_aerospace_defense_filter() -> int:
+def clear_removed_aerospace_defense_filter(archetype: str = "software_tpm") -> int:
     response = (
         supabase.table(config.SUPABASE_TABLE_NAME)
         .update({
@@ -503,6 +503,7 @@ def clear_removed_aerospace_defense_filter() -> int:
             "is_entry_level_filtered": False,
         })
         .eq("filter_reason", r"desc:aerospace.*defense|defense.*aerospace")
+        .eq("archetype", archetype)
         .execute()
     )
     return len(response.data or [])

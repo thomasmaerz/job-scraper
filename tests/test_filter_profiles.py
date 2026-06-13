@@ -318,6 +318,7 @@ def test_clear_removed_aerospace_defense_filter_resets_removed_reason(monkeypatc
             },
             "filters": [
                 ("eq", "filter_reason", r"desc:aerospace.*defense|defense.*aerospace"),
+                ("eq", "archetype", "software_tpm"),
             ],
         }
     ]

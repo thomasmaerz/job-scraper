@@ -6,6 +6,10 @@ def test_normalize_title_handles_clear_cut_abbreviations():
     assert supabase_utils.normalize_title("Technical   Project-Manager") == "technical project manager"
 
 
+def test_normalize_title_does_not_corrupt_embedded_tokens():
+    assert supabase_utils.normalize_title("SRE Manager") == "sre manager"
+
+
 def test_normalize_location_collapses_formatting_noise():
     assert supabase_utils.normalize_location(" Toronto , Ontario  , Canada ") == "toronto ontario canada"
 
@@ -21,6 +25,12 @@ def test_build_canonical_key_uses_normalized_parts():
 
 
 def test_description_fingerprint_ignores_minor_formatting_changes():
-    a = "We are Chandos. Inclusion, collaboration, innovation."
-    b = "We are Chandos\n\nInclusion, collaboration, innovation!"
-    assert supabase_utils.make_description_fingerprint(a) == supabase_utils.make_description_fingerprint(b)
+    sentence = "We are Chandos. Inclusion, collaboration, innovation, and continuous improvement drive every project we deliver. "
+    a = sentence * 6
+    b = (sentence.replace(". ", "\n\n").replace(", ", ",  ").replace(" improvement", " improvement!") * 6)
+
+    fingerprint_a = supabase_utils.make_description_fingerprint(a)
+    fingerprint_b = supabase_utils.make_description_fingerprint(b)
+
+    assert fingerprint_a is not None
+    assert fingerprint_a == fingerprint_b

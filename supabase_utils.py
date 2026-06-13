@@ -22,9 +22,10 @@ def _collapse_spaces(value: str) -> str:
 
 def normalize_title(title: str) -> str:
     value = (title or "").lower()
-    for raw, replacement in getattr(config, "TITLE_NORMALIZATION_REPLACEMENTS", {}).items():
-        value = value.replace(raw, replacement)
     value = value.replace("-", " ").replace("/", " ")
+    for raw, replacement in getattr(config, "TITLE_NORMALIZATION_REPLACEMENTS", {}).items():
+        pattern = rf"\b{re.escape(raw)}\b"
+        value = re.sub(pattern, replacement, value)
     value = value.translate(str.maketrans("", "", string.punctuation.replace("&", "")))
     value = value.replace("&", " and ")
     return _collapse_spaces(value)

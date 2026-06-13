@@ -41,6 +41,7 @@ def normalize_location(location: str) -> str:
 
 def normalize_company(company: str) -> str:
     value = (company or "").lower()
+    value = value.replace("-", " ").replace("/", " ")
     value = value.translate(str.maketrans("", "", string.punctuation))
     return _collapse_spaces(value)
 

@@ -24,6 +24,35 @@ def test_build_canonical_key_uses_normalized_parts():
     assert key == "linkedin|chandos construction|senior project manager|chalk river ontario canada"
 
 
+def test_normalize_company_treats_separator_variants_consistently():
+    assert supabase_utils.normalize_company("Foo-Bar") == "foo bar"
+    assert supabase_utils.normalize_company("Foo/Bar") == "foo bar"
+    assert supabase_utils.normalize_company("Foo Bar") == "foo bar"
+
+
+def test_build_canonical_key_uses_normalized_company_separator_variants():
+    dash_key = supabase_utils.build_canonical_key(
+        provider="linkedin",
+        company="Foo-Bar",
+        title="Sr. Project Manager",
+        location="Toronto / Ontario - Canada",
+    )
+    slash_key = supabase_utils.build_canonical_key(
+        provider="linkedin",
+        company="Foo/Bar",
+        title="Senior Project Manager",
+        location="Toronto, Ontario, Canada",
+    )
+    space_key = supabase_utils.build_canonical_key(
+        provider="linkedin",
+        company="Foo Bar",
+        title="Sr Project Manager",
+        location="Toronto Ontario Canada",
+    )
+
+    assert dash_key == slash_key == space_key == "linkedin|foo bar|senior project manager|toronto ontario canada"
+
+
 def test_description_fingerprint_ignores_minor_formatting_changes():
     sentence = "We are Chandos. Inclusion, collaboration, innovation, and continuous improvement drive every project we deliver. "
     a = sentence * 6

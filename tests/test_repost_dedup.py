@@ -189,3 +189,28 @@ def test_prepare_repost_update_payload_preserves_existing_canonical_fields_on_pa
     assert update["recruiter_name"] == "Jane Recruiter"
     assert update["recruiter_profile_url"] == "https://www.linkedin.com/in/jane-recruiter"
     assert update["recruiter_identifier"] == "jane-recruiter"
+
+
+def test_find_canonical_match_prefers_existing_role():
+    existing_rows = [{
+        "job_id": "4394716706",
+        "canonical_key": "linkedin|chandos construction|industrial construction senior project manager|chalk river ontario canada",
+        "company": "Chandos Construction",
+        "job_title": "Industrial Construction - Senior Project Manager",
+        "location": "Chalk River, Ontario, Canada",
+        "description_fingerprint": supabase_utils.make_description_fingerprint("We are Chandos. Inclusion, collaboration, innovation."),
+        "listing_instances": [],
+        "seen_count": 1,
+        "repost_count": 0,
+    }]
+    job = {
+        "provider": "linkedin",
+        "company": "Chandos Construction",
+        "job_title": "Industrial Construction - Senior Project Manager",
+        "location": "Chalk River, Ontario, Canada",
+        "description": "We are Chandos. Inclusion, collaboration, innovation!",
+    }
+
+    match = supabase_utils.find_canonical_match(job, existing_rows)
+
+    assert match["job_id"] == "4394716706"

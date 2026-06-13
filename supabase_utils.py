@@ -8,7 +8,7 @@ import logging # Import logging
 import re # Import re for filter pattern matching
 import string
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -133,6 +133,66 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
         "repost_count": int(existing.get("repost_count") or 0) + 1,
         "listing_instances": listing_instances,
     }
+
+
+def find_canonical_match(job: dict, existing_rows: list[dict]) -> dict | None:
+    target_key = build_canonical_key(
+        job.get("provider"),
+        job.get("company"),
+        job.get("job_title"),
+        job.get("location"),
+    )
+    target_fp = make_description_fingerprint(job.get("description"))
+
+    for row in existing_rows:
+        if row.get("canonical_key") == target_key:
+            return row
+
+    if not target_fp:
+        return None
+
+    for row in existing_rows:
+        same_company = normalize_company(row.get("company")) == normalize_company(job.get("company"))
+        same_title = normalize_title(row.get("job_title")) == normalize_title(job.get("job_title"))
+        same_location = normalize_location(row.get("location")) == normalize_location(job.get("location"))
+        same_fp = row.get("description_fingerprint") and row.get("description_fingerprint") == target_fp
+        if same_company and same_title and same_location and same_fp:
+            return row
+
+    return None
+
+
+def get_recent_canonical_candidates(provider: str, company: str, days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    response = (
+        supabase.table(config.SUPABASE_TABLE_NAME)
+        .select("job_id, canonical_key, company, job_title, location, description_fingerprint, listing_instances, seen_count, repost_count")
+        .eq("provider", provider)
+        .eq("company", company)
+        .gte("last_seen_at", cutoff)
+        .execute()
+    )
+    return response.data or []
+
+
+def save_linkedin_jobs_canonicalized(jobs_data: list):
+    for job in jobs_data:
+        if not getattr(config, "ENABLE_REPOST_DEDUP", True):
+            save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
+            continue
+
+        candidates = get_recent_canonical_candidates(
+            provider=job.get("provider"),
+            company=job.get("company"),
+            days=getattr(config, "REPOST_DEDUP_DAYS", 30),
+        )
+        match = find_canonical_match(job, candidates)
+
+        if match:
+            payload = prepare_repost_update_payload(match, job)
+            supabase.table(config.SUPABASE_TABLE_NAME).upsert([payload]).execute()
+        else:
+            save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
 
 # --- Supabase Functions ---
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:

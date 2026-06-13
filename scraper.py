@@ -794,7 +794,7 @@ if __name__ == "__main__":
             # 2. Save the NEW scraped data to Supabase
             if new_linkedin_job_details:
                 print(f"\n--- Saving {len(new_linkedin_job_details)} new job(s) for query '{query}' ---")
-                supabase_utils.save_jobs_to_supabase(new_linkedin_job_details)
+                supabase_utils.save_linkedin_jobs_canonicalized(new_linkedin_job_details)
                 total_new_jobs_saved += len(new_linkedin_job_details)
             else:
                 print(f"\nNo new job details were fetched or processed for query '{query}'.")

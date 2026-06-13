@@ -15,6 +15,22 @@ from urllib.parse import urlparse
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def _resolve_archetype_config(archetype: str | None) -> tuple[str, dict]:
+    resolved_archetype = archetype or config.DEFAULT_ARCHETYPE
+    archetype_config = config.ARCHETYPE_CONFIGS.get(resolved_archetype)
+    if archetype_config is None:
+        raise ValueError(f"Unknown archetype '{resolved_archetype}'. Check config.ARCHETYPE_CONFIGS.")
+
+    missing_keys = [key for key in ("filter_profile",) if not archetype_config.get(key)]
+    if missing_keys:
+        missing_keys_text = ", ".join(missing_keys)
+        raise ValueError(
+            f"Archetype '{resolved_archetype}' is missing required config key(s): {missing_keys_text}."
+        )
+
+    return resolved_archetype, archetype_config
+
 def _parse_salary_fields(text: str) -> dict:
     if not text:
         return {"salary_text": None, "salary_min": None, "salary_max": None, "salary_currency": None}
@@ -481,8 +497,8 @@ def process_linkedin_query(
     processed_count = 0
 
     ids_to_fetch = new_job_ids_to_process
-    resolved_archetype = archetype or config.DEFAULT_ARCHETYPE
-    resolved_filter_profile = filter_profile or config.ARCHETYPE_CONFIGS[resolved_archetype]["filter_profile"]
+    resolved_archetype, archetype_config = _resolve_archetype_config(archetype)
+    resolved_filter_profile = filter_profile or archetype_config["filter_profile"]
 
     for job_id in ids_to_fetch:
         details = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))

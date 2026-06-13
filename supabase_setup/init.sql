@@ -132,7 +132,6 @@ CREATE INDEX IF NOT EXISTS "idx_jobs_last_seen_at" ON "public"."jobs" ("last_see
 CREATE INDEX IF NOT EXISTS "idx_jobs_last_seen_posted_at" ON "public"."jobs" ("last_seen_posted_at");
 
 
-COMMENT ON COLUMN "public"."jobs"."job_id" IS 'LinkedIn''s unique job ID (from URN, e.g., ''3884913367'')';
 COMMENT ON COLUMN "public"."jobs"."job_id" IS 'Canonical row identifier for the stored job record. For LinkedIn canonical rows, this is the stable row anchor, not necessarily the latest live LinkedIn posting ID.';
 COMMENT ON COLUMN "public"."jobs"."original_job_id" IS 'First LinkedIn listing ID observed for this canonical role.';
 COMMENT ON COLUMN "public"."jobs"."latest_job_id" IS 'Most recent LinkedIn listing ID observed for this canonical role. Use this for outbound LinkedIn fetches.';

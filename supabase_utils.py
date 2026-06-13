@@ -166,9 +166,13 @@ def get_recent_canonical_candidates(provider: str, company: str, days: int) -> l
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     response = (
         supabase.table(config.SUPABASE_TABLE_NAME)
-        .select("job_id, canonical_key, company, job_title, location, description_fingerprint, listing_instances, seen_count, repost_count")
+        .select(
+            "job_id, canonical_key, company, job_title, location, description_fingerprint, "
+            "listing_instances, seen_count, repost_count, latest_job_id, last_seen_posted_at, "
+            "posted_relative_text, applicant_count, salary_text, salary_min, salary_max, "
+            "salary_currency, recruiter_name, recruiter_profile_url, recruiter_identifier"
+        )
         .eq("provider", provider)
-        .eq("company", company)
         .gte("last_seen_at", cutoff)
         .execute()
     )

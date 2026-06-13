@@ -74,8 +74,9 @@ def make_description_fingerprint(description: str) -> str | None:
 
 
 def build_listing_instance(job: dict) -> dict:
+    job_id = job.get("job_id")
     return {
-        "job_id": str(job.get("job_id")),
+        "job_id": str(job_id) if job_id is not None else None,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "posted_at": job.get("posted_at"),
         "posted_relative_text": job.get("posted_relative_text"),
@@ -95,10 +96,11 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
         job.get("location"),
     )
     now_iso = datetime.now(timezone.utc).isoformat()
+    job_id = job.get("job_id")
     payload = dict(job)
     payload["canonical_key"] = canonical_key
-    payload["original_job_id"] = str(job.get("job_id"))
-    payload["latest_job_id"] = str(job.get("job_id"))
+    payload["original_job_id"] = str(job_id) if job_id is not None else None
+    payload["latest_job_id"] = str(job_id) if job_id is not None else None
     payload["first_seen_at"] = now_iso
     payload["last_seen_at"] = now_iso
     payload["last_seen_posted_at"] = job.get("posted_at")
@@ -112,20 +114,21 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
 def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
     listing_instances = list(existing.get("listing_instances") or [])
     listing_instances.append(build_listing_instance(new_job))
+    new_job_id = new_job.get("job_id")
     return {
         "job_id": existing["job_id"],
-        "latest_job_id": str(new_job.get("job_id")),
+        "latest_job_id": str(new_job_id) if new_job_id is not None else None,
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
-        "last_seen_posted_at": new_job.get("posted_at"),
-        "posted_relative_text": new_job.get("posted_relative_text"),
-        "applicant_count": new_job.get("applicant_count"),
-        "salary_text": new_job.get("salary_text"),
-        "salary_min": new_job.get("salary_min"),
-        "salary_max": new_job.get("salary_max"),
-        "salary_currency": new_job.get("salary_currency"),
-        "recruiter_name": new_job.get("recruiter_name"),
-        "recruiter_profile_url": new_job.get("recruiter_profile_url"),
-        "recruiter_identifier": new_job.get("recruiter_identifier"),
+        "last_seen_posted_at": new_job.get("posted_at") if new_job.get("posted_at") is not None else existing.get("last_seen_posted_at"),
+        "posted_relative_text": new_job.get("posted_relative_text") if new_job.get("posted_relative_text") is not None else existing.get("posted_relative_text"),
+        "applicant_count": new_job.get("applicant_count") if new_job.get("applicant_count") is not None else existing.get("applicant_count"),
+        "salary_text": new_job.get("salary_text") if new_job.get("salary_text") is not None else existing.get("salary_text"),
+        "salary_min": new_job.get("salary_min") if new_job.get("salary_min") is not None else existing.get("salary_min"),
+        "salary_max": new_job.get("salary_max") if new_job.get("salary_max") is not None else existing.get("salary_max"),
+        "salary_currency": new_job.get("salary_currency") if new_job.get("salary_currency") is not None else existing.get("salary_currency"),
+        "recruiter_name": new_job.get("recruiter_name") if new_job.get("recruiter_name") is not None else existing.get("recruiter_name"),
+        "recruiter_profile_url": new_job.get("recruiter_profile_url") if new_job.get("recruiter_profile_url") is not None else existing.get("recruiter_profile_url"),
+        "recruiter_identifier": new_job.get("recruiter_identifier") if new_job.get("recruiter_identifier") is not None else existing.get("recruiter_identifier"),
         "seen_count": int(existing.get("seen_count") or 0) + 1,
         "repost_count": int(existing.get("repost_count") or 0) + 1,
         "listing_instances": listing_instances,

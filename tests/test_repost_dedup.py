@@ -231,6 +231,24 @@ def test_prepare_repost_update_payload_preserves_existing_canonical_fields_on_pa
     assert update["recruiter_identifier"] == "jane-recruiter"
 
 
+def test_prepare_repost_update_payload_preserves_existing_latest_job_id_when_new_job_id_missing():
+    existing = {
+        "job_id": "4394716706",
+        "latest_job_id": "4426608777",
+        "listing_instances": [{"job_id": "4394716706", "scraped_at": "2026-05-29T12:00:00Z"}],
+        "seen_count": 1,
+        "repost_count": 0,
+    }
+    new_job = {
+        "job_id": None,
+        "posted_at": None,
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, new_job)
+
+    assert update["latest_job_id"] == "4426608777"
+
+
 def test_find_canonical_match_prefers_existing_role():
     existing_rows = [{
         "job_id": "4394716706",
@@ -334,3 +352,43 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
     assert query.upsert_payloads[0][0]["job_id"] == "4394716706"
     assert query.upsert_payloads[0][0]["latest_job_id"] == "4426608777"
     assert query.upsert_payloads[0][0]["salary_text"] == "$120,000-$135,000 CAD"
+
+
+def test_save_linkedin_jobs_canonicalized_caches_recent_candidates_by_query_params(monkeypatch):
+    calls = []
+
+    def fake_get_recent_canonical_candidates(provider, company, days):
+        calls.append((provider, company, days))
+        return []
+
+    inserted_payloads = []
+
+    def fake_save_jobs_to_supabase(payloads):
+        inserted_payloads.extend(payloads)
+
+    monkeypatch.setattr(supabase_utils, "get_recent_canonical_candidates", fake_get_recent_canonical_candidates)
+    monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", fake_save_jobs_to_supabase)
+
+    jobs = [
+        {
+            "job_id": "1",
+            "provider": "linkedin",
+            "company": "Acme",
+            "job_title": "TPM",
+            "location": "Toronto",
+            "description": "desc 1",
+        },
+        {
+            "job_id": "2",
+            "provider": "linkedin",
+            "company": "Acme",
+            "job_title": "TPM 2",
+            "location": "Toronto",
+            "description": "desc 2",
+        },
+    ]
+
+    supabase_utils.save_linkedin_jobs_canonicalized(jobs)
+
+    assert calls == [("linkedin", "Acme", getattr(supabase_utils.config, "REPOST_DEDUP_DAYS", 30))]
+    assert len(inserted_payloads) == 2

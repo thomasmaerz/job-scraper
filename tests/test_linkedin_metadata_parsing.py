@@ -32,7 +32,7 @@ def test_extract_detail_metadata_applicants_salary_recruiter():
 def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
     cards = [{"job_id": "123", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
 
-    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda q, l: cards)
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location: cards)
     monkeypatch.setattr(scraper.supabase_utils, "get_existing_jobs_from_supabase", lambda: (set(), set()))
     monkeypatch.setattr(scraper, "_fetch_linkedin_job_details", lambda job_id, search_card=None: {
         "job_id": job_id,
@@ -48,3 +48,25 @@ def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
     results = scraper.process_linkedin_query("TPM", "Canada")
     assert results[0]["posted_at"] == "2026-06-12"
     assert results[0]["posted_relative_text"] == "2 hours ago"
+
+
+def test_process_linkedin_query_skips_ids_already_seen_as_latest_job_id(monkeypatch):
+    cards = [{"job_id": "linkedin-live-99", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
+    fetched_job_ids = []
+
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location: cards)
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "get_existing_jobs_from_supabase",
+        lambda: ({"canonical-1", "linkedin-live-99"}, set()),
+    )
+    monkeypatch.setattr(
+        scraper,
+        "_fetch_linkedin_job_details",
+        lambda job_id, search_card=None: fetched_job_ids.append(job_id),
+    )
+
+    results = scraper.process_linkedin_query("TPM", "Canada")
+
+    assert results == []
+    assert fetched_job_ids == []

@@ -117,7 +117,7 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
     new_job_id = new_job.get("job_id")
     return {
         "job_id": existing["job_id"],
-        "latest_job_id": str(new_job_id) if new_job_id is not None else None,
+        "latest_job_id": str(new_job_id) if new_job_id is not None else existing.get("latest_job_id"),
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
         "last_seen_posted_at": new_job.get("posted_at") if new_job.get("posted_at") is not None else existing.get("last_seen_posted_at"),
         "posted_relative_text": new_job.get("posted_relative_text") if new_job.get("posted_relative_text") is not None else existing.get("posted_relative_text"),
@@ -180,16 +180,25 @@ def get_recent_canonical_candidates(provider: str, company: str, days: int) -> l
 
 
 def save_linkedin_jobs_canonicalized(jobs_data: list):
+    candidates_cache = {}
     for job in jobs_data:
         if not getattr(config, "ENABLE_REPOST_DEDUP", True):
             save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
             continue
 
-        candidates = get_recent_canonical_candidates(
-            provider=job.get("provider"),
-            company=job.get("company"),
-            days=getattr(config, "REPOST_DEDUP_DAYS", 30),
+        cache_key = (
+            job.get("provider"),
+            job.get("company"),
+            getattr(config, "REPOST_DEDUP_DAYS", 30),
         )
+        candidates = candidates_cache.get(cache_key)
+        if candidates is None:
+            candidates = get_recent_canonical_candidates(
+                provider=cache_key[0],
+                company=cache_key[1],
+                days=cache_key[2],
+            )
+            candidates_cache[cache_key] = candidates
         match = find_canonical_match(job, candidates)
 
         if match:
@@ -214,7 +223,7 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
         while True:
             response = (
                 supabase.table(config.SUPABASE_TABLE_NAME)
-                .select("job_id, company, job_title")
+                .select("job_id, latest_job_id, company, job_title")
                 .range(offset, offset + batch_size - 1)
                 .execute()
             )
@@ -231,6 +240,10 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
 
                 if job_id:
                     existing_ids.add(str(job_id))
+
+                latest_job_id = item.get("latest_job_id")
+                if latest_job_id:
+                    existing_ids.add(str(latest_job_id))
 
                 if company and job_title:
                     normalized_company = company.strip().lower()

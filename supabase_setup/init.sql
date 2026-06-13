@@ -104,8 +104,39 @@ COMMENT ON COLUMN "public"."jobs"."is_entry_level_filtered" IS 'True if filtered
 CREATE INDEX IF NOT EXISTS "idx_jobs_is_filtered" ON "public"."jobs" ("is_filtered");
 CREATE INDEX IF NOT EXISTS "idx_jobs_is_entry_level_filtered" ON "public"."jobs" ("is_entry_level_filtered");
 
+-- Migration: add canonical role storage and repost tracking columns
+ALTER TABLE "public"."jobs"
+    ADD COLUMN IF NOT EXISTS "canonical_key" text,
+    ADD COLUMN IF NOT EXISTS "original_job_id" text,
+    ADD COLUMN IF NOT EXISTS "latest_job_id" text,
+    ADD COLUMN IF NOT EXISTS "last_seen_posted_at" timestamp with time zone,
+    ADD COLUMN IF NOT EXISTS "posted_relative_text" text,
+    ADD COLUMN IF NOT EXISTS "applicant_count" integer,
+    ADD COLUMN IF NOT EXISTS "salary_text" text,
+    ADD COLUMN IF NOT EXISTS "salary_min" numeric,
+    ADD COLUMN IF NOT EXISTS "salary_max" numeric,
+    ADD COLUMN IF NOT EXISTS "salary_currency" text,
+    ADD COLUMN IF NOT EXISTS "recruiter_name" text,
+    ADD COLUMN IF NOT EXISTS "recruiter_profile_url" text,
+    ADD COLUMN IF NOT EXISTS "recruiter_identifier" text,
+    ADD COLUMN IF NOT EXISTS "description_fingerprint" text,
+    ADD COLUMN IF NOT EXISTS "first_seen_at" timestamp with time zone DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS "last_seen_at" timestamp with time zone DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS "seen_count" integer DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS "repost_count" integer DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS "listing_instances" jsonb DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS "idx_jobs_canonical_key" ON "public"."jobs" ("canonical_key");
+CREATE INDEX IF NOT EXISTS "idx_jobs_company_title_location" ON "public"."jobs" ("company", "job_title", "location");
+CREATE INDEX IF NOT EXISTS "idx_jobs_last_seen_at" ON "public"."jobs" ("last_seen_at");
+CREATE INDEX IF NOT EXISTS "idx_jobs_last_seen_posted_at" ON "public"."jobs" ("last_seen_posted_at");
+
 
 COMMENT ON COLUMN "public"."jobs"."job_id" IS 'LinkedIn''s unique job ID (from URN, e.g., ''3884913367'')';
+COMMENT ON COLUMN "public"."jobs"."job_id" IS 'Canonical row identifier for the stored job record. For LinkedIn canonical rows, this is the stable row anchor, not necessarily the latest live LinkedIn posting ID.';
+COMMENT ON COLUMN "public"."jobs"."original_job_id" IS 'First LinkedIn listing ID observed for this canonical role.';
+COMMENT ON COLUMN "public"."jobs"."latest_job_id" IS 'Most recent LinkedIn listing ID observed for this canonical role. Use this for outbound LinkedIn fetches.';
+COMMENT ON COLUMN "public"."jobs"."listing_instances" IS 'Append-only listing history for repost tracking, including per-listing scrape metadata.';
 
 
 

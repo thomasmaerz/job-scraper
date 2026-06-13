@@ -1,10 +1,6 @@
 from pathlib import Path
-import sys
-import types
 
 from bs4 import BeautifulSoup
-
-sys.modules.setdefault("supabase_utils", types.ModuleType("supabase_utils"))
 
 import scraper
 

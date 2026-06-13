@@ -7,6 +7,7 @@ import hashlib
 import logging # Import logging
 import re # Import re for filter pattern matching
 import string
+import unicodedata
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -54,7 +55,9 @@ def build_canonical_key(provider: str, company: str, title: str, location: str) 
 
 
 def _normalize_description_for_fingerprint(description: str) -> str:
-    value = (description or "").lower()
+    value = unicodedata.normalize("NFKD", description or "").lower()
+    value = value.replace("’", "").replace("‘", "")
+    value = value.replace("-", " ").replace("–", " ").replace("—", " ").replace("•", " ")
     value = value.replace("*", " ").replace("_", " ").replace("`", " ")
     value = value.translate(str.maketrans("", "", string.punctuation))
     return _collapse_spaces(value)

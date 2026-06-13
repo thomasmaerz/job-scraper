@@ -34,3 +34,21 @@ def test_description_fingerprint_ignores_minor_formatting_changes():
 
     assert fingerprint_a is not None
     assert fingerprint_a == fingerprint_b
+
+
+def test_description_fingerprint_normalizes_unicode_punctuation_for_long_equivalents():
+    plain = (
+        "We're building client-focused teams that solve complex problems with care, speed, and accountability. "
+        "Our people partner across design, delivery, and operations to keep commitments clear and work moving forward. "
+    ) * 4
+    formatted = (
+        "We’re building client—focused teams that solve complex problems with care, speed, and accountability.\n"
+        "• Our people partner across design, delivery, and operations to keep commitments clear and work moving forward.\n\n"
+    ) * 4
+
+    fingerprint_plain = supabase_utils.make_description_fingerprint(plain)
+    fingerprint_formatted = supabase_utils.make_description_fingerprint(formatted)
+
+    assert fingerprint_plain is not None
+    assert fingerprint_formatted is not None
+    assert fingerprint_plain == fingerprint_formatted

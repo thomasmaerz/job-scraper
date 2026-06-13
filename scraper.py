@@ -13,6 +13,36 @@ import json
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def _extract_linkedin_search_cards(job_elements: list) -> list[dict]:
+    results = []
+    seen = set()
+    for job_element in job_elements:
+        base_card = job_element.find("div", {"class": "base-card"})
+        job_urn = base_card.get("data-entity-urn") if base_card else None
+        if not job_urn or "jobPosting:" not in job_urn:
+            continue
+
+        try:
+            job_id = job_urn.split(":")[3]
+        except IndexError:
+            logging.warning(f"Could not parse job ID from URN: {job_urn}")
+            continue
+
+        if job_id in seen:
+            continue
+        seen.add(job_id)
+
+        time_el = job_element.find("time")
+        posted_at = time_el.get("datetime").strip() if time_el and time_el.get("datetime") else None
+        posted_relative_text = time_el.get_text(" ", strip=True) if time_el else None
+
+        results.append({
+            "job_id": job_id,
+            "posted_at": posted_at,
+            "posted_relative_text": posted_relative_text,
+        })
+    return results
+
 # Convert HTML description to Markdown
 def convert_html_to_markdown(html: str) -> str | None:
     """
@@ -79,7 +109,7 @@ def _get_careers_future_job_company_name(job_item: dict) -> str | None:
 def _fetch_linkedin_job_ids(search_query: str, location: str) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
-    job_ids_list = []
+    scraped_cards = []
     start = 0
     max_start = config.LINKEDIN_MAX_START
 
@@ -153,20 +183,11 @@ def _fetch_linkedin_job_ids(search_query: str, location: str) -> list:
     
         logging.info(f"Found {len(all_jobs_on_this_page)} potential job elements on this page.")
 
-        jobs_found_this_iteration = 0
-        for job_element in all_jobs_on_this_page:
-            base_card = job_element.find("div", {"class": "base-card"})
-            job_urn = base_card.get('data-entity-urn') if base_card else None
-            if job_urn and 'jobPosting:' in job_urn:
-                try:
-                    jobid = job_urn.split(":")[3]
-                    if jobid not in job_ids_list:
-                         job_ids_list.append(jobid)
-                         jobs_found_this_iteration += 1
-                except IndexError:
-                    
-                    logging.warning(f"Could not parse job ID from URN: {job_urn}")
-                    pass
+        page_cards = _extract_linkedin_search_cards(all_jobs_on_this_page)
+        existing_ids = {card["job_id"] for card in scraped_cards}
+        new_page_cards = [card for card in page_cards if card["job_id"] not in existing_ids]
+        scraped_cards.extend(new_page_cards)
+        jobs_found_this_iteration = len(new_page_cards)
 
     
         logging.info(f"Added {jobs_found_this_iteration} unique job IDs from this page.")
@@ -179,8 +200,8 @@ def _fetch_linkedin_job_ids(search_query: str, location: str) -> list:
         start += 10
 
 
-    logging.info(f"--- Finished Phase 1: Found {len(job_ids_list)} unique job IDs during scraping ---")
-    return job_ids_list
+    logging.info(f"--- Finished Phase 1: Found {len(scraped_cards)} unique job IDs during scraping ---")
+    return scraped_cards
 
 def _fetch_linkedin_job_details(job_id: str) -> dict | None:
     """Fetches detailed information for a single job ID with delays, rotating user agents, and retries."""
@@ -344,15 +365,16 @@ def process_linkedin_query(search_query: str, location: str, limit: int = None) 
     Returns a list of new job details found.
     """
 
-    scraped_job_ids = _fetch_linkedin_job_ids(search_query, location)
-    if not scraped_job_ids:
+    scraped_cards = _fetch_linkedin_job_ids(search_query, location)
+    if not scraped_cards:
     
         logging.info("No job IDs found in Phase 1. Skipping detail fetching.")
         return []
 
-    unique_linkedin_job_ids = list(set(scraped_job_ids))
+    card_by_job_id = {card['job_id']: card for card in scraped_cards}
+    unique_linkedin_job_ids = list(card_by_job_id.keys())
 
-    logging.info(f"Found {len(scraped_job_ids)} raw job IDs, {len(unique_linkedin_job_ids)} unique IDs after scraping.")
+    logging.info(f"Found {len(scraped_cards)} raw job cards, {len(unique_linkedin_job_ids)} unique IDs after scraping.")
 
 
     logging.info("\n--- Starting Filtering Step: Checking against Supabase ---")

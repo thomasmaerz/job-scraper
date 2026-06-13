@@ -151,7 +151,7 @@ A Next.js web application is available to view and manage the scraped jobs, your
 
 - **Repository:** [jobs-scrapper-web](https://github.com/anandanair/jobs-scraper-web)
 - **Setup:** To use the web interface, clone the `jobs-scrapper-web` repository and follow the setup instructions provided in its `README.md` file to run it locally. This will typically involve configuring it to connect to your Supabase instance.
-- **Insights UI:** The companion `zeroluck/job-scraper-web` application displays records from `keyword_insights` on its Insights page. The `job_keyword_insights` table provides idempotent per-job source facts behind those aggregates.
+- **Insights UI:** The companion `zeroluck/job-scraper-web` application displays records from `keyword_insights` on its Insights page. The `job_keyword_insights` table provides idempotent per-job source facts behind those aggregates. The UI category tabs are a client-side refinement only; they do not replace server-side archetype scoping in the underlying Supabase query or RPC.
 
 The individual Python scripts can still be run locally for development or testing, but this requires setting up a local Python environment, installing dependencies from `requirements.txt`, and creating a local `.env` file with the necessary credentials (mirroring the GitHub secrets).
 
@@ -195,6 +195,21 @@ The individual Python scripts can still be run locally for development or testin
     python score_jobs.py
     python job_manager.py
     ```
+
+### Safe backfill order for archetype-aware filtering and insights
+
+1. Apply `supabase_setup/init.sql` and `supabase_setup/add_job_insights.sql`.
+2. Run `python backfill_filter.py` to stamp legacy LinkedIn rows with `software_tpm`, clear the removed aerospace-defense filter, and reapply archetype-aware filters.
+3. Run `JOB_INSIGHTS_REPLACEMENT_BACKFILL=true JOB_INSIGHTS_ARCHETYPE=software_tpm python analyze_jobs.py` to rebuild facts and aggregates from the clean corpus.
+
+### End-to-end rebuild verification for clean insights
+
+1. Start from a clean archetype-scoped corpus by completing the safe backfill order above.
+2. Run `JOB_INSIGHTS_REPLACEMENT_BACKFILL=true JOB_INSIGHTS_ARCHETYPE=software_tpm python analyze_jobs.py` so `job_keyword_insights` is fully replaced for the scoped corpus before `keyword_insights` is rebuilt.
+3. Verify the rebuilt `keyword_insights` rows remain separated by `archetype`, `keyword`, and `category` rather than collapsing shared keywords across archetypes.
+4. Confirm the rebuilt aggregate contains the expected `software_tpm` / `Python` / `technology` row with count `2` when the source facts include two matching software TPM rows.
+5. Verify the server query or RPC used by the web app is explicitly archetype-scoped before any UI tab filtering is applied.
+6. In the web app, verify the Insights page category tabs filter only within the already-scoped `software_tpm` dataset returned from Supabase, so switching tabs never reintroduces rows from a different archetype.
 
 ## Project Structure
 

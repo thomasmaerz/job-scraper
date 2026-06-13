@@ -1,7 +1,109 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import analyze_jobs
+
+
+@pytest.fixture
+def fake_db_with_fact_rows():
+    operations = []
+
+    fact_rows = [
+        {"keyword": "Python", "category": "technology", "archetype": "software_tpm"},
+        {"keyword": "Python", "category": "technology", "archetype": "software_tpm"},
+        {"keyword": "Agile", "category": "skill", "archetype": "software_tpm"},
+        {"keyword": "Python", "category": "technology", "archetype": "data_pm"},
+        {"keyword": "SQL", "category": "technology", "archetype": "data_pm"},
+    ]
+
+    existing_rows = [
+        {"keyword": "Legacy", "category": "technology", "archetype": "software_tpm"},
+        {"keyword": "Legacy", "category": "technology", "archetype": "data_pm"},
+        {"keyword": "Python", "category": "technology", "archetype": "software_tpm"},
+        {"keyword": "Python", "category": "technology", "archetype": "data_pm"},
+        {"keyword": "SQL", "category": "technology", "archetype": "data_pm"},
+    ]
+
+    class FactsSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category, archetype"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(data=fact_rows)
+
+    class ExistingAggregateSelectQuery:
+        def __init__(self):
+            self.offset = 0
+
+        def select(self, value):
+            assert value == "keyword, category, archetype"
+            return self
+
+        def range(self, start, end):
+            self.offset = start
+            return self
+
+        def execute(self):
+            if self.offset > 0:
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(data=existing_rows)
+
+    class DeleteQuery:
+        def __init__(self):
+            self.filters = []
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def execute(self):
+            operations.append(("delete", tuple(self.filters)))
+            return SimpleNamespace(data=[])
+
+    class UpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            operations.append(("upsert", self.rows))
+            return SimpleNamespace(data=self.rows)
+
+    class JobKeywordInsightsTable:
+        def select(self, value):
+            return FactsSelectQuery().select(value)
+
+    class KeywordInsightsTable:
+        def select(self, value):
+            return ExistingAggregateSelectQuery().select(value)
+
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "archetype,keyword,category"
+            return UpsertQuery(rows)
+
+        def delete(self):
+            return DeleteQuery()
+
+    class FakeDb:
+        def table(self, name):
+            if name == "job_keyword_insights":
+                return JobKeywordInsightsTable()
+            if name == "keyword_insights":
+                return KeywordInsightsTable()
+            raise AssertionError(name)
+
+    return FakeDb(), operations
 
 
 def test_aggregate_keywords_normalizes_keyword_case_and_category():
@@ -99,7 +201,7 @@ def test_extract_keywords_from_batch_uses_llm_client_response_format():
     assert "Must know Agile and Python." in calls[0]["prompt"]
 
 
-def test_fetch_unanalyzed_jobs_queries_expected_filters():
+def test_fetch_unanalyzed_jobs_excludes_filtered_rows_and_scopes_by_archetype():
     class FakeQuery:
         def __init__(self):
             self.calls = []
@@ -127,7 +229,17 @@ def test_fetch_unanalyzed_jobs_queries_expected_filters():
 
         def execute(self):
             self.calls.append(("execute",))
-            return SimpleNamespace(data=[{"job_id": "1", "job_title": "A", "description": "B"}])
+            return SimpleNamespace(
+                data=[
+                    {
+                        "job_id": "1",
+                        "job_title": "A",
+                        "description": "B",
+                        "archetype": "data_eng",
+                        "provider": "greenhouse",
+                    }
+                ]
+            )
 
     class FakeDb:
         def __init__(self):
@@ -139,12 +251,25 @@ def test_fetch_unanalyzed_jobs_queries_expected_filters():
 
     db = FakeDb()
 
-    result = analyze_jobs.fetch_unanalyzed_jobs(db=db, limit=25)
+    result = analyze_jobs.fetch_unanalyzed_jobs(db=db, limit=25, archetype="data_eng")
 
-    assert result == [{"job_id": "1", "job_title": "A", "description": "B"}]
-    assert ("select", "job_id, job_title, description") in db.query.calls
+    assert result == [
+        {
+            "job_id": "1",
+            "job_title": "A",
+            "description": "B",
+            "archetype": "data_eng",
+            "provider": "greenhouse",
+        }
+    ]
+    assert (
+        "select",
+        "job_id, job_title, description, archetype, provider",
+    ) in db.query.calls
     assert ("eq", "is_active", True) in db.query.calls
     assert ("eq", "job_state", "new") in db.query.calls
+    assert ("eq", "is_filtered", False) in db.query.calls
+    assert ("eq", "archetype", "data_eng") in db.query.calls
     assert ("is_", "insights_analyzed_at", None) in db.query.calls
     assert ("is_", "description", None) in db.query.calls
     assert ("limit", 25) in db.query.calls
@@ -356,7 +481,7 @@ def test_aggregate_keywords_preserves_acronyms_and_uppercase_keywords():
     }
 
 
-def test_upsert_job_keyword_facts_ignores_existing_job_keyword_pairs():
+def test_upsert_job_keyword_facts_dedupes_by_archetype_aware_identity():
     inserted_rows = []
 
     class FakeUpsertQuery:
@@ -364,12 +489,12 @@ def test_upsert_job_keyword_facts_ignores_existing_job_keyword_pairs():
             self.rows = rows
 
         def execute(self):
-            inserted_rows.extend(self.rows[:1])
-            return SimpleNamespace(data=self.rows[:1])
+            inserted_rows.extend(self.rows)
+            return SimpleNamespace(data=self.rows)
 
     class FakeTable:
         def upsert(self, rows, on_conflict, ignore_duplicates):
-            assert on_conflict == "job_id,keyword,category"
+            assert on_conflict == "job_id,archetype,keyword,category"
             assert ignore_duplicates is True
             return FakeUpsertQuery(rows)
 
@@ -379,14 +504,18 @@ def test_upsert_job_keyword_facts_ignores_existing_job_keyword_pairs():
             return FakeTable()
 
     facts = [
-        {"job_id": "1", "keyword": "AWS", "category": "technology"},
-        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "data_pm"},
     ]
 
     inserted = analyze_jobs.upsert_job_keyword_facts(facts, db=FakeDb())
 
     assert inserted == inserted_rows
-    assert inserted == [{"job_id": "1", "keyword": "AWS", "category": "technology"}]
+    assert inserted == [
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "data_pm"},
+    ]
 
 
 def test_replace_job_keyword_facts_replaces_existing_rows_for_job_ids():
@@ -394,16 +523,20 @@ def test_replace_job_keyword_facts_replaces_existing_rows_for_job_ids():
     inserted_rows = []
 
     class FakeDeleteQuery:
+        def __init__(self):
+            self.filters = []
+
         def delete(self):
             calls.append(("delete",))
             return self
 
-        def in_(self, key, values):
-            calls.append(("in_", key, values))
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            calls.append(("eq", key, value))
             return self
 
         def execute(self):
-            calls.append(("delete_execute",))
+            calls.append(("delete_execute", tuple(self.filters)))
             return SimpleNamespace(data=[])
 
     class FakeUpsertQuery:
@@ -421,7 +554,7 @@ def test_replace_job_keyword_facts_replaces_existing_rows_for_job_ids():
 
         def upsert(self, rows, on_conflict):
             calls.append(("upsert", on_conflict, rows))
-            assert on_conflict == "job_id,keyword,category"
+            assert on_conflict == "job_id,archetype,keyword,category"
             return FakeUpsertQuery(rows)
 
     class FakeDb:
@@ -430,19 +563,105 @@ def test_replace_job_keyword_facts_replaces_existing_rows_for_job_ids():
             return FakeTable()
 
     facts = [
-        {"job_id": "1", "keyword": "SQL", "category": "technology"},
-        {"job_id": "1", "keyword": "AWS", "category": "technology"},
+        {"job_id": "1", "keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
     ]
 
     inserted = analyze_jobs.replace_job_keyword_facts(["1"], facts, db=FakeDb())
 
     assert calls[0] == ("delete",)
-    assert calls[1] == ("in_", "job_id", ["1"])
-    assert calls[2] == ("delete_execute",)
-    assert calls[3][0] == "upsert"
-    assert calls[4] == ("upsert_execute",)
+    assert calls[1] == ("eq", "job_id", "1")
+    assert calls[2] == ("eq", "archetype", "software_tpm")
+    assert calls[3] == ("delete_execute", (("job_id", "1"), ("archetype", "software_tpm")))
+    assert calls[4] == ("upsert", "job_id,archetype,keyword,category", facts)
+    assert calls[5] == ("upsert_execute",)
+
     assert inserted == inserted_rows
     assert inserted == facts
+
+
+def test_replace_job_keyword_facts_only_deletes_matching_archetype_for_same_job_id():
+    delete_filters = []
+
+    class FakeDeleteQuery:
+        def __init__(self):
+            self.filters = []
+
+        def delete(self):
+            return self
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def execute(self):
+            delete_filters.append(tuple(self.filters))
+            return SimpleNamespace(data=[])
+
+    class FakeUpsertQuery:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self):
+            return SimpleNamespace(data=self.rows)
+
+    class FakeTable:
+        def delete(self):
+            return FakeDeleteQuery().delete()
+
+        def upsert(self, rows, on_conflict):
+            assert on_conflict == "job_id,archetype,keyword,category"
+            return FakeUpsertQuery(rows)
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "job_keyword_insights"
+            return FakeTable()
+
+    facts = [
+        {"job_id": "1", "keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+    ]
+
+    analyze_jobs.replace_job_keyword_facts(["1"], facts, db=FakeDb())
+
+    assert delete_filters == [(("job_id", "1"), ("archetype", "software_tpm"))]
+
+
+def test_replace_job_keyword_facts_deletes_only_matching_archetype_when_new_fact_set_is_empty():
+    delete_filters = []
+
+    class FakeDeleteQuery:
+        def __init__(self):
+            self.filters = []
+
+        def delete(self):
+            return self
+
+        def eq(self, key, value):
+            self.filters.append((key, value))
+            return self
+
+        def execute(self):
+            delete_filters.append(tuple(self.filters))
+            return SimpleNamespace(data=[])
+
+    class FakeTable:
+        def delete(self):
+            return FakeDeleteQuery().delete()
+
+        def upsert(self, rows, on_conflict):
+            raise AssertionError("upsert should not be called for empty facts")
+
+    class FakeDb:
+        def table(self, name):
+            assert name == "job_keyword_insights"
+            return FakeTable()
+
+    inserted = analyze_jobs.replace_job_keyword_facts(["1"], [], archetype="software_tpm", db=FakeDb())
+
+    assert inserted == []
+    assert delete_filters == [(("job_id", "1"), ("archetype", "software_tpm"))]
 
 
 def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
@@ -453,7 +672,7 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
             self.offset = 0
 
         def select(self, value):
-            assert value == "job_id, keyword, category"
+            assert value == "job_id, keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -465,16 +684,16 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
                 return SimpleNamespace(
                     data=[
                         *[
-                            {"job_id": str(i), "keyword": "AWS", "category": "technology"}
+                            {"job_id": str(i), "keyword": "AWS", "category": "technology", "archetype": "software_tpm"}
                             for i in range(1, 11)
                         ],
                         *[
-                            {"job_id": f"p{i}", "keyword": "PMP", "category": "certification"}
+                            {"job_id": f"p{i}", "keyword": "PMP", "category": "certification", "archetype": "software_tpm"}
                             for i in range(1, 5)
                         ],
-                        {"job_id": "11", "keyword": "AWS", "category": "technology"},
-                        {"job_id": "12", "keyword": "AWS", "category": "technology"},
-                        {"job_id": "p5", "keyword": "PMP", "category": "certification"},
+                        {"job_id": "11", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+                        {"job_id": "12", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+                        {"job_id": "p5", "keyword": "PMP", "category": "certification", "archetype": "software_tpm"},
                     ]
                 )
             return SimpleNamespace(data=[])
@@ -492,7 +711,7 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
             return FactsSelectQuery().select(value)
 
         def upsert(self, rows, on_conflict):
-            assert on_conflict == "keyword,category"
+            assert on_conflict == "archetype,keyword,category"
             return FakeUpsertQuery(rows)
 
     class FakeDb:
@@ -504,15 +723,17 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
             raise AssertionError(name)
 
     source_facts = [
-        {"job_id": "11", "keyword": "AWS", "category": "technology"},
-        {"job_id": "12", "keyword": "AWS", "category": "technology"},
-        {"job_id": "p5", "keyword": "PMP", "category": "certification"},
+        {"job_id": "11", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "12", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "p5", "keyword": "PMP", "category": "certification", "archetype": "software_tpm"},
     ]
 
     analyze_jobs.update_keyword_insights_from_facts(source_facts, db=FakeDb())
 
     by_key = {(row["keyword"], row["category"]): row for row in upserted}
+    assert by_key[("AWS", "technology")]["archetype"] == "software_tpm"
     assert by_key[("AWS", "technology")]["count"] == 12
+    assert by_key[("PMP", "certification")]["archetype"] == "software_tpm"
     assert by_key[("PMP", "certification")]["count"] == 5
     assert all("last_updated" in row for row in upserted)
 
@@ -540,7 +761,7 @@ def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts(
             self.offset = 0
 
         def select(self, value):
-            assert value == "job_id, keyword, category"
+            assert value == "job_id, keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -552,9 +773,9 @@ def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts(
                 return SimpleNamespace(data=[])
             return SimpleNamespace(
                 data=[
-                    {"job_id": "1", "keyword": "AWS", "category": "technology"},
-                    {"job_id": "2", "keyword": "AWS", "category": "technology"},
-                    {"job_id": "2", "keyword": "PMP", "category": "certification"},
+                    {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+                    {"job_id": "2", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+                    {"job_id": "2", "keyword": "PMP", "category": "certification", "archetype": "software_tpm"},
                 ]
             )
 
@@ -563,7 +784,7 @@ def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts(
             return KeywordInsightsSelectQuery().select(value)
 
         def upsert(self, rows, on_conflict):
-            assert on_conflict == "keyword,category"
+            assert on_conflict == "archetype,keyword,category"
 
             class FakeUpsertQuery:
                 def execute(self_inner):
@@ -585,15 +806,17 @@ def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts(
             raise AssertionError(name)
 
     inserted_facts = [
-        {"job_id": "1", "keyword": "AWS", "category": "technology"},
-        {"job_id": "2", "keyword": "AWS", "category": "technology"},
-        {"job_id": "2", "keyword": "PMP", "category": "certification"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "2", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "2", "keyword": "PMP", "category": "certification", "archetype": "software_tpm"},
     ]
 
     analyze_jobs.update_keyword_insights_from_facts(inserted_facts, db=FakeDb())
 
     by_key = {(row["keyword"], row["category"]): row for row in upserted}
+    assert by_key[("AWS", "technology")]["archetype"] == "software_tpm"
     assert by_key[("AWS", "technology")]["count"] == 2
+    assert by_key[("PMP", "certification")]["archetype"] == "software_tpm"
     assert by_key[("PMP", "certification")]["count"] == 1
 
 
@@ -605,7 +828,7 @@ def test_update_keyword_insights_recomputes_removed_keywords_to_zero():
             self.offset = 0
 
         def select(self, value):
-            assert value == "job_id, keyword, category"
+            assert value == "job_id, keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -617,13 +840,13 @@ def test_update_keyword_insights_recomputes_removed_keywords_to_zero():
                 return SimpleNamespace(data=[])
             return SimpleNamespace(
                 data=[
-                    {"job_id": "2", "keyword": "Azure", "category": "technology"},
+                    {"job_id": "2", "keyword": "Azure", "category": "technology", "archetype": "software_tpm"},
                 ]
             )
 
     class KeywordInsightsTable:
         def upsert(self, rows, on_conflict):
-            assert on_conflict == "keyword,category"
+            assert on_conflict == "archetype,keyword,category"
 
             class FakeUpsertQuery:
                 def execute(self_inner):
@@ -645,14 +868,16 @@ def test_update_keyword_insights_recomputes_removed_keywords_to_zero():
             raise AssertionError(name)
 
     affected_facts = [
-        {"job_id": "1", "keyword": "AWS", "category": "technology"},
-        {"job_id": "2", "keyword": "Azure", "category": "technology"},
+        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+        {"job_id": "2", "keyword": "Azure", "category": "technology", "archetype": "software_tpm"},
     ]
 
     analyze_jobs.update_keyword_insights_from_facts(affected_facts, db=FakeDb())
 
     by_key = {(row["keyword"], row["category"]): row for row in upserted}
+    assert by_key[("AWS", "technology")]["archetype"] == "software_tpm"
     assert by_key[("AWS", "technology")]["count"] == 0
+    assert by_key[("Azure", "technology")]["archetype"] == "software_tpm"
     assert by_key[("Azure", "technology")]["count"] == 1
 
 
@@ -664,7 +889,7 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
             self.offset = 0
 
         def select(self, value):
-            assert value == "keyword, category"
+            assert value == "keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -676,9 +901,9 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
                 return SimpleNamespace(data=[])
             return SimpleNamespace(
                 data=[
-                    {"keyword": "SQL", "category": "technology"},
-                    {"keyword": "SQL", "category": "technology"},
-                    {"keyword": "PMP", "category": "certification"},
+                    {"keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
+                    {"keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
+                    {"keyword": "PMP", "category": "certification", "archetype": "software_tpm"},
                 ]
             )
 
@@ -687,7 +912,7 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
             self.offset = 0
 
         def select(self, value):
-            assert value == "keyword, category"
+            assert value == "keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -699,9 +924,9 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
                 return SimpleNamespace(data=[])
             return SimpleNamespace(
                 data=[
-                    {"keyword": "AWS", "category": "technology"},
-                    {"keyword": "SQL", "category": "technology"},
-                    {"keyword": "PMP", "category": "certification"},
+                    {"keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
+                    {"keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
+                    {"keyword": "PMP", "category": "certification", "archetype": "software_tpm"},
                 ]
             )
 
@@ -734,7 +959,7 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
             return ExistingAggregateSelectQuery().select(value)
 
         def upsert(self, rows, on_conflict):
-            assert on_conflict == "keyword,category"
+            assert on_conflict == "archetype,keyword,category"
             return UpsertQuery(rows)
 
         def delete(self):
@@ -753,12 +978,44 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
     assert operations[0][0] == "upsert"
     rows = operations[0][1]
     by_key = {(row["keyword"], row["category"]): row for row in rows}
+    assert by_key[("SQL", "technology")]["archetype"] == "software_tpm"
     assert by_key[("SQL", "technology")]["count"] == 2
+    assert by_key[("PMP", "certification")]["archetype"] == "software_tpm"
     assert by_key[("PMP", "certification")]["count"] == 1
     assert operations[1] == (
         "delete",
-        (("keyword", "AWS"), ("category", "technology")),
+        (("keyword", "AWS"), ("category", "technology"), ("archetype", "software_tpm")),
     )
+
+
+def test_rebuild_keyword_insights_keeps_archetypes_separate(fake_db_with_fact_rows):
+    fake_db, operations = fake_db_with_fact_rows
+
+    analyze_jobs.rebuild_keyword_insights(db=fake_db)
+
+    assert operations[0][0] == "upsert"
+    rows = operations[0][1]
+    by_key = {(row["archetype"], row["keyword"], row["category"]): row for row in rows}
+
+    assert by_key[("software_tpm", "Python", "technology")]["count"] == 2
+    assert by_key[("data_pm", "Python", "technology")]["count"] == 1
+    assert by_key[("data_pm", "SQL", "technology")]["count"] == 1
+    assert by_key[("software_tpm", "Agile", "skill")]["count"] == 1
+
+    assert ("software_tpm", "Python", "technology") in by_key
+    assert ("data_pm", "Python", "technology") in by_key
+    assert by_key[("software_tpm", "Python", "technology")] != by_key[("data_pm", "Python", "technology")]
+
+    assert set(operations[1:]) == {
+        (
+            "delete",
+            (("keyword", "Legacy"), ("category", "technology"), ("archetype", "software_tpm")),
+        ),
+        (
+            "delete",
+            (("keyword", "Legacy"), ("category", "technology"), ("archetype", "data_pm")),
+        ),
+    }
 
 
 def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeypatch):
@@ -769,7 +1026,7 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
             self.offset = 0
 
         def select(self, value):
-            assert value == "keyword, category"
+            assert value == "keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -779,14 +1036,14 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
         def execute(self):
             if self.offset > 0:
                 return SimpleNamespace(data=[])
-            return SimpleNamespace(data=[{"keyword": "SQL", "category": "technology"}])
+            return SimpleNamespace(data=[{"keyword": "SQL", "category": "technology", "archetype": "software_tpm"}])
 
     class ExistingAggregateSelectQuery:
         def __init__(self):
             self.offset = 0
 
         def select(self, value):
-            assert value == "keyword, category"
+            assert value == "keyword, category, archetype"
             return self
 
         def range(self, start, end):
@@ -796,7 +1053,7 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
         def execute(self):
             if self.offset > 0:
                 return SimpleNamespace(data=[])
-            return SimpleNamespace(data=[{"keyword": "AWS", "category": "technology"}])
+            return SimpleNamespace(data=[{"keyword": "AWS", "category": "technology", "archetype": "software_tpm"}])
 
     class DeleteQuery:
         def __init__(self):
@@ -827,7 +1084,7 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
             return ExistingAggregateSelectQuery().select(value)
 
         def upsert(self, rows, on_conflict):
-            assert on_conflict == "keyword,category"
+            assert on_conflict == "archetype,keyword,category"
             return UpsertQuery(rows)
 
         def delete(self):
@@ -855,6 +1112,7 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
                 {
                     "keyword": "SQL",
                     "category": "technology",
+                    "archetype": "software_tpm",
                     "count": 1,
                     "last_updated": operations[0][1][0]["last_updated"],
                 }
@@ -865,8 +1123,20 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
 
 def test_build_job_keyword_facts_uses_job_keyed_results_not_cross_product():
     batch = [
-        {"job_id": "1", "job_title": "A", "description": "Needs AWS"},
-        {"job_id": "2", "job_title": "B", "description": "Needs PMP"},
+        {
+            "job_id": "1",
+            "job_title": "A",
+            "description": "Needs AWS",
+            "archetype": "software_tpm",
+            "provider": "greenhouse",
+        },
+        {
+            "job_id": "2",
+            "job_title": "B",
+            "description": "Needs PMP",
+            "archetype": "data_eng",
+            "provider": "lever",
+        },
     ]
     extracted = {
         "1": [analyze_jobs.KeywordItem(keyword="AWS", category="technology")],
@@ -876,15 +1146,27 @@ def test_build_job_keyword_facts_uses_job_keyed_results_not_cross_product():
     facts = analyze_jobs.build_job_keyword_facts(batch, extracted)
 
     assert facts == [
-        {"job_id": "1", "keyword": "AWS", "category": "technology"},
-        {"job_id": "2", "keyword": "PMP", "category": "certification"},
+        {
+            "job_id": "1",
+            "keyword": "AWS",
+            "category": "technology",
+            "archetype": "software_tpm",
+            "provider": "greenhouse",
+        },
+        {
+            "job_id": "2",
+            "keyword": "PMP",
+            "category": "certification",
+            "archetype": "data_eng",
+            "provider": "lever",
+        },
     ]
 
 
 def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     batches = [
-        [{"job_id": "1", "job_title": "A", "description": "Needs AWS"}],
-        [{"job_id": "2", "job_title": "B", "description": "Needs SQL"}],
+        [{"job_id": "1", "job_title": "A", "description": "Needs AWS", "archetype": "software_tpm", "provider": "greenhouse"}],
+        [{"job_id": "2", "job_title": "B", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}],
         [],
     ]
     extracted_batches = [
@@ -898,11 +1180,11 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
-        lambda db=None, limit=None, backfill_all=False, replacement_backfill=False: batches.pop(0),
+        lambda db=None, limit=None, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE, backfill_all=False, replacement_backfill=False: batches.pop(0),
     )
     monkeypatch.setattr(analyze_jobs, "extract_keywords_from_batch", lambda batch, client=None, max_retries=None: extracted_batches.pop(0))
 
-    def fake_replace_facts(job_ids, facts, db=None):
+    def fake_replace_facts(job_ids, facts, archetype=None, db=None):
         fact_calls.append(facts)
         return facts
 
@@ -924,8 +1206,8 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
 
 def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(monkeypatch):
     fetch_batches = [
-        [{"job_id": "1", "job_title": "A", "description": "Needs SQL"}],
-        [{"job_id": "1", "job_title": "A", "description": "Needs SQL"}],
+        [{"job_id": "1", "job_title": "A", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}],
+        [{"job_id": "1", "job_title": "A", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}],
         [],
     ]
     extracted = {"1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]}
@@ -941,7 +1223,7 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
-        lambda db=None, limit=None, backfill_all=False, replacement_backfill=False: fetch_batches.pop(0),
+        lambda db=None, limit=None, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE, backfill_all=False, replacement_backfill=False: fetch_batches.pop(0),
     )
     monkeypatch.setattr(
         analyze_jobs,
@@ -949,7 +1231,7 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
         lambda batch, client=None, max_retries=None: extracted,
     )
 
-    def fake_replace(job_ids, facts, db=None):
+    def fake_replace(job_ids, facts, archetype=None, db=None):
         replace_calls.append((job_ids, facts))
         return facts
 
@@ -1010,8 +1292,8 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
     monkeypatch.setattr(
         analyze_jobs,
         "fetch_unanalyzed_jobs",
-        lambda db=None, limit=None, backfill_all=False, replacement_backfill=False: [
-            {"job_id": "1", "job_title": "A", "description": "Needs SQL"}
+        lambda db=None, limit=None, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE, backfill_all=False, replacement_backfill=False: [
+            {"job_id": "1", "job_title": "A", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}
         ],
     )
     monkeypatch.setattr(
@@ -1022,7 +1304,7 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
         },
     )
 
-    def fake_replace(job_ids, facts, db=None):
+    def fake_replace(job_ids, facts, archetype=None, db=None):
         calls.append(("replace", job_ids, facts))
         return facts
 
@@ -1046,12 +1328,12 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
 
 def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
     calls = []
-    batches = [[{"job_id": "1", "job_title": "A", "description": "Needs SQL"}], []]
+    batches = [[{"job_id": "1", "job_title": "A", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}], []]
 
     monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
 
-    def fake_fetch(db=None, limit=None, backfill_all=False, replacement_backfill=False):
-        calls.append(("fetch", backfill_all, replacement_backfill))
+    def fake_fetch(db=None, limit=None, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE, backfill_all=False, replacement_backfill=False):
+        calls.append(("fetch", archetype, backfill_all, replacement_backfill))
         return batches.pop(0)
 
     monkeypatch.setattr(analyze_jobs, "fetch_unanalyzed_jobs", fake_fetch)
@@ -1062,7 +1344,7 @@ def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
             "1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]
         },
     )
-    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", lambda job_ids, facts, db=None: facts)
+    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", lambda job_ids, facts, archetype=None, db=None: facts)
     monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: None)
 
     def fake_mark(job_ids, db=None, replacement_backfill=False):
@@ -1073,5 +1355,5 @@ def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
     processed = analyze_jobs.run(replacement_backfill=True)
 
     assert processed == 1
-    assert calls[0] == ("fetch", False, True)
+    assert calls[0] == ("fetch", analyze_jobs.config.DEFAULT_ARCHETYPE, False, True)
     assert calls[1] == ("mark", ["1"], True)

@@ -211,7 +211,7 @@ def upsert_job_keyword_facts(facts: list[dict], db=None) -> list[dict]:
     return inserted
 
 
-def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], db=None) -> list[dict]:
+def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], archetype: str | None = None, db=None) -> list[dict]:
     db = db or _get_db()
 
     delete_keys = []
@@ -227,7 +227,10 @@ def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], db=None) ->
     for job_id in job_ids:
         if job_id in fact_job_ids:
             continue
-        db.table("job_keyword_insights").delete().eq("job_id", job_id).execute()
+        delete_query = db.table("job_keyword_insights").delete().eq("job_id", job_id)
+        if archetype is not None:
+            delete_query = delete_query.eq("archetype", archetype)
+        delete_query.execute()
 
     for job_id, archetype in delete_keys:
         db.table("job_keyword_insights").delete().eq("job_id", job_id).eq("archetype", archetype).execute()
@@ -403,7 +406,7 @@ def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, r
             extracted = extract_keywords_from_batch(batch)
             facts = build_job_keyword_facts(batch, extracted)
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
-            replace_job_keyword_facts(analyzed_job_ids, facts, db=db)
+            replace_job_keyword_facts(analyzed_job_ids, facts, archetype=archetype, db=db)
             rebuild_keyword_insights(db=db)
             mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill)
             processed_jobs += len(analyzed_job_ids)

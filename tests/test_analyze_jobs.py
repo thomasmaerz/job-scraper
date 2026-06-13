@@ -628,7 +628,7 @@ def test_replace_job_keyword_facts_only_deletes_matching_archetype_for_same_job_
     assert delete_filters == [(("job_id", "1"), ("archetype", "software_tpm"))]
 
 
-def test_replace_job_keyword_facts_deletes_existing_rows_even_when_new_fact_set_is_empty():
+def test_replace_job_keyword_facts_deletes_only_matching_archetype_when_new_fact_set_is_empty():
     delete_filters = []
 
     class FakeDeleteQuery:
@@ -658,10 +658,10 @@ def test_replace_job_keyword_facts_deletes_existing_rows_even_when_new_fact_set_
             assert name == "job_keyword_insights"
             return FakeTable()
 
-    inserted = analyze_jobs.replace_job_keyword_facts(["1"], [], db=FakeDb())
+    inserted = analyze_jobs.replace_job_keyword_facts(["1"], [], archetype="software_tpm", db=FakeDb())
 
     assert inserted == []
-    assert delete_filters == [(("job_id", "1"),)]
+    assert delete_filters == [(("job_id", "1"), ("archetype", "software_tpm"))]
 
 
 def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
@@ -1184,7 +1184,7 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     )
     monkeypatch.setattr(analyze_jobs, "extract_keywords_from_batch", lambda batch, client=None, max_retries=None: extracted_batches.pop(0))
 
-    def fake_replace_facts(job_ids, facts, db=None):
+    def fake_replace_facts(job_ids, facts, archetype=None, db=None):
         fact_calls.append(facts)
         return facts
 
@@ -1231,7 +1231,7 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
         lambda batch, client=None, max_retries=None: extracted,
     )
 
-    def fake_replace(job_ids, facts, db=None):
+    def fake_replace(job_ids, facts, archetype=None, db=None):
         replace_calls.append((job_ids, facts))
         return facts
 
@@ -1304,7 +1304,7 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
         },
     )
 
-    def fake_replace(job_ids, facts, db=None):
+    def fake_replace(job_ids, facts, archetype=None, db=None):
         calls.append(("replace", job_ids, facts))
         return facts
 
@@ -1344,7 +1344,7 @@ def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
             "1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]
         },
     )
-    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", lambda job_ids, facts, db=None: facts)
+    monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", lambda job_ids, facts, archetype=None, db=None: facts)
     monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: None)
 
     def fake_mark(job_ids, db=None, replacement_backfill=False):

@@ -3,8 +3,10 @@ import config # Import configuration
 from typing import Optional, Any, Dict
 from models import Resume
 import datetime # Import datetime module
+import hashlib
 import logging # Import logging
 import re # Import re for filter pattern matching
+import string
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -12,6 +14,57 @@ if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("Supabase URL and Key must be set in environment variables or config.")
 
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _collapse_spaces(value: str) -> str:
+    return " ".join((value or "").split())
+
+
+def normalize_title(title: str) -> str:
+    value = (title or "").lower()
+    for raw, replacement in getattr(config, "TITLE_NORMALIZATION_REPLACEMENTS", {}).items():
+        value = value.replace(raw, replacement)
+    value = value.replace("-", " ").replace("/", " ")
+    value = value.translate(str.maketrans("", "", string.punctuation.replace("&", "")))
+    value = value.replace("&", " and ")
+    return _collapse_spaces(value)
+
+
+def normalize_location(location: str) -> str:
+    value = (location or "").lower()
+    value = value.replace("-", " ").replace("/", " ")
+    value = value.translate(str.maketrans("", "", string.punctuation))
+    return _collapse_spaces(value)
+
+
+def normalize_company(company: str) -> str:
+    value = (company or "").lower()
+    value = value.translate(str.maketrans("", "", string.punctuation))
+    return _collapse_spaces(value)
+
+
+def build_canonical_key(provider: str, company: str, title: str, location: str) -> str:
+    return "|".join([
+        (provider or "").lower().strip(),
+        normalize_company(company),
+        normalize_title(title),
+        normalize_location(location),
+    ])
+
+
+def _normalize_description_for_fingerprint(description: str) -> str:
+    value = (description or "").lower()
+    value = value.replace("*", " ").replace("_", " ").replace("`", " ")
+    value = value.translate(str.maketrans("", "", string.punctuation))
+    return _collapse_spaces(value)
+
+
+def make_description_fingerprint(description: str) -> str | None:
+    normalized = _normalize_description_for_fingerprint(description)
+    min_len = getattr(config, "DESCRIPTION_FINGERPRINT_MIN_LENGTH", 500)
+    if len(normalized) < min_len:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 # --- Supabase Functions ---
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
@@ -736,4 +789,3 @@ def get_base_resume() -> Optional[dict]:
     except Exception as e:
         logging.error(f"Error fetching base resume from Supabase: {e}", exc_info=True)
         return None
-

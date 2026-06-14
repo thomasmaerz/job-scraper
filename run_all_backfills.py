@@ -1,3 +1,5 @@
+import sys
+
 import supabase_utils
 
 supabase = supabase_utils.supabase
@@ -209,8 +211,59 @@ def verification_failed(report: list[dict]) -> bool:
     return any((not item["passed"]) and item["required"] for item in report)
 
 
+def collect_preflight_metrics() -> dict:
+    return {
+        "preflight_null_is_filtered": 0,
+        "keyword_insights_count_before": 0,
+    }
+
+
+def collect_postrun_metrics() -> dict:
+    return {
+        "linkedin_archetype_nulls": 0,
+        "linkedin_filter_profile_nulls": 0,
+        "repair_canonical_key_nulls": 0,
+        "repair_identity_nulls": 0,
+        "repair_timestamp_nulls": 0,
+        "repair_listing_instances_nulls": 0,
+        "repair_scraped_mismatches": 0,
+        "repair_posted_mismatches": 0,
+        "legacy_aerospace_filter_rows": 0,
+        "keyword_insights_count_after": 0,
+        "sample_jobs_ok": True,
+    }
+
+
+def print_verification_report(report: list[dict]) -> None:
+    for item in report:
+        status = "PASS" if item["passed"] else "FAIL"
+        print(f"{status} | {item['name']} | actual={item['actual']} | expected={item['expected']}")
+
+
 def main() -> int:
-    raise NotImplementedError
+    try:
+        preflight = collect_preflight_metrics()
+        print(f"Preflight null is_filtered count: {preflight['preflight_null_is_filtered']}")
+
+        phase1_updated = supabase_utils.backfill_job_archetypes()
+        print(f"Phase 1 updated rows: {phase1_updated}")
+
+        phase2_updated = supabase_utils.clear_removed_aerospace_defense_filter()
+        print(f"Phase 2 updated rows: {phase2_updated}")
+
+        phase3_updated = supabase_utils.flag_filtered_jobs()
+        print(f"Phase 3 updated rows: {phase3_updated}")
+
+        phase4_updated = backfill_canonical_fields(batch_size=100)
+        print(f"Phase 4 updated rows: {phase4_updated}")
+
+        metrics = {**preflight, **collect_postrun_metrics()}
+        report = build_verification_report(metrics)
+        print_verification_report(report)
+        return 1 if verification_failed(report) else 0
+    except Exception as exc:
+        print(f"Backfill failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

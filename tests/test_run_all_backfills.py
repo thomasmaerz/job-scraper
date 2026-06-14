@@ -1,3 +1,5 @@
+import sys
+
 import run_all_backfills
 
 
@@ -260,3 +262,52 @@ def test_build_verification_report_accepts_matching_keyword_counts_and_clean_met
 
     assert all(item["passed"] for item in report if item["required"])
     assert run_all_backfills.verification_failed(report) is False
+
+
+def test_main_runs_phases_in_order_and_returns_zero(monkeypatch, capsys):
+    calls = []
+
+    monkeypatch.setattr(run_all_backfills, "collect_preflight_metrics", lambda: {"keyword_insights_count_before": 1739, "preflight_null_is_filtered": 0})
+    monkeypatch.setattr(run_all_backfills.supabase_utils, "backfill_job_archetypes", lambda: calls.append("phase1") or 642)
+    monkeypatch.setattr(run_all_backfills.supabase_utils, "clear_removed_aerospace_defense_filter", lambda: calls.append("phase2") or 2)
+    monkeypatch.setattr(run_all_backfills.supabase_utils, "flag_filtered_jobs", lambda: calls.append("phase3") or 14)
+    monkeypatch.setattr(run_all_backfills, "backfill_canonical_fields", lambda batch_size=100: calls.append("phase4") or 642)
+    monkeypatch.setattr(run_all_backfills, "collect_postrun_metrics", lambda: {
+        "linkedin_archetype_nulls": 0,
+        "linkedin_filter_profile_nulls": 0,
+        "repair_canonical_key_nulls": 0,
+        "repair_identity_nulls": 0,
+        "repair_timestamp_nulls": 0,
+        "repair_listing_instances_nulls": 0,
+        "repair_scraped_mismatches": 0,
+        "repair_posted_mismatches": 0,
+        "legacy_aerospace_filter_rows": 0,
+        "keyword_insights_count_after": 1739,
+        "sample_jobs_ok": True,
+    })
+
+    exit_code = run_all_backfills.main()
+
+    assert exit_code == 0
+    assert calls == ["phase1", "phase2", "phase3", "phase4"]
+    assert "PASS" in capsys.readouterr().out
+
+
+def test_main_stops_when_phase_two_raises(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(run_all_backfills, "collect_preflight_metrics", lambda: {"keyword_insights_count_before": 1739, "preflight_null_is_filtered": 0})
+    monkeypatch.setattr(run_all_backfills.supabase_utils, "backfill_job_archetypes", lambda: calls.append("phase1") or 642)
+
+    def explode():
+        calls.append("phase2")
+        raise RuntimeError("phase 2 failed")
+
+    monkeypatch.setattr(run_all_backfills.supabase_utils, "clear_removed_aerospace_defense_filter", explode)
+    monkeypatch.setattr(run_all_backfills.supabase_utils, "flag_filtered_jobs", lambda: calls.append("phase3") or 14)
+    monkeypatch.setattr(run_all_backfills, "backfill_canonical_fields", lambda batch_size=100: calls.append("phase4") or 642)
+
+    exit_code = run_all_backfills.main()
+
+    assert exit_code == 1
+    assert calls == ["phase1", "phase2"]

@@ -1,5 +1,7 @@
 import supabase_utils
 
+supabase = supabase_utils.supabase
+
 
 def build_historical_listing_instance(row: dict) -> dict:
     job_id = row.get("job_id")
@@ -60,6 +62,58 @@ def needs_canonical_repair(row: dict) -> bool:
         return fingerprint is not None
 
     return False
+
+
+CANONICAL_REPAIR_SELECT_FIELDS = ", ".join([
+    "job_id",
+    "company",
+    "job_title",
+    "location",
+    "description",
+    "provider",
+    "posted_at",
+    "scraped_at",
+    "posted_relative_text",
+    "applicant_count",
+    "salary_text",
+    "salary_min",
+    "salary_max",
+    "salary_currency",
+    "recruiter_name",
+    "recruiter_profile_url",
+    "recruiter_identifier",
+    "canonical_key",
+    "original_job_id",
+    "latest_job_id",
+    "first_seen_at",
+    "last_seen_at",
+    "last_seen_posted_at",
+    "listing_instances",
+    "description_fingerprint",
+])
+
+
+def fetch_repair_candidates(batch_size: int = 1000) -> list[dict]:
+    response = (
+        supabase.table("jobs")
+        .select(CANONICAL_REPAIR_SELECT_FIELDS)
+        .range(0, batch_size - 1)
+        .execute()
+    )
+    rows = response.data or []
+    return [row for row in rows if needs_canonical_repair(row)]
+
+
+def chunked(items: list[dict], size: int) -> list[list[dict]]:
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def backfill_canonical_fields(batch_size: int = 100) -> int:
+    rows = fetch_repair_candidates(batch_size=1000)
+    payloads = [build_historical_backfill_payload(row) for row in rows]
+    for batch in chunked(payloads, batch_size):
+        supabase.table("jobs").upsert(batch).execute()
+    return len(payloads)
 
 
 def main() -> int:

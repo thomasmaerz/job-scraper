@@ -80,3 +80,123 @@ def test_needs_canonical_repair_detects_partial_state():
         "description_fingerprint": None,
         "description": "short desc",
     }) is False
+
+
+class FakeResponse:
+    def __init__(self, data):
+        self.data = data
+
+
+class FakeQuery:
+    def __init__(self, rows=None, state=None):
+        self.rows = rows or []
+        self.state = state if state is not None else {}
+        self.selected = None
+        self.range_calls = []
+        self.upsert_payloads = []
+
+    def select(self, fields):
+        self.selected = fields
+        return self
+
+    def range(self, start, end):
+        self.range_calls.append((start, end))
+        return self
+
+    def execute(self):
+        return FakeResponse(self.rows)
+
+    def upsert(self, payload):
+        self.upsert_payloads.append(payload)
+        return self
+
+
+class FakeSupabase:
+    def __init__(self, select_query, upsert_query=None):
+        self.select_query = select_query
+        self.upsert_query = upsert_query or select_query
+
+    def table(self, _name):
+        if getattr(self, "_used_select", False):
+            return self.upsert_query
+        self._used_select = True
+        return self.select_query
+
+
+def test_fetch_repair_candidates_returns_only_rows_needing_repair(monkeypatch):
+    rows = [
+        {
+            "job_id": "1",
+            "company": "Acme",
+            "job_title": "TPM",
+            "location": "Toronto",
+            "description": "long description " * 50,
+            "provider": "linkedin",
+            "scraped_at": "2026-06-14T10:15:00+00:00",
+            "posted_at": "2026-06-12",
+            "canonical_key": None,
+            "original_job_id": None,
+            "latest_job_id": None,
+            "first_seen_at": None,
+            "last_seen_at": None,
+            "listing_instances": None,
+            "description_fingerprint": None,
+        },
+        {
+            "job_id": "2",
+            "company": "Acme",
+            "job_title": "TPM",
+            "location": "Toronto",
+            "description": "short",
+            "provider": "linkedin",
+            "scraped_at": "2026-06-14T10:15:00+00:00",
+            "posted_at": "2026-06-12",
+            "canonical_key": "k",
+            "original_job_id": "2",
+            "latest_job_id": "2",
+            "first_seen_at": "2026-06-14T10:15:00+00:00",
+            "last_seen_at": "2026-06-14T10:15:00+00:00",
+            "listing_instances": [{}],
+            "description_fingerprint": None,
+        },
+    ]
+    query = FakeQuery(rows=rows)
+    monkeypatch.setattr(run_all_backfills, "supabase", FakeSupabase(query))
+
+    result = run_all_backfills.fetch_repair_candidates(batch_size=1000)
+
+    assert [row["job_id"] for row in result] == ["1"]
+    assert "canonical_key" in query.selected
+    assert "description_fingerprint" in query.selected
+
+
+def test_backfill_canonical_fields_upserts_in_batches(monkeypatch):
+    rows = [
+        {
+            "job_id": str(i),
+            "company": "Acme",
+            "job_title": "TPM",
+            "location": "Toronto",
+            "description": "long description " * 50,
+            "provider": "linkedin",
+            "scraped_at": "2026-06-14T10:15:00+00:00",
+            "posted_at": "2026-06-12",
+            "canonical_key": None,
+            "original_job_id": None,
+            "latest_job_id": None,
+            "first_seen_at": None,
+            "last_seen_at": None,
+            "listing_instances": None,
+            "description_fingerprint": None,
+        }
+        for i in range(205)
+    ]
+    select_query = FakeQuery(rows=rows)
+    upsert_query = FakeQuery(rows=[])
+    monkeypatch.setattr(run_all_backfills, "supabase", FakeSupabase(select_query, upsert_query))
+
+    repaired = run_all_backfills.backfill_canonical_fields(batch_size=100)
+
+    assert repaired == 205
+    assert len(upsert_query.upsert_payloads) == 3
+    assert [len(batch) for batch in upsert_query.upsert_payloads] == [100, 100, 5]

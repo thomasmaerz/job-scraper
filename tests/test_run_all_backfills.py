@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import run_all_backfills
 
 

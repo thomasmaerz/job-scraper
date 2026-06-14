@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import run_all_backfills
 
@@ -291,6 +292,40 @@ def test_main_runs_phases_in_order_and_returns_zero(monkeypatch, capsys):
     assert exit_code == 0
     assert calls == ["phase1", "phase2", "phase3", "phase4"]
     assert "PASS" in capsys.readouterr().out
+
+
+class CountingQuery:
+    def __init__(self, value, state):
+        self.value = value
+        self.state = state
+        self.filters = []
+
+    def select(self, fields, count=None):
+        self.state.append(("select", fields, count))
+        return self
+
+    def eq(self, field, value):
+        self.filters.append(("eq", field, value))
+        return self
+
+    def is_(self, field, value):
+        self.filters.append(("is", field, value))
+        return self
+
+    def execute(self):
+        return SimpleNamespace(count=self.value, data=[])
+
+
+def test_count_rows_applies_filters(monkeypatch):
+    state = []
+    query = CountingQuery(5, state)
+    monkeypatch.setattr(run_all_backfills, "supabase", SimpleNamespace(table=lambda _name: query))
+
+    value = run_all_backfills.count_rows("jobs", [("eq", "provider", "linkedin"), ("is", "archetype", None)])
+
+    assert value == 5
+    assert state == [("select", "job_id", "exact")]
+    assert query.filters == [("eq", "provider", "linkedin"), ("is", "archetype", None)]
 
 
 def test_main_stops_when_phase_two_raises(monkeypatch):

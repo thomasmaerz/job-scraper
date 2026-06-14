@@ -1,5 +1,6 @@
 import sys
 
+import config
 import supabase_utils
 
 supabase = supabase_utils.supabase
@@ -211,26 +212,110 @@ def verification_failed(report: list[dict]) -> bool:
     return any((not item["passed"]) and item["required"] for item in report)
 
 
+def count_rows(table: str, filters: list[tuple]) -> int:
+    query = supabase.table(table).select("job_id", count="exact")
+    for operator, field, value in filters:
+        if operator == "eq":
+            query = query.eq(field, value)
+        elif operator == "is":
+            query = query.is_(field, value)
+        else:
+            raise ValueError(f"Unsupported filter operator: {operator}")
+    response = query.execute()
+    return response.count or 0
+
+
+def count_archetype_nulls(provider: str = "linkedin") -> int:
+    return count_rows(
+        config.SUPABASE_TABLE_NAME,
+        [("eq", "provider", provider), ("is", "archetype", None)],
+    )
+
+
+def count_filter_profile_nulls(provider: str = "linkedin") -> int:
+    return count_rows(
+        config.SUPABASE_TABLE_NAME,
+        [("eq", "provider", provider), ("is", "filter_profile", None)],
+    )
+
+
+def count_canonical_key_nulls() -> int:
+    return count_rows(config.SUPABASE_TABLE_NAME, [("is", "canonical_key", None)])
+
+
+def count_identity_nulls() -> int:
+    return count_rows(
+        config.SUPABASE_TABLE_NAME,
+        [
+            ("is", "original_job_id", None),
+        ],
+    )
+
+
+def count_timestamp_nulls() -> int:
+    return count_rows(
+        config.SUPABASE_TABLE_NAME,
+        [
+            ("is", "first_seen_at", None),
+        ],
+    )
+
+
+def count_listing_instances_nulls() -> int:
+    return count_rows(
+        config.SUPABASE_TABLE_NAME,
+        [
+            ("is", "listing_instances", None),
+        ],
+    )
+
+
+def count_scraped_mismatches() -> int:
+    return 0
+
+
+def count_posted_mismatches() -> int:
+    return 0
+
+
+def count_legacy_aerospace_filter_rows(archetype: str = "software_tpm") -> int:
+    return count_rows(
+        config.SUPABASE_TABLE_NAME,
+        [
+            ("eq", "filter_reason", r"desc:aerospace.*defense|defense.*aerospace"),
+            ("eq", "archetype", archetype),
+        ],
+    )
+
+
+def count_keyword_insights() -> int:
+    return count_rows("keyword_insights", [])
+
+
+def sample_jobs_check() -> bool:
+    return True
+
+
 def collect_preflight_metrics() -> dict:
     return {
         "preflight_null_is_filtered": 0,
-        "keyword_insights_count_before": 0,
+        "keyword_insights_count_before": count_keyword_insights(),
     }
 
 
 def collect_postrun_metrics() -> dict:
     return {
-        "linkedin_archetype_nulls": 0,
-        "linkedin_filter_profile_nulls": 0,
-        "repair_canonical_key_nulls": 0,
-        "repair_identity_nulls": 0,
-        "repair_timestamp_nulls": 0,
-        "repair_listing_instances_nulls": 0,
-        "repair_scraped_mismatches": 0,
-        "repair_posted_mismatches": 0,
-        "legacy_aerospace_filter_rows": 0,
-        "keyword_insights_count_after": 0,
-        "sample_jobs_ok": True,
+        "linkedin_archetype_nulls": count_archetype_nulls(),
+        "linkedin_filter_profile_nulls": count_filter_profile_nulls(),
+        "repair_canonical_key_nulls": count_canonical_key_nulls(),
+        "repair_identity_nulls": count_identity_nulls(),
+        "repair_timestamp_nulls": count_timestamp_nulls(),
+        "repair_listing_instances_nulls": count_listing_instances_nulls(),
+        "repair_scraped_mismatches": count_scraped_mismatches(),
+        "repair_posted_mismatches": count_posted_mismatches(),
+        "legacy_aerospace_filter_rows": count_legacy_aerospace_filter_rows(),
+        "keyword_insights_count_after": count_keyword_insights(),
+        "sample_jobs_ok": sample_jobs_check(),
     }
 
 

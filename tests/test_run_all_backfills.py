@@ -213,3 +213,50 @@ def test_backfill_canonical_fields_upserts_in_batches(monkeypatch):
     assert repaired == 205
     assert len(upsert_query.upsert_payloads) == 3
     assert [len(batch) for batch in upsert_query.upsert_payloads] == [100, 100, 5]
+
+
+def test_build_verification_report_marks_failed_checks():
+    metrics = {
+        "preflight_null_is_filtered": 3,
+        "linkedin_archetype_nulls": 0,
+        "linkedin_filter_profile_nulls": 0,
+        "repair_canonical_key_nulls": 0,
+        "repair_identity_nulls": 2,
+        "repair_timestamp_nulls": 0,
+        "repair_listing_instances_nulls": 0,
+        "repair_scraped_mismatches": 0,
+        "repair_posted_mismatches": 0,
+        "legacy_aerospace_filter_rows": 0,
+        "keyword_insights_count_before": 1739,
+        "keyword_insights_count_after": 1739,
+        "sample_jobs_ok": True,
+    }
+
+    report = run_all_backfills.build_verification_report(metrics)
+
+    assert report[0]["name"] == "Preflight null is_filtered count"
+    assert any(item["name"] == "Canonical identity coverage" and item["passed"] is False for item in report)
+    assert run_all_backfills.verification_failed(report) is True
+
+
+def test_build_verification_report_accepts_matching_keyword_counts_and_clean_metrics():
+    metrics = {
+        "preflight_null_is_filtered": 0,
+        "linkedin_archetype_nulls": 0,
+        "linkedin_filter_profile_nulls": 0,
+        "repair_canonical_key_nulls": 0,
+        "repair_identity_nulls": 0,
+        "repair_timestamp_nulls": 0,
+        "repair_listing_instances_nulls": 0,
+        "repair_scraped_mismatches": 0,
+        "repair_posted_mismatches": 0,
+        "legacy_aerospace_filter_rows": 0,
+        "keyword_insights_count_before": 1739,
+        "keyword_insights_count_after": 1739,
+        "sample_jobs_ok": True,
+    }
+
+    report = run_all_backfills.build_verification_report(metrics)
+
+    assert all(item["passed"] for item in report if item["required"])
+    assert run_all_backfills.verification_failed(report) is False

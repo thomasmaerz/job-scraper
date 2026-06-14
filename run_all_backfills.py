@@ -116,6 +116,99 @@ def backfill_canonical_fields(batch_size: int = 100) -> int:
     return len(payloads)
 
 
+def build_verification_report(metrics: dict) -> list[dict]:
+    return [
+        {
+            "name": "Preflight null is_filtered count",
+            "actual": metrics["preflight_null_is_filtered"],
+            "expected": "reported",
+            "passed": True,
+            "required": False,
+        },
+        {
+            "name": "Archetype coverage",
+            "actual": metrics["linkedin_archetype_nulls"],
+            "expected": 0,
+            "passed": metrics["linkedin_archetype_nulls"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Filter profile coverage",
+            "actual": metrics["linkedin_filter_profile_nulls"],
+            "expected": 0,
+            "passed": metrics["linkedin_filter_profile_nulls"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Canonical key coverage",
+            "actual": metrics["repair_canonical_key_nulls"],
+            "expected": 0,
+            "passed": metrics["repair_canonical_key_nulls"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Canonical identity coverage",
+            "actual": metrics["repair_identity_nulls"],
+            "expected": 0,
+            "passed": metrics["repair_identity_nulls"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Canonical timestamp coverage",
+            "actual": metrics["repair_timestamp_nulls"],
+            "expected": 0,
+            "passed": metrics["repair_timestamp_nulls"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Listing instance coverage",
+            "actual": metrics["repair_listing_instances_nulls"],
+            "expected": 0,
+            "passed": metrics["repair_listing_instances_nulls"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Historical timestamp consistency",
+            "actual": metrics["repair_scraped_mismatches"],
+            "expected": 0,
+            "passed": metrics["repair_scraped_mismatches"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Historical posted consistency",
+            "actual": metrics["repair_posted_mismatches"],
+            "expected": 0,
+            "passed": metrics["repair_posted_mismatches"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Aerospace filter exact-match cleared",
+            "actual": metrics["legacy_aerospace_filter_rows"],
+            "expected": 0,
+            "passed": metrics["legacy_aerospace_filter_rows"] == 0,
+            "required": True,
+        },
+        {
+            "name": "Keyword insights preserved",
+            "actual": metrics["keyword_insights_count_after"],
+            "expected": metrics["keyword_insights_count_before"],
+            "passed": metrics["keyword_insights_count_after"] == metrics["keyword_insights_count_before"],
+            "required": True,
+        },
+        {
+            "name": "Sample job check",
+            "actual": metrics["sample_jobs_ok"],
+            "expected": True,
+            "passed": metrics["sample_jobs_ok"] is True,
+            "required": True,
+        },
+    ]
+
+
+def verification_failed(report: list[dict]) -> bool:
+    return any((not item["passed"]) and item["required"] for item in report)
+
+
 def main() -> int:
     raise NotImplementedError
 

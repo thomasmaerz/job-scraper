@@ -82,12 +82,12 @@ def test_needs_canonical_repair_detects_partial_state():
     }) is False
 
 
-class FakeResponse:
+class _FakeResponse:
     def __init__(self, data):
         self.data = data
 
 
-class FakeQuery:
+class _FakeQuery:
     def __init__(self, rows=None, state=None):
         self.rows = rows or []
         self.state = state if state is not None else {}
@@ -104,14 +104,14 @@ class FakeQuery:
         return self
 
     def execute(self):
-        return FakeResponse(self.rows)
+        return _FakeResponse(self.rows)
 
     def upsert(self, payload):
         self.upsert_payloads.append(payload)
         return self
 
 
-class FakeSupabase:
+class _FakeSupabase:
     def __init__(self, select_query, upsert_query=None):
         self.select_query = select_query
         self.upsert_query = upsert_query or select_query
@@ -121,6 +121,19 @@ class FakeSupabase:
             return self.upsert_query
         self._used_select = True
         return self.select_query
+
+
+def test_needs_canonical_repair_returns_true_when_description_fingerprint_null_but_long_description():
+    assert run_all_backfills.needs_canonical_repair({
+        "canonical_key": "x",
+        "original_job_id": "1",
+        "latest_job_id": "1",
+        "first_seen_at": "a",
+        "last_seen_at": "a",
+        "listing_instances": [{}],
+        "description_fingerprint": None,
+        "description": "long description " * 50,
+    }) is True
 
 
 def test_fetch_repair_candidates_returns_only_rows_needing_repair(monkeypatch):
@@ -160,8 +173,8 @@ def test_fetch_repair_candidates_returns_only_rows_needing_repair(monkeypatch):
             "description_fingerprint": None,
         },
     ]
-    query = FakeQuery(rows=rows)
-    monkeypatch.setattr(run_all_backfills, "supabase", FakeSupabase(query))
+    query = _FakeQuery(rows=rows)
+    monkeypatch.setattr(run_all_backfills, "supabase", _FakeSupabase(query))
 
     result = run_all_backfills.fetch_repair_candidates(batch_size=1000)
 
@@ -191,9 +204,9 @@ def test_backfill_canonical_fields_upserts_in_batches(monkeypatch):
         }
         for i in range(205)
     ]
-    select_query = FakeQuery(rows=rows)
-    upsert_query = FakeQuery(rows=[])
-    monkeypatch.setattr(run_all_backfills, "supabase", FakeSupabase(select_query, upsert_query))
+    select_query = _FakeQuery(rows=rows)
+    upsert_query = _FakeQuery(rows=[])
+    monkeypatch.setattr(run_all_backfills, "supabase", _FakeSupabase(select_query, upsert_query))
 
     repaired = run_all_backfills.backfill_canonical_fields(batch_size=100)
 

@@ -5,6 +5,14 @@ import supabase_utils
 
 supabase = supabase_utils.supabase
 
+"""Run one-off backfills for missing archetype, filter, and canonical job state."""
+
+JOBS_TABLE = config.SUPABASE_TABLE_NAME
+KEYWORD_INSIGHTS_TABLE = "keyword_insights"
+PHASE4_UPSERT_BATCH_SIZE = 100
+REPAIR_FETCH_BATCH_SIZE = 1000
+SAMPLE_REPAIR_CHECK_LIMIT = 3
+
 
 def build_historical_listing_instance(row: dict) -> dict:
     job_id = row.get("job_id")
@@ -96,9 +104,9 @@ CANONICAL_REPAIR_SELECT_FIELDS = ", ".join([
 ])
 
 
-def fetch_repair_candidates(batch_size: int = 1000) -> list[dict]:
+def fetch_repair_candidates(batch_size: int = REPAIR_FETCH_BATCH_SIZE) -> list[dict]:
     response = (
-        supabase.table("jobs")
+        supabase.table(JOBS_TABLE)
         .select(CANONICAL_REPAIR_SELECT_FIELDS)
         .range(0, batch_size - 1)
         .execute()
@@ -111,8 +119,8 @@ def chunked(items: list[dict], size: int) -> list[list[dict]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
 
-def backfill_canonical_fields(batch_size: int = 100) -> int:
-    rows = fetch_repair_candidates(batch_size=1000)
+def backfill_canonical_fields(batch_size: int = PHASE4_UPSERT_BATCH_SIZE) -> int:
+    rows = fetch_repair_candidates(batch_size=REPAIR_FETCH_BATCH_SIZE)
     payloads = [build_historical_backfill_payload(row) for row in rows]
     for batch in chunked(payloads, batch_size):
         supabase.table("jobs").upsert(batch).execute()
@@ -289,7 +297,7 @@ def count_legacy_aerospace_filter_rows(archetype: str = "software_tpm") -> int:
 
 
 def count_keyword_insights() -> int:
-    return count_rows("keyword_insights", [])
+    return count_rows(KEYWORD_INSIGHTS_TABLE, [])
 
 
 def sample_jobs_check() -> bool:
@@ -339,7 +347,7 @@ def main() -> int:
         phase3_updated = supabase_utils.flag_filtered_jobs()
         print(f"Phase 3 updated rows: {phase3_updated}")
 
-        phase4_updated = backfill_canonical_fields(batch_size=100)
+        phase4_updated = backfill_canonical_fields(batch_size=PHASE4_UPSERT_BATCH_SIZE)
         print(f"Phase 4 updated rows: {phase4_updated}")
 
         metrics = {**preflight, **collect_postrun_metrics()}

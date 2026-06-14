@@ -1,11 +1,11 @@
+"""Run one-off backfills for missing archetype, filter, and canonical job state."""
+
 import sys
 
 import config
 import supabase_utils
 
 supabase = supabase_utils.supabase
-
-"""Run one-off backfills for missing archetype, filter, and canonical job state."""
 
 JOBS_TABLE = config.SUPABASE_TABLE_NAME
 KEYWORD_INSIGHTS_TABLE = "keyword_insights"
@@ -123,7 +123,7 @@ def backfill_canonical_fields(batch_size: int = PHASE4_UPSERT_BATCH_SIZE) -> int
     rows = fetch_repair_candidates(batch_size=REPAIR_FETCH_BATCH_SIZE)
     payloads = [build_historical_backfill_payload(row) for row in rows]
     for batch in chunked(payloads, batch_size):
-        supabase.table("jobs").upsert(batch).execute()
+        supabase.table(JOBS_TABLE).upsert(batch).execute()
     return len(payloads)
 
 

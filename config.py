@@ -34,7 +34,7 @@ LINKEDIN_LOCATION = "Canada"
 LINKEDIN_GEO_ID = 101174742      # Canada
 LINKEDIN_JOB_TYPE = "F" # F=Full-time, C=Contract, P=Part-time, T=Temporary, I=Internship
 LINKEDIN_JOB_POSTING_DATE = "r86400" # r86400=Past 24h, r604800=Past week
-LINKEDIN_F_WT = 1,2 # 1=Onsite, 2=Remote, 3=Hybrid
+LINKEDIN_F_WT = "1,2,3" # 1=Onsite, 2=Remote, 3=Hybrid
 
 CAREERS_FUTURE_SEARCH_QUERIES = []
 CAREERS_FUTURE_SEARCH_CATEGORIES = []

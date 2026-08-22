@@ -6,6 +6,12 @@ on:
     # Runs every 4 hours (configurable — adjust to match your quota)
     - cron: "0 */4 * * *"
   workflow_dispatch: # Allows manual triggering from the Actions tab
+    inputs:
+      jobs_per_run:
+        description: "Number of jobs to score in this run (overrides JOBS_TO_SCORE_PER_RUN)"
+        required: false
+        default: "25"
+        type: number
 
 jobs:
   score:
@@ -34,5 +40,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          JOBS_TO_SCORE_PER_RUN: ${{ inputs.jobs_per_run || '25' }}
         run: python score_jobs.py # Execute the job scoring script
 

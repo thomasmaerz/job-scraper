@@ -264,10 +264,7 @@ BEGIN
             seen_count = l.seen_count,
             repost_count = GREATEST(l.seen_count - 1, 0),
             listing_instances = l.listing_instances,
-            detail_metadata_checked_at = a.detail_metadata_checked_at,
-            location_province_code = a.location_province_code,
-            location_scope = a.location_scope,
-            location_metro = a.location_metro
+            detail_metadata_checked_at = a.detail_metadata_checked_at
         FROM aggregate_values a, listing_values l
         WHERE target.job_id = survivor;
 

@@ -74,6 +74,39 @@ def test_generate_content_forwards_reasoning_effort(monkeypatch):
     assert calls[0]["reasoning_effort"] == "medium"
 
 
+def test_generate_content_omits_reasoning_effort_for_gemma_fallback(monkeypatch):
+    calls = []
+
+    class RateLimitError(Exception):
+        pass
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RateLimitError("429 rate limit")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+    monkeypatch.setattr(llm_client.litellm, "completion", fake_completion)
+    monkeypatch.setattr(llm_client.time, "sleep", lambda *_args, **_kwargs: None)
+
+    client = llm_client.LLMClient(
+        model="gemini",
+        api_key="test-key",
+        max_rpm=100,
+        max_retries=1,
+        retry_base_delay=0,
+        daily_budget=0,
+        request_delay=0,
+        model_chain=["gemini/gemini-3.1-flash-lite", "gemini/gemma-4-26b-a4b-it"],
+    )
+
+    assert client.generate_content(prompt="hello", reasoning_effort="low") == "ok"
+    assert calls[0]["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in calls[1]
+
+
 def test_generate_content_omits_temperature_when_not_provided(monkeypatch):
     calls = []
 

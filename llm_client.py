@@ -194,9 +194,6 @@ class LLMClient:
         if response_format is not None:
             base_kwargs["response_format"] = response_format
 
-        if reasoning_effort is not None:
-            base_kwargs["reasoning_effort"] = reasoning_effort
-
         last_exception = None
 
         is_dynamic_gemini = model.lower() in ("gemini", "google") and not self.model_chain and not model_override
@@ -225,6 +222,8 @@ class LLMClient:
                 current_model = gemini_pool[pool_index % len(gemini_pool)] if use_model_pool else model
                 kwargs = base_kwargs.copy()
                 kwargs["model"] = current_model
+                if reasoning_effort is not None and "/gemma-" not in current_model.lower():
+                    kwargs["reasoning_effort"] = reasoning_effort
 
                 logger.debug(f"LLM request attempt {attempt + 1}/{max_attempts} to {current_model}")
                 response = litellm.completion(**kwargs)

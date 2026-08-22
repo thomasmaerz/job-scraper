@@ -9,7 +9,7 @@ This project is a comprehensive suite of tools designed to automate and enhance 
   - Extracts text from PDF resumes using `pdfplumber`. ([resume_parser.py](resume_parser.py))
   - Utilizes Google Gemini AI to parse resume text into structured data ([parse_resume_with_ai.py](parse_resume_with_ai.py))
 - **Job Scoring**: Scores job descriptions against a parsed resume using AI to determine suitability. ([score_jobs.py](score_jobs.py))
-- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. Scheduled runs analyze only new unanalyzed jobs; manual replacement backfill is available for one-time reanalysis of previously analyzed jobs. ([analyze_jobs.py](analyze_jobs.py))
+- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. Scheduled runs analyze unanalyzed jobs in any state (new or expired) up to `JOB_INSIGHTS_MAX_JOBS` per run, with aggregates split by archetype and provider; manual replacement backfill is available for one-time reanalysis of previously analyzed jobs. ([analyze_jobs.py](analyze_jobs.py))
 - **Universal LLM Support**: Supports 400+ model providers (Gemini, OpenAI, Anthropic, Ollama, Groq, etc.) via a unified abstraction layer. ([llm_client.py](llm_client.py))
 - **Job Management**:
   - Tracks the status of job applications.
@@ -134,7 +134,7 @@ Once the setup is complete and GitHub Actions are enabled, the workflows defined
 - **`scrape_jobs.yml`**: Periodically scrapes new job postings from LinkedIn and CareersFuture based on your `config.py` settings and saves them to your Supabase database.
 - **`score_jobs.yml`**: Periodically scores the newly scraped jobs and jobs with custom resumes against your parsed resume / custom resume and updates the scores in the database.
 - **`job_manager.yml`**: Periodically manages job statuses (e.g., marks old jobs as expired, checks if active jobs are still available).
-- **`analyze_jobs.yml`**: Runs `analyze_jobs.py` on a schedule or manually to extract recurring market keywords from new jobs and update `keyword_insights`. Manual dispatch also supports a `drain_backlog` input to keep processing until no eligible unanalyzed jobs remain.
+- **`analyze_jobs.yml`**: Runs `analyze_jobs.py` on a schedule or manually to extract recurring market keywords from unanalyzed jobs and update `keyword_insights`. Manual dispatch also supports a `drain_backlog` input to keep processing until no eligible unanalyzed jobs remain.
 - **`hourly_resume_customization.yml`**: (If enabled and configured) May run tasks related to customizing resumes for specific jobs.
 
 You can monitor the execution of these actions in the "Actions" tab of your repository.

@@ -630,7 +630,7 @@ CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
     "keyword" text NOT NULL,
     "category" text NOT NULL,
     "count" integer DEFAULT 0 NOT NULL,
-    "provider" text,
+    "provider" text DEFAULT 'unknown'::text NOT NULL,
     "last_updated" timestamp with time zone DEFAULT now(),
     CONSTRAINT "keyword_insights_category_check"
         CHECK ("category" IN ('skill', 'technology', 'certification', 'attribute')),
@@ -676,7 +676,7 @@ ALTER TABLE ONLY "public"."customized_resumes"
 
 
 ALTER TABLE ONLY "public"."keyword_insights"
-    ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "keyword", "category");
+    ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "provider", "keyword", "category");
 
 
 ALTER TABLE ONLY "public"."job_keyword_insights"

@@ -43,7 +43,7 @@ def test_add_job_insights_sql_scopes_fact_and_aggregate_tables_by_archetype():
     sql = (ROOT / "supabase_setup" / "add_job_insights.sql").read_text()
 
     assert '"archetype" text NOT NULL' in sql
-    assert 'PRIMARY KEY ("archetype", "keyword", "category")' in sql
+    assert 'PRIMARY KEY ("archetype", "provider", "keyword", "category")' in sql
     assert 'PRIMARY KEY ("job_id", "archetype", "keyword", "category")' in sql
 
 
@@ -55,8 +55,10 @@ def test_add_job_insights_sql_migrates_existing_keyword_insights_table():
     assert 'ADD COLUMN IF NOT EXISTS "provider" text' in sql
     assert "UPDATE \"public\".\"keyword_insights\"" in sql
     assert "SET \"archetype\" = 'software_tpm'" in sql
+    assert "SET \"provider\" = 'unknown'" in sql
+    assert 'ALTER COLUMN "provider" SET NOT NULL' in sql
     assert 'DROP CONSTRAINT IF EXISTS "keyword_insights_pkey"' in sql
-    assert 'ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "keyword", "category")' in sql
+    assert 'ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "provider", "keyword", "category")' in sql
 
 
 def test_add_job_insights_sql_migrates_existing_job_keyword_insights_table():
@@ -77,7 +79,7 @@ def test_init_sql_scopes_insight_tables_by_archetype_for_fresh_installs():
     assert 'CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (' in sql
     assert 'CREATE TABLE IF NOT EXISTS "public"."job_keyword_insights" (' in sql
     assert '"archetype" text NOT NULL' in sql
-    assert 'ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "keyword", "category")' in sql
+    assert 'ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "provider", "keyword", "category")' in sql
     assert 'ADD CONSTRAINT "job_keyword_insights_pkey" PRIMARY KEY ("job_id", "archetype", "keyword", "category")' in sql
     assert 'CREATE INDEX IF NOT EXISTS "idx_keyword_insights_archetype_category"' in sql
     assert 'CREATE INDEX IF NOT EXISTS "idx_job_keyword_insights_archetype"' in sql

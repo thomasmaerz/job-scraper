@@ -21,9 +21,8 @@ CREATE TABLE IF NOT EXISTS "public"."keyword_insights" (
     "keyword" text NOT NULL,
     "category" text NOT NULL,
     "count" integer DEFAULT 0 NOT NULL,
-    "provider" text,
+    "provider" text DEFAULT 'unknown'::text NOT NULL,
     "last_updated" timestamp with time zone DEFAULT now(),
-    CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "keyword", "category"),
     CONSTRAINT "keyword_insights_category_check"
         CHECK ("category" IN ('skill', 'technology', 'certification', 'attribute')),
     CONSTRAINT "keyword_insights_count_check"
@@ -52,14 +51,24 @@ UPDATE "public"."keyword_insights"
 SET "archetype" = 'software_tpm'
 WHERE "archetype" IS NULL;
 
+UPDATE "public"."keyword_insights"
+SET "provider" = 'unknown'
+WHERE "provider" IS NULL;
+
 ALTER TABLE "public"."keyword_insights"
 ALTER COLUMN "archetype" SET NOT NULL;
+
+ALTER TABLE "public"."keyword_insights"
+ALTER COLUMN "provider" SET DEFAULT 'unknown';
+
+ALTER TABLE "public"."keyword_insights"
+ALTER COLUMN "provider" SET NOT NULL;
 
 ALTER TABLE "public"."keyword_insights"
 DROP CONSTRAINT IF EXISTS "keyword_insights_pkey";
 
 ALTER TABLE "public"."keyword_insights"
-ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "keyword", "category");
+ADD CONSTRAINT "keyword_insights_pkey" PRIMARY KEY ("archetype", "provider", "keyword", "category");
 
 ALTER TABLE "public"."job_keyword_insights"
 ADD COLUMN IF NOT EXISTS "archetype" text;

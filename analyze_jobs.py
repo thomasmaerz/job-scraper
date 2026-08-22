@@ -82,9 +82,6 @@ def fetch_unanalyzed_jobs(
         .eq("archetype", archetype)
     )
 
-    if not backfill_all and not replacement_backfill:
-        query = query.eq("is_active", True).eq("job_state", "new")
-
     if replacement_backfill:
         query = query.not_.is_("insights_analyzed_at", None).is_("insights_reanalyzed_at", None)
     else:
@@ -261,6 +258,10 @@ def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], archetype: 
     return inserted
 
 
+def _normalize_provider(provider) -> str:
+    return provider or "unknown"
+
+
 def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affected_keys=None):
     if not source_facts and not affected_keys:
         return
@@ -268,7 +269,8 @@ def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affect
     db = db or _get_db()
     timestamp = datetime.now(timezone.utc).isoformat()
     affected_keys = affected_keys or {
-        (fact.get("archetype"), fact["keyword"], fact["category"]) for fact in source_facts
+        (fact.get("archetype"), _normalize_provider(fact.get("provider")), fact["keyword"], fact["category"])
+        for fact in source_facts
     }
     counts = defaultdict(int)
     offset = 0
@@ -276,7 +278,7 @@ def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affect
     while True:
         rows = (
             db.table("job_keyword_insights")
-            .select("job_id, keyword, category, archetype")
+            .select("job_id, keyword, category, archetype, provider")
             .range(offset, offset + page_size - 1)
             .execute()
             .data
@@ -285,7 +287,7 @@ def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affect
         if not rows:
             break
         for row in rows:
-            key = (row.get("archetype"), row["keyword"], row["category"])
+            key = (row.get("archetype"), _normalize_provider(row.get("provider")), row["keyword"], row["category"])
             if key in affected_keys:
                 counts[key] += 1
         offset += page_size
@@ -293,18 +295,19 @@ def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affect
     rows = [
         {
             "archetype": archetype,
+            "provider": provider,
             "keyword": keyword,
             "category": category,
-            "count": counts[(archetype, keyword, category)],
+            "count": counts[(archetype, provider, keyword, category)],
             "last_updated": timestamp,
         }
-        for (archetype, keyword, category) in affected_keys
+        for (archetype, provider, keyword, category) in affected_keys
     ]
 
     batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
-        db.table("keyword_insights").upsert(batch, on_conflict="archetype,keyword,category").execute()
+        db.table("keyword_insights").upsert(batch, on_conflict="archetype,provider,keyword,category").execute()
 
 
 def rebuild_keyword_insights(db=None):
@@ -317,7 +320,7 @@ def rebuild_keyword_insights(db=None):
     while True:
         rows = (
             db.table("job_keyword_insights")
-            .select("keyword, category, archetype")
+            .select("keyword, category, archetype, provider")
             .range(offset, offset + page_size - 1)
             .execute()
             .data
@@ -327,24 +330,25 @@ def rebuild_keyword_insights(db=None):
             break
 
         for row in rows:
-            counts[(row.get("archetype"), row["keyword"], row["category"])] += 1
+            counts[(row.get("archetype"), _normalize_provider(row.get("provider")), row["keyword"], row["category"])] += 1
         offset += page_size
 
     rebuilt_rows = [
         {
             "archetype": archetype,
+            "provider": provider,
             "keyword": keyword,
             "category": category,
             "count": count,
             "last_updated": timestamp,
         }
-        for (archetype, keyword, category), count in counts.items()
+        for (archetype, provider, keyword, category), count in counts.items()
     ]
 
     batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
     for start in range(0, len(rebuilt_rows), batch_size):
         batch = rebuilt_rows[start : start + batch_size]
-        db.table("keyword_insights").upsert(batch, on_conflict="archetype,keyword,category").execute()
+        db.table("keyword_insights").upsert(batch, on_conflict="archetype,provider,keyword,category").execute()
 
     rebuilt_keys = set(counts.keys())
     existing_keys = set()
@@ -352,7 +356,7 @@ def rebuild_keyword_insights(db=None):
     while True:
         rows = (
             db.table("keyword_insights")
-            .select("keyword, category, archetype")
+            .select("keyword, category, archetype, provider")
             .range(offset, offset + page_size - 1)
             .execute()
             .data
@@ -362,12 +366,12 @@ def rebuild_keyword_insights(db=None):
             break
 
         for row in rows:
-            existing_keys.add((row.get("archetype"), row["keyword"], row["category"]))
+            existing_keys.add((row.get("archetype"), _normalize_provider(row.get("provider")), row["keyword"], row["category"]))
         offset += page_size
 
     stale_keys = existing_keys - rebuilt_keys
-    for archetype, keyword, category in stale_keys:
-        db.table("keyword_insights").delete().eq("keyword", keyword).eq("category", category).eq("archetype", archetype).execute()
+    for archetype, provider, keyword, category in stale_keys:
+        db.table("keyword_insights").delete().eq("keyword", keyword).eq("category", category).eq("archetype", archetype).eq("provider", provider).execute()
 
 
 def mark_jobs_analyzed(job_ids: list, db=None, replacement_backfill: bool = False):

@@ -9,10 +9,13 @@ CREATE TABLE IF NOT EXISTS public.job_listing_archive (
 
 CREATE TABLE IF NOT EXISTS public.job_resume_links (
     canonical_job_id text NOT NULL REFERENCES public.jobs(job_id) ON DELETE CASCADE,
-    customized_resume_id uuid NOT NULL REFERENCES public.customized_resumes(id) ON DELETE CASCADE,
+    customized_resume_id uuid NOT NULL,
     source_job_id text,
     PRIMARY KEY (canonical_job_id, customized_resume_id)
 );
+
+ALTER TABLE public.job_resume_links
+    DROP CONSTRAINT IF EXISTS job_resume_links_customized_resume_id_fkey;
 
 CREATE TABLE IF NOT EXISTS public.job_repost_merge_plan (
     source_job_id text PRIMARY KEY,

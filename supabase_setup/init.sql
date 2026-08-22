@@ -126,6 +126,8 @@ ALTER TABLE "public"."jobs"
     ADD COLUMN IF NOT EXISTS "last_seen_posted_at" timestamp with time zone,
     ADD COLUMN IF NOT EXISTS "posted_relative_text" text,
     ADD COLUMN IF NOT EXISTS "applicant_count" integer,
+    ADD COLUMN IF NOT EXISTS "applicant_count_text" text,
+    ADD COLUMN IF NOT EXISTS "applicant_count_type" text,
     ADD COLUMN IF NOT EXISTS "salary_text" text,
     ADD COLUMN IF NOT EXISTS "salary_min" numeric,
     ADD COLUMN IF NOT EXISTS "salary_max" numeric,
@@ -133,6 +135,7 @@ ALTER TABLE "public"."jobs"
     ADD COLUMN IF NOT EXISTS "recruiter_name" text,
     ADD COLUMN IF NOT EXISTS "recruiter_profile_url" text,
     ADD COLUMN IF NOT EXISTS "recruiter_identifier" text,
+    ADD COLUMN IF NOT EXISTS "detail_metadata_checked_at" timestamp with time zone,
     ADD COLUMN IF NOT EXISTS "description_fingerprint" text,
     ADD COLUMN IF NOT EXISTS "first_seen_at" timestamp with time zone DEFAULT now(),
     ADD COLUMN IF NOT EXISTS "last_seen_at" timestamp with time zone DEFAULT now(),
@@ -142,6 +145,10 @@ ALTER TABLE "public"."jobs"
 
 CREATE INDEX IF NOT EXISTS "idx_jobs_canonical_key" ON "public"."jobs" ("canonical_key");
 CREATE INDEX IF NOT EXISTS "idx_jobs_company_title_location" ON "public"."jobs" ("company", "job_title", "location");
+
+COMMENT ON COLUMN "public"."jobs"."applicant_count_text" IS 'Raw LinkedIn applicant caption preserving display semantics.';
+COMMENT ON COLUMN "public"."jobs"."applicant_count_type" IS 'Interpretation of applicant_count: exact, upper_bound, or lower_bound.';
+COMMENT ON COLUMN "public"."jobs"."detail_metadata_checked_at" IS 'Last LinkedIn detail-page metadata check, including unavailable responses.';
 CREATE INDEX IF NOT EXISTS "idx_jobs_last_seen_at" ON "public"."jobs" ("last_seen_at");
 CREATE INDEX IF NOT EXISTS "idx_jobs_last_seen_posted_at" ON "public"."jobs" ("last_seen_posted_at");
 

@@ -25,6 +25,10 @@ class _RecordingQuery:
         self.filters.append(("gte", field, value))
         return self
 
+    def range(self, start, end):
+        self.filters.append(("range", start, end))
+        return self
+
     def upsert(self, payload):
         self.upsert_payloads.append(payload)
         return self
@@ -249,6 +253,43 @@ def test_prepare_repost_update_payload_preserves_existing_latest_job_id_when_new
     assert update["latest_job_id"] == "4426608777"
 
 
+def test_prepare_repost_update_payload_does_not_count_same_listing_twice():
+    existing = {
+        "job_id": "canonical",
+        "latest_job_id": "source-2",
+        "listing_instances": [{"job_id": "source-1"}, {"job_id": "source-2"}],
+        "seen_count": 2,
+        "repost_count": 1,
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(
+        existing,
+        {"job_id": "source-2", "applicant_count": 42},
+    )
+
+    assert update["seen_count"] == 2
+    assert update["repost_count"] == 1
+    assert len(update["listing_instances"]) == 2
+    assert update["listing_instances"][1]["applicant_count"] == 42
+
+
+def test_prepare_repost_update_payload_reactivates_expired_canonical_role():
+    existing = {
+        "job_id": "canonical",
+        "latest_job_id": "source-1",
+        "listing_instances": [{"job_id": "source-1"}],
+        "seen_count": 1,
+        "repost_count": 0,
+        "is_active": False,
+        "job_state": "expired",
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, {"job_id": "source-2"})
+
+    assert update["is_active"] is True
+    assert update["job_state"] == "new"
+
+
 def test_find_canonical_match_prefers_existing_role():
     existing_rows = [{
         "job_id": "4394716706",
@@ -256,6 +297,7 @@ def test_find_canonical_match_prefers_existing_role():
         "company": "Chandos Construction",
         "job_title": "Industrial Construction - Senior Project Manager",
         "location": "Chalk River, Ontario, Canada",
+        "description": "We are Chandos. Inclusion, collaboration, innovation.",
         "description_fingerprint": supabase_utils.make_description_fingerprint("We are Chandos. Inclusion, collaboration, innovation."),
         "listing_instances": [],
         "seen_count": 1,
@@ -274,22 +316,55 @@ def test_find_canonical_match_prefers_existing_role():
     assert match["job_id"] == "4394716706"
 
 
-def test_get_recent_canonical_candidates_selects_fields_needed_for_partial_repost_updates(monkeypatch):
+def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updates(monkeypatch):
     query = _RecordingQuery(response_data=[])
     monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
 
-    supabase_utils.get_recent_canonical_candidates(
-        provider="linkedin",
-        company="Chandos Construction",
-        days=30,
-    )
+    supabase_utils.get_canonical_candidates(provider="linkedin")
 
     assert query.selected == (
-        "job_id, canonical_key, company, job_title, location, description_fingerprint, "
+        "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
         "listing_instances, seen_count, repost_count, latest_job_id, last_seen_posted_at, "
-        "posted_relative_text, applicant_count, salary_text, salary_min, salary_max, "
-        "salary_currency, recruiter_name, recruiter_profile_url, recruiter_identifier"
+        "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
+        "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
+        "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
+        "is_active, job_state"
     )
+
+
+def test_find_canonical_match_uses_freehire_style_fuzzy_description_match():
+    shared = " ".join(f"delivery token{index}" for index in range(100))
+    existing = {
+        "job_id": "old",
+        "company": "Example Inc.",
+        "job_title": "Senior Project Manager - Toronto",
+        "description": shared + " legacy",
+        "description_fingerprint": "different",
+    }
+    job = {
+        "company": "Example Inc",
+        "job_title": "Senior Project Manager - Calgary",
+        "description": shared + " updated",
+    }
+
+    assert supabase_utils.find_canonical_match(job, [existing]) == existing
+
+
+def test_find_canonical_match_rejects_low_similarity_same_title():
+    existing = {
+        "job_id": "old",
+        "company": "Example Inc.",
+        "job_title": "Senior Project Manager",
+        "description": "alpha bravo charlie delta echo foxtrot",
+        "description_fingerprint": "different",
+    }
+    job = {
+        "company": "Example Inc",
+        "job_title": "Senior Project Manager",
+        "description": "systems delivery program stakeholder schedule budget",
+    }
+
+    assert supabase_utils.find_canonical_match(job, [existing]) is None
 
 
 def test_save_jobs_to_supabase_preserves_canonical_and_task2_metadata_fields(monkeypatch):
@@ -337,6 +412,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
         "company": "Foo Bar",
         "job_title": "Senior Project Manager",
         "location": "Toronto, Ontario, Canada",
+        "description": "We are Chandos. Inclusion, collaboration, innovation. " * 4,
         "description_fingerprint": supabase_utils.make_description_fingerprint(
             "We are Chandos. Inclusion, collaboration, innovation. " * 4
         ),
@@ -392,11 +468,11 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
     assert query.upsert_payloads[0][0]["salary_text"] == "$120,000-$135,000 CAD"
 
 
-def test_save_linkedin_jobs_canonicalized_caches_recent_candidates_by_query_params(monkeypatch):
+def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypatch):
     calls = []
 
-    def fake_get_recent_canonical_candidates(provider, company, days):
-        calls.append((provider, company, days))
+    def fake_get_canonical_candidates(provider):
+        calls.append(provider)
         return []
 
     inserted_payloads = []
@@ -404,7 +480,7 @@ def test_save_linkedin_jobs_canonicalized_caches_recent_candidates_by_query_para
     def fake_save_jobs_to_supabase(payloads):
         inserted_payloads.extend(payloads)
 
-    monkeypatch.setattr(supabase_utils, "get_recent_canonical_candidates", fake_get_recent_canonical_candidates)
+    monkeypatch.setattr(supabase_utils, "get_canonical_candidates", fake_get_canonical_candidates)
     monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", fake_save_jobs_to_supabase)
 
     jobs = [
@@ -428,5 +504,5 @@ def test_save_linkedin_jobs_canonicalized_caches_recent_candidates_by_query_para
 
     supabase_utils.save_linkedin_jobs_canonicalized(jobs)
 
-    assert calls == [("linkedin", "Acme", getattr(supabase_utils.config, "REPOST_DEDUP_DAYS", 30))]
+    assert calls == ["linkedin"]
     assert len(inserted_payloads) == 2

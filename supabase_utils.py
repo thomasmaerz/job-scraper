@@ -8,6 +8,7 @@ import logging # Import logging
 import re # Import re for filter pattern matching
 import string
 import unicodedata
+import html
 from datetime import datetime, timezone, timedelta
 
 # --- Initialize Supabase Client ---
@@ -73,6 +74,30 @@ def make_description_fingerprint(description: str) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def normalize_role_title(title: str) -> str:
+    value = re.sub(r"[()]", " ", title or "")
+    trailing_clause = re.compile(r"(?:\s*,\s*|\s+[|@]\s*|\s+[-–—]\s*)[^,|@\-–—]*$")
+    match = trailing_clause.search(value)
+    if match and len(value[:match.start()].split()) >= 2:
+        value = value[:match.start()]
+    value = re.sub(r"<[^>]*>", " ", value)
+    return normalize_title(html.unescape(value))
+
+
+def description_token_signature(description: str) -> set[str]:
+    value = re.sub(r"<[^>]*>", " ", description or "")
+    value = _collapse_spaces(html.unescape(value).lower())
+    return {token for token in re.findall(r"[a-z0-9]+", value) if len(token) > 3}
+
+
+def description_similarity(left: str, right: str) -> float:
+    left_tokens = description_token_signature(left)
+    right_tokens = description_token_signature(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
 def build_listing_instance(job: dict) -> dict:
     job_id = job.get("job_id")
     return {
@@ -81,10 +106,13 @@ def build_listing_instance(job: dict) -> dict:
         "posted_at": job.get("posted_at"),
         "posted_relative_text": job.get("posted_relative_text"),
         "applicant_count": job.get("applicant_count"),
+        "applicant_count_text": job.get("applicant_count_text"),
+        "applicant_count_type": job.get("applicant_count_type"),
         "salary_text": job.get("salary_text"),
         "recruiter_name": job.get("recruiter_name"),
         "recruiter_profile_url": job.get("recruiter_profile_url"),
         "recruiter_identifier": job.get("recruiter_identifier"),
+        "detail_metadata_checked_at": job.get("detail_metadata_checked_at"),
     }
 
 
@@ -113,15 +141,45 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
 
 def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
     listing_instances = list(existing.get("listing_instances") or [])
-    listing_instances.append(build_listing_instance(new_job))
     new_job_id = new_job.get("job_id")
-    return {
+    new_job_id = str(new_job_id) if new_job_id is not None else None
+    known_listing_ids = {
+        str(instance.get("job_id"))
+        for instance in listing_instances
+        if instance.get("job_id") is not None
+    }
+    is_new_listing = new_job_id is not None and new_job_id not in known_listing_ids
+    if is_new_listing:
+        listing_instances.append(build_listing_instance(new_job))
+    elif new_job_id is not None:
+        for instance in listing_instances:
+            if str(instance.get("job_id")) != new_job_id:
+                continue
+            for field in (
+                "posted_at",
+                "posted_relative_text",
+                "applicant_count",
+                "applicant_count_text",
+                "applicant_count_type",
+                "salary_text",
+                "recruiter_name",
+                "recruiter_profile_url",
+                "recruiter_identifier",
+            ):
+                if new_job.get(field) is not None:
+                    instance[field] = new_job[field]
+            instance["detail_metadata_checked_at"] = new_job.get("detail_metadata_checked_at")
+            break
+    seen_count = int(existing.get("seen_count") or len(known_listing_ids) or 1)
+    payload = {
         "job_id": existing["job_id"],
-        "latest_job_id": str(new_job_id) if new_job_id is not None else existing.get("latest_job_id"),
+        "latest_job_id": new_job_id if new_job_id is not None else existing.get("latest_job_id"),
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
         "last_seen_posted_at": new_job.get("posted_at") if new_job.get("posted_at") is not None else existing.get("last_seen_posted_at"),
         "posted_relative_text": new_job.get("posted_relative_text") if new_job.get("posted_relative_text") is not None else existing.get("posted_relative_text"),
         "applicant_count": new_job.get("applicant_count") if new_job.get("applicant_count") is not None else existing.get("applicant_count"),
+        "applicant_count_text": new_job.get("applicant_count_text") if new_job.get("applicant_count_text") is not None else existing.get("applicant_count_text"),
+        "applicant_count_type": new_job.get("applicant_count_type") if new_job.get("applicant_count_type") is not None else existing.get("applicant_count_type"),
         "salary_text": new_job.get("salary_text") if new_job.get("salary_text") is not None else existing.get("salary_text"),
         "salary_min": new_job.get("salary_min") if new_job.get("salary_min") is not None else existing.get("salary_min"),
         "salary_max": new_job.get("salary_max") if new_job.get("salary_max") is not None else existing.get("salary_max"),
@@ -129,54 +187,83 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
         "recruiter_name": new_job.get("recruiter_name") if new_job.get("recruiter_name") is not None else existing.get("recruiter_name"),
         "recruiter_profile_url": new_job.get("recruiter_profile_url") if new_job.get("recruiter_profile_url") is not None else existing.get("recruiter_profile_url"),
         "recruiter_identifier": new_job.get("recruiter_identifier") if new_job.get("recruiter_identifier") is not None else existing.get("recruiter_identifier"),
-        "seen_count": int(existing.get("seen_count") or 0) + 1,
-        "repost_count": int(existing.get("repost_count") or 0) + 1,
+        "seen_count": seen_count + (1 if is_new_listing else 0),
+        "repost_count": int(existing.get("repost_count") or 0) + (1 if is_new_listing else 0),
         "listing_instances": listing_instances,
+        "detail_metadata_checked_at": new_job.get("detail_metadata_checked_at") or existing.get("detail_metadata_checked_at"),
     }
+    if is_new_listing and existing.get("job_state") in {"expired", "removed"}:
+        payload["is_active"] = True
+        payload["job_state"] = "new"
+    return payload
 
 
 def find_canonical_match(job: dict, existing_rows: list[dict]) -> dict | None:
-    target_key = build_canonical_key(
-        job.get("provider"),
-        job.get("company"),
-        job.get("job_title"),
-        job.get("location"),
-    )
+    target_company = normalize_company(job.get("company"))
+    target_title = normalize_role_title(job.get("job_title"))
     target_fp = make_description_fingerprint(job.get("description"))
+    target_job_id = str(job.get("job_id")) if job.get("job_id") is not None else None
 
-    for row in existing_rows:
-        if row.get("canonical_key") == target_key:
+    ordered_rows = sorted(existing_rows, key=lambda row: str(row.get("job_id") or ""))
+    for row in ordered_rows:
+        known_ids = {str(row.get("job_id")), str(row.get("latest_job_id"))}
+        known_ids.update(
+            str(instance.get("job_id"))
+            for instance in (row.get("listing_instances") or [])
+            if instance.get("job_id") is not None
+        )
+        if target_job_id and target_job_id in known_ids:
             return row
 
-    if not target_fp:
+    matching_bucket = [
+        row for row in ordered_rows
+        if normalize_company(row.get("company")) == target_company
+        and normalize_role_title(row.get("job_title")) == target_title
+    ]
+    if len(matching_bucket) > 200:
         return None
 
-    for row in existing_rows:
-        same_company = normalize_company(row.get("company")) == normalize_company(job.get("company"))
-        same_title = normalize_title(row.get("job_title")) == normalize_title(job.get("job_title"))
-        same_location = normalize_location(row.get("location")) == normalize_location(job.get("location"))
-        same_fp = row.get("description_fingerprint") and row.get("description_fingerprint") == target_fp
-        if same_company and same_title and same_location and same_fp:
+    for row in matching_bucket:
+        same_company = normalize_company(row.get("company")) == target_company
+        same_title = normalize_role_title(row.get("job_title")) == target_title
+        same_fp = target_fp and row.get("description_fingerprint") == target_fp
+        if same_company and same_title and same_fp:
+            return row
+
+    for row in matching_bucket:
+        same_company = normalize_company(row.get("company")) == target_company
+        same_title = normalize_role_title(row.get("job_title")) == target_title
+        similarity = description_similarity(job.get("description"), row.get("description"))
+        threshold = getattr(config, "REPOST_DESCRIPTION_SIMILARITY_THRESHOLD", 0.90)
+        if same_company and same_title and similarity >= threshold:
             return row
 
     return None
 
 
-def get_recent_canonical_candidates(provider: str, company: str, days: int) -> list[dict]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    response = (
-        supabase.table(config.SUPABASE_TABLE_NAME)
-        .select(
-            "job_id, canonical_key, company, job_title, location, description_fingerprint, "
-            "listing_instances, seen_count, repost_count, latest_job_id, last_seen_posted_at, "
-            "posted_relative_text, applicant_count, salary_text, salary_min, salary_max, "
-            "salary_currency, recruiter_name, recruiter_profile_url, recruiter_identifier"
+def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]:
+    candidates = []
+    offset = 0
+    while True:
+        response = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select(
+                "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
+                "listing_instances, seen_count, repost_count, latest_job_id, last_seen_posted_at, "
+                "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
+                "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
+                "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
+                "is_active, job_state"
+            )
+            .eq("provider", provider)
+            .range(offset, offset + page_size - 1)
+            .execute()
         )
-        .eq("provider", provider)
-        .gte("last_seen_at", cutoff)
-        .execute()
-    )
-    return response.data or []
+        page = response.data or []
+        candidates.extend(page)
+        if len(page) < page_size:
+            return candidates
+        offset += page_size
 
 
 def save_linkedin_jobs_canonicalized(jobs_data: list):
@@ -186,26 +273,21 @@ def save_linkedin_jobs_canonicalized(jobs_data: list):
             save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
             continue
 
-        cache_key = (
-            job.get("provider"),
-            job.get("company"),
-            getattr(config, "REPOST_DEDUP_DAYS", 30),
-        )
+        cache_key = job.get("provider")
         candidates = candidates_cache.get(cache_key)
         if candidates is None:
-            candidates = get_recent_canonical_candidates(
-                provider=cache_key[0],
-                company=cache_key[1],
-                days=cache_key[2],
-            )
+            candidates = get_canonical_candidates(provider=cache_key)
             candidates_cache[cache_key] = candidates
         match = find_canonical_match(job, candidates)
 
         if match:
             payload = prepare_repost_update_payload(match, job)
             supabase.table(config.SUPABASE_TABLE_NAME).upsert([payload]).execute()
+            match.update(payload)
         else:
-            save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
+            payload = prepare_canonical_insert_payload(job)
+            save_jobs_to_supabase([payload])
+            candidates.append(payload)
 
 # --- Supabase Functions ---
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
@@ -258,6 +340,24 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
         print(f"Error fetching existing jobs from Supabase: {e}")
 
     return existing_ids, existing_company_title_keys
+
+
+def get_incomplete_linkedin_metadata_ids(job_ids: list[str]) -> set[str]:
+    if not job_ids:
+        return set()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    response = (
+        supabase.table(config.SUPABASE_TABLE_NAME)
+        .select("job_id, latest_job_id, detail_metadata_checked_at")
+        .eq("provider", "linkedin")
+        .in_("latest_job_id", [str(job_id) for job_id in job_ids])
+        .execute()
+    )
+    return {
+        str(row.get("latest_job_id") or row.get("job_id"))
+        for row in (response.data or [])
+        if not row.get("detail_metadata_checked_at") or row["detail_metadata_checked_at"] < cutoff
+    }
 
 
 def get_filter_profile(archetype: str | None) -> dict:
@@ -338,6 +438,8 @@ def save_jobs_to_supabase(jobs_data: list):
         "description_fingerprint",
         "posted_relative_text",
         "applicant_count",
+        "applicant_count_text",
+        "applicant_count_type",
         "salary_text",
         "salary_min",
         "salary_max",
@@ -345,6 +447,7 @@ def save_jobs_to_supabase(jobs_data: list):
         "recruiter_name",
         "recruiter_profile_url",
         "recruiter_identifier",
+        "detail_metadata_checked_at",
     }
     processed_jobs_data = []
     for job in jobs_data:

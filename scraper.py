@@ -35,15 +35,51 @@ def _parse_salary_fields(text: str) -> dict:
     if not text:
         return {"salary_text": None, "salary_min": None, "salary_max": None, "salary_currency": None}
 
-    match = re.search(r'(\$[\d,]+)\s*-\s*(\$[\d,]+)\s*(CAD|USD)?', text, re.IGNORECASE)
+    match = re.search(
+        r'(?:(CAD|USD)\s*)?'
+        r'(\$?\s*\d[\d,]*(?:\.\d+)?\s*[kK]?)'
+        r'\s*(?:-|–|—|to|à)\s*'
+        r'(\$?\s*\d[\d,]*(?:\.\d+)?\s*[kK]?)'
+        r'\s*(CAD|USD)?',
+        text,
+        re.IGNORECASE,
+    )
     if not match:
         return {"salary_text": None, "salary_min": None, "salary_max": None, "salary_currency": None}
 
-    raw_min, raw_max, currency = match.groups()
+    leading_currency, raw_min, raw_max, trailing_currency = match.groups()
+
+    def parse_amount(value: str) -> int:
+        normalized = value.replace("$", "").replace(",", "").replace(" ", "")
+        multiplier = 1000 if normalized.lower().endswith("k") else 1
+        normalized = normalized.rstrip("kK")
+        return int(float(normalized) * multiplier)
+
+    salary_min = parse_amount(raw_min)
+    salary_max = parse_amount(raw_max)
+    context = text[max(0, match.start() - 100):match.end() + 100]
+    has_pay_context = re.search(
+        r'\b(salary|pay|compensation|wage|rate|remuneration|rémunération|salaire|'
+        r'annual|annually|yearly|hourly|bi-weekly|weekly|monthly)\b|'
+        r'/(?:hr|hour|year)|per\s+(?:hour|year|annum)',
+        context,
+        re.IGNORECASE,
+    )
+    has_salary_marker = bool(
+        (leading_currency or trailing_currency)
+        or "$" in raw_min
+        or "$" in raw_max
+        or raw_min.strip().lower().endswith("k")
+        or raw_max.strip().lower().endswith("k")
+    )
+    if not has_salary_marker or not has_pay_context or salary_min < 1000 or salary_max < 1000 or salary_max < salary_min:
+        return {"salary_text": None, "salary_min": None, "salary_max": None, "salary_currency": None}
+
+    currency = leading_currency or trailing_currency
     return {
-        "salary_text": match.group(0),
-        "salary_min": int(raw_min.replace("$", "").replace(",", "")),
-        "salary_max": int(raw_max.replace("$", "").replace(",", "")),
+        "salary_text": match.group(0).strip(),
+        "salary_min": salary_min,
+        "salary_max": salary_max,
         "salary_currency": currency.upper() if currency else None,
     }
 
@@ -56,6 +92,8 @@ def _extract_recruiter_identifier(profile_url: str | None) -> str | None:
 def _extract_linkedin_detail_metadata(soup: BeautifulSoup) -> dict:
     result = {
         "applicant_count": None,
+        "applicant_count_text": None,
+        "applicant_count_type": None,
         "salary_text": None,
         "salary_min": None,
         "salary_max": None,
@@ -65,14 +103,23 @@ def _extract_linkedin_detail_metadata(soup: BeautifulSoup) -> dict:
         "recruiter_identifier": None,
     }
 
-    applicant_span = soup.find("span", {"class": re.compile(r"num-applicants__caption")})
-    if applicant_span:
-        text = applicant_span.get_text(" ", strip=True)
+    applicant_caption = soup.find(["span", "figcaption"], {"class": re.compile(r"num-applicants__caption")})
+    if applicant_caption:
+        text = applicant_caption.get_text(" ", strip=True)
+        result["applicant_count_text"] = text
         match = re.search(r'(\d+)', text.replace(",", ""))
         if match:
             result["applicant_count"] = int(match.group(1))
+            lowered = text.lower()
+            if "over" in lowered or "+" in lowered:
+                result["applicant_count_type"] = "lower_bound"
+            elif "among the first" in lowered or "fewer than" in lowered:
+                result["applicant_count_type"] = "upper_bound"
+            else:
+                result["applicant_count_type"] = "exact"
 
-    recruiter_link = soup.find("a", href=re.compile(r"linkedin\.com/in/"))
+    recruiter_section = soup.find(class_=re.compile(r"hirer-card|message-the-recruiter"))
+    recruiter_link = (recruiter_section or soup).find("a", href=re.compile(r"linkedin\.com/in/"))
     if recruiter_link:
         result["recruiter_profile_url"] = recruiter_link.get("href")
         result["recruiter_identifier"] = _extract_recruiter_identifier(result["recruiter_profile_url"])
@@ -421,6 +468,7 @@ def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) ->
             logging.warning(f"Description HTML was empty for job ID {job_id}. Skipping conversion.") 
 
         job_details.update(_extract_linkedin_detail_metadata(soup))
+        job_details["detail_metadata_checked_at"] = datetime.now().isoformat()
 
         # --- Set Provider ---
         job_details["provider"] = "linkedin"
@@ -470,11 +518,18 @@ def process_linkedin_query(
 
     logging.info("\n--- Starting Filtering Step: Checking against Supabase ---")
     job_ids_set, company_title_set = supabase_utils.get_existing_jobs_from_supabase()
+    incomplete_metadata_ids = supabase_utils.get_incomplete_linkedin_metadata_ids(unique_linkedin_job_ids)
 
     new_job_ids_to_process = [
         str(job_id) for job_id in unique_linkedin_job_ids 
         if str(job_id) not in job_ids_set
     ]
+    enrichment_limit = getattr(config, "LINKEDIN_METADATA_ENRICH_LIMIT_PER_QUERY", 10)
+    metadata_job_ids_to_process = [
+        str(job_id) for job_id in unique_linkedin_job_ids
+        if str(job_id) in incomplete_metadata_ids
+    ][:enrichment_limit]
+    job_ids_to_process = list(dict.fromkeys(new_job_ids_to_process + metadata_job_ids_to_process))
 
 
     logging.info(f"Found {len(unique_linkedin_job_ids)} unique scraped IDs.")
@@ -483,20 +538,20 @@ def process_linkedin_query(
 
     logging.info(f"Identified {len(new_job_ids_to_process)} new job IDs to fetch details for.")
 
-    if not new_job_ids_to_process:
+    if not job_ids_to_process:
     
         logging.info("No new job IDs to process after filtering.")
         return []
 
-    if limit is not None and len(new_job_ids_to_process) > limit:
-        logging.info(f"Truncating new_job_ids_to_process from {len(new_job_ids_to_process)} to {limit} to stay within source limit.")
-        new_job_ids_to_process = new_job_ids_to_process[:limit]
+    if limit is not None and len(job_ids_to_process) > limit:
+        logging.info(f"Truncating job_ids_to_process from {len(job_ids_to_process)} to {limit} to stay within source limit.")
+        job_ids_to_process = job_ids_to_process[:limit]
 
-    logging.info(f"\n--- Starting Phase 2: Fetching Job Details for {len(new_job_ids_to_process)} New IDs ---")
+    logging.info(f"\n--- Starting Phase 2: Fetching Job Details for {len(job_ids_to_process)} IDs ---")
     detailed_new_jobs = []
     processed_count = 0
 
-    ids_to_fetch = new_job_ids_to_process
+    ids_to_fetch = job_ids_to_process
     resolved_archetype, archetype_config = _resolve_archetype_config(archetype)
     resolved_filter_profile = filter_profile or archetype_config["filter_profile"]
 
@@ -790,7 +845,7 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
     detailed_new_jobs = []
     processed_count = 0
 
-    for job_id in new_job_ids_to_process:
+    for job_id in job_ids_to_process:
         details = _fetch_careers_future_job_details(job_id)
         if details:
             # --- NEW: Check for description before adding ---

@@ -67,6 +67,7 @@ def build_merge_plan(rows: list[dict]) -> list[dict]:
         key = (
             supabase_utils.normalize_company(row.get("company")),
             supabase_utils.normalize_role_title(row.get("job_title")),
+            supabase_utils.normalize_location(row.get("location")),
         )
         if all(key):
             buckets[key].append(row)

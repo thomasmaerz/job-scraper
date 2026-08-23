@@ -93,3 +93,24 @@ def test_init_sql_actionable_rpcs_exclude_filtered_jobs_consistently():
     assert 'AND j.is_filtered = FALSE\n        AND j.customized_resume_id IS NOT NULL' in sql
     assert 'AND j.is_filtered = FALSE\n        AND j.resume_score >= 50' in sql
     assert sql.count('AND j.is_filtered = FALSE') >= 4
+
+
+def test_posting_wave_migration_adds_count_and_shared_calculator():
+    sql = (ROOT / "supabase_setup" / "add_posting_wave_semantics.sql").read_text()
+
+    assert "ADD COLUMN IF NOT EXISTS posting_wave_count" in sql
+    assert "CREATE OR REPLACE FUNCTION public.calculate_listing_posting_waves" in sql
+    assert "instance->>'location'" in sql
+    assert "instance->>'scrape_run_id'" in sql
+    assert "GREATEST(result.posting_wave_count - 1, 0)" in sql
+    assert "GRANT EXECUTE ON FUNCTION public.calculate_listing_posting_waves(jsonb) TO service_role" in sql
+
+
+def test_historical_merge_uses_location_and_posting_wave_calculator():
+    sql = (ROOT / "supabase_setup" / "merge_historical_reposts.sql").read_text()
+
+    assert "'location', source_snapshot->>'location'" in sql
+    assert "public.calculate_listing_posting_waves(lv.raw_listing_instances)" in sql
+    assert "posting_wave_count = w.posting_wave_count" in sql
+    assert "repost_count = w.repost_count" in sql
+    assert "GREATEST(l.seen_count - 1, 0)" not in sql

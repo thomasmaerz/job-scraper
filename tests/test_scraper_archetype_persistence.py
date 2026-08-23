@@ -33,6 +33,7 @@ def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile
         "search_query": "Technical Program Manager",
         "archetype": "software_tpm",
         "filter_profile": "software_tpm_v1",
+        "scrape_run_id": scraper.SCRAPE_RUN_ID,
     }]
 
 

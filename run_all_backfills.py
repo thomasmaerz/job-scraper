@@ -19,18 +19,60 @@ def build_historical_listing_instance(row: dict) -> dict:
     return {
         "job_id": str(job_id) if job_id is not None else None,
         "scraped_at": row.get("scraped_at"),
+        "last_seen_at": row.get("scraped_at"),
+        "scrape_run_id": row.get("scrape_run_id"),
+        "location": row.get("location"),
         "posted_at": row.get("posted_at"),
         "posted_relative_text": row.get("posted_relative_text"),
         "applicant_count": row.get("applicant_count"),
+        "applicant_count_text": row.get("applicant_count_text"),
+        "applicant_count_type": row.get("applicant_count_type"),
         "salary_text": row.get("salary_text"),
+        "salary_min": row.get("salary_min"),
+        "salary_max": row.get("salary_max"),
+        "salary_currency": row.get("salary_currency"),
         "recruiter_name": row.get("recruiter_name"),
         "recruiter_profile_url": row.get("recruiter_profile_url"),
         "recruiter_identifier": row.get("recruiter_identifier"),
+        "detail_metadata_checked_at": row.get("detail_metadata_checked_at"),
     }
 
 
 def build_historical_backfill_payload(row: dict) -> dict:
     job_id = row.get("job_id")
+    existing_instances = row.get("listing_instances") or []
+    if existing_instances:
+        listing_instances = [dict(instance) for instance in existing_instances]
+        canonical_id = str(job_id) if job_id is not None else None
+        for instance in listing_instances:
+            if canonical_id is None or str(instance.get("job_id")) != canonical_id:
+                continue
+            if instance.get("location") is None:
+                instance["location"] = row.get("location")
+            break
+    else:
+        listing_instances = [build_historical_listing_instance(row)]
+    known_instance_ids = {
+        str(instance.get("job_id"))
+        for instance in listing_instances
+        if instance.get("job_id") is not None
+    }
+    for identity_field in ("original_job_id", "latest_job_id"):
+        source_id = row.get(identity_field)
+        source_id = str(source_id) if source_id is not None else None
+        if source_id and source_id not in known_instance_ids:
+            listing_instances.append({"job_id": source_id})
+            known_instance_ids.add(source_id)
+    listing_instances, posting_wave_count, repost_count = supabase_utils.calculate_posting_waves(
+        listing_instances
+    )
+    listing_ids = [
+        str(instance["job_id"])
+        for instance in listing_instances
+        if instance.get("job_id") is not None
+    ]
+    first_seen_at = row.get("first_seen_at") or row.get("scraped_at")
+    last_seen_at = row.get("last_seen_at") or row.get("scraped_at")
     return {
         "job_id": str(job_id) if job_id is not None else None,
         "canonical_key": supabase_utils.build_canonical_key(
@@ -42,14 +84,15 @@ def build_historical_backfill_payload(row: dict) -> dict:
         "description_fingerprint": supabase_utils.make_description_fingerprint(
             row.get("description")
         ),
-        "original_job_id": str(job_id) if job_id is not None else None,
-        "latest_job_id": str(job_id) if job_id is not None else None,
-        "first_seen_at": row.get("scraped_at"),
-        "last_seen_at": row.get("scraped_at"),
-        "last_seen_posted_at": row.get("posted_at"),
-        "seen_count": 1,
-        "repost_count": 0,
-        "listing_instances": [build_historical_listing_instance(row)],
+        "original_job_id": row.get("original_job_id") or (listing_ids[0] if listing_ids else None),
+        "latest_job_id": row.get("latest_job_id") or (listing_ids[-1] if listing_ids else None),
+        "first_seen_at": first_seen_at,
+        "last_seen_at": last_seen_at,
+        "last_seen_posted_at": row.get("last_seen_posted_at") or row.get("posted_at"),
+        "seen_count": len(set(listing_ids)),
+        "posting_wave_count": posting_wave_count,
+        "repost_count": repost_count,
+        "listing_instances": listing_instances,
     }
 
 
@@ -86,6 +129,8 @@ CANONICAL_REPAIR_SELECT_FIELDS = ", ".join([
     "scraped_at",
     "posted_relative_text",
     "applicant_count",
+    "applicant_count_text",
+    "applicant_count_type",
     "salary_text",
     "salary_min",
     "salary_max",
@@ -93,6 +138,7 @@ CANONICAL_REPAIR_SELECT_FIELDS = ", ".join([
     "recruiter_name",
     "recruiter_profile_url",
     "recruiter_identifier",
+    "detail_metadata_checked_at",
     "canonical_key",
     "original_job_id",
     "latest_job_id",
@@ -105,14 +151,20 @@ CANONICAL_REPAIR_SELECT_FIELDS = ", ".join([
 
 
 def fetch_repair_candidates(batch_size: int = REPAIR_FETCH_BATCH_SIZE) -> list[dict]:
-    response = (
-        supabase.table(JOBS_TABLE)
-        .select(CANONICAL_REPAIR_SELECT_FIELDS)
-        .range(0, batch_size - 1)
-        .execute()
-    )
-    rows = response.data or []
-    return [row for row in rows if needs_canonical_repair(row)]
+    candidates = []
+    offset = 0
+    while True:
+        response = (
+            supabase.table(JOBS_TABLE)
+            .select(CANONICAL_REPAIR_SELECT_FIELDS)
+            .range(offset, offset + batch_size - 1)
+            .execute()
+        )
+        rows = response.data or []
+        candidates.extend(row for row in rows if needs_canonical_repair(row))
+        if len(rows) < batch_size:
+            return candidates
+        offset += batch_size
 
 
 def chunked(items: list[dict], size: int) -> list[list[dict]]:
@@ -220,8 +272,8 @@ def verification_failed(report: list[dict]) -> bool:
     return any((not item["passed"]) and item["required"] for item in report)
 
 
-def count_rows(table: str, filters: list[tuple]) -> int:
-    query = supabase.table(table).select("job_id", count="exact")
+def count_rows(table: str, filters: list[tuple], select_field: str = "job_id") -> int:
+    query = supabase.table(table).select(select_field, count="exact")
     for operator, field, value in filters:
         if operator == "eq":
             query = query.eq(field, value)
@@ -297,7 +349,7 @@ def count_legacy_aerospace_filter_rows(archetype: str = "software_tpm") -> int:
 
 
 def count_keyword_insights() -> int:
-    return count_rows(KEYWORD_INSIGHTS_TABLE, [])
+    return count_rows(KEYWORD_INSIGHTS_TABLE, [], select_field="archetype")
 
 
 def sample_jobs_check() -> bool:

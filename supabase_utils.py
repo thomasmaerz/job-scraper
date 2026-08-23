@@ -9,7 +9,8 @@ import re # Import re for filter pattern matching
 import string
 import unicodedata
 import html
-from datetime import datetime, timezone, timedelta
+import json
+from datetime import date, datetime, timezone, timedelta
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -98,17 +99,134 @@ def description_similarity(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
+def _date_part(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()[:10]
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", str(value).strip())
+    return match.group(1) if match else None
+
+
+def calculate_posting_waves(listing_instances: list[dict]) -> tuple[list[dict], int, int]:
+    instances = [dict(instance) for instance in listing_instances]
+    if not instances:
+        return instances, 0, 0
+
+    locations: dict[str, list[int]] = {}
+    for index, instance in enumerate(instances):
+        normalized_location = normalize_location(instance.get("location"))
+        if normalized_location:
+            instance["normalized_location"] = normalized_location
+        else:
+            instance.pop("normalized_location", None)
+        locations.setdefault(normalized_location, []).append(index)
+
+    location_order = sorted(
+        locations,
+        key=lambda location: min(locations[location]),
+    )
+    wave_counts = []
+    for location_index, location in enumerate(location_order):
+        member_indexes = locations[location]
+        parent = {index: index for index in member_indexes}
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        shared_keys: dict[str, int] = {}
+        instance_keys: dict[int, list[str]] = {}
+        for member_index in member_indexes:
+            instance = instances[member_index]
+            posted_date = _date_part(instance.get("posted_at"))
+            scrape_run_id = instance.get("scrape_run_id")
+            keys = []
+            if not location:
+                keys.append("unknown_location")
+            else:
+                if posted_date:
+                    keys.append(f"posted:{posted_date}")
+                if scrape_run_id:
+                    keys.append(f"scrape_run:{scrape_run_id}")
+            if location and not keys:
+                scraped_date = _date_part(instance.get("scraped_at"))
+                keys.append(
+                    f"scrape_date:{scraped_date}"
+                    if scraped_date
+                    else "unknown"
+                )
+            instance_keys[member_index] = keys
+            for key in keys:
+                if key in shared_keys:
+                    union(shared_keys[key], member_index)
+                else:
+                    shared_keys[key] = member_index
+
+        components: dict[int, list[int]] = {}
+        for member_index in member_indexes:
+            components.setdefault(find(member_index), []).append(member_index)
+        waves = sorted(
+            components.values(),
+            key=lambda wave: min(
+                str(
+                    _date_part(instances[index].get("posted_at"))
+                    or instances[index].get("scraped_at")
+                    or instances[index].get("scrape_run_id")
+                    or "9999-12-31"
+                )
+                for index in wave
+            ),
+        )
+        wave_counts.append(len(waves))
+        for wave_index, wave_members in enumerate(waves, start=1):
+            wave_key = min(
+                key for index in wave_members for key in instance_keys[index]
+            )
+            for member_position, member_index in enumerate(wave_members):
+                instance = instances[member_index]
+                instance["posting_wave_key"] = f"{location}|{wave_key}"
+                instance["posting_wave_index"] = wave_index
+                if member_position > 0:
+                    instance["variant_type"] = "simultaneous_variant"
+                elif wave_index > 1:
+                    instance["variant_type"] = "repost"
+                elif location_index > 0:
+                    instance["variant_type"] = "location_variant"
+                else:
+                    instance["variant_type"] = "original"
+
+    posting_wave_count = max(wave_counts, default=0)
+    repost_count = max(posting_wave_count - 1, 0)
+    return instances, posting_wave_count, repost_count
+
+
 def build_listing_instance(job: dict) -> dict:
     job_id = job.get("job_id")
+    scraped_at = job.get("scraped_at") or datetime.now(timezone.utc).isoformat()
     return {
         "job_id": str(job_id) if job_id is not None else None,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "scraped_at": scraped_at,
+        "last_seen_at": scraped_at,
+        "scrape_run_id": job.get("scrape_run_id"),
+        "location": job.get("location"),
         "posted_at": job.get("posted_at"),
         "posted_relative_text": job.get("posted_relative_text"),
         "applicant_count": job.get("applicant_count"),
         "applicant_count_text": job.get("applicant_count_text"),
         "applicant_count_type": job.get("applicant_count_type"),
         "salary_text": job.get("salary_text"),
+        "salary_min": job.get("salary_min"),
+        "salary_max": job.get("salary_max"),
+        "salary_currency": job.get("salary_currency"),
         "recruiter_name": job.get("recruiter_name"),
         "recruiter_profile_url": job.get("recruiter_profile_url"),
         "recruiter_identifier": job.get("recruiter_identifier"),
@@ -132,9 +250,13 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
     payload["first_seen_at"] = now_iso
     payload["last_seen_at"] = now_iso
     payload["last_seen_posted_at"] = job.get("posted_at")
+    listing_instances, posting_wave_count, repost_count = calculate_posting_waves(
+        [build_listing_instance(job)]
+    )
     payload["seen_count"] = 1
-    payload["repost_count"] = 0
-    payload["listing_instances"] = [build_listing_instance(job)]
+    payload["posting_wave_count"] = posting_wave_count
+    payload["repost_count"] = repost_count
+    payload["listing_instances"] = listing_instances
     payload["description_fingerprint"] = make_description_fingerprint(job.get("description"))
     return payload
 
@@ -156,21 +278,32 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
             if str(instance.get("job_id")) != new_job_id:
                 continue
             for field in (
-                "posted_at",
+                "location",
                 "posted_relative_text",
                 "applicant_count",
                 "applicant_count_text",
                 "applicant_count_type",
                 "salary_text",
+                "salary_min",
+                "salary_max",
+                "salary_currency",
                 "recruiter_name",
                 "recruiter_profile_url",
                 "recruiter_identifier",
             ):
                 if new_job.get(field) is not None:
                     instance[field] = new_job[field]
+            if instance.get("posted_at") is None and new_job.get("posted_at") is not None:
+                instance["posted_at"] = new_job["posted_at"]
+            instance["last_seen_at"] = datetime.now(timezone.utc).isoformat()
             instance["detail_metadata_checked_at"] = new_job.get("detail_metadata_checked_at")
             break
-    seen_count = int(existing.get("seen_count") or len(known_listing_ids) or 1)
+    distinct_listing_ids = {
+        str(instance.get("job_id"))
+        for instance in listing_instances
+        if instance.get("job_id") is not None
+    }
+    listing_instances, posting_wave_count, repost_count = calculate_posting_waves(listing_instances)
     payload = {
         "job_id": existing["job_id"],
         "latest_job_id": new_job_id if new_job_id is not None else existing.get("latest_job_id"),
@@ -187,8 +320,9 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
         "recruiter_name": new_job.get("recruiter_name") if new_job.get("recruiter_name") is not None else existing.get("recruiter_name"),
         "recruiter_profile_url": new_job.get("recruiter_profile_url") if new_job.get("recruiter_profile_url") is not None else existing.get("recruiter_profile_url"),
         "recruiter_identifier": new_job.get("recruiter_identifier") if new_job.get("recruiter_identifier") is not None else existing.get("recruiter_identifier"),
-        "seen_count": seen_count + (1 if is_new_listing else 0),
-        "repost_count": int(existing.get("repost_count") or 0) + (1 if is_new_listing else 0),
+        "seen_count": len(distinct_listing_ids),
+        "posting_wave_count": posting_wave_count,
+        "repost_count": repost_count,
         "listing_instances": listing_instances,
         "detail_metadata_checked_at": new_job.get("detail_metadata_checked_at") or existing.get("detail_metadata_checked_at"),
     }
@@ -201,6 +335,7 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
 def find_canonical_match(job: dict, existing_rows: list[dict]) -> dict | None:
     target_company = normalize_company(job.get("company"))
     target_title = normalize_role_title(job.get("job_title"))
+    target_location = normalize_location(job.get("location"))
     target_fp = make_description_fingerprint(job.get("description"))
     target_job_id = str(job.get("job_id")) if job.get("job_id") is not None else None
 
@@ -217,8 +352,11 @@ def find_canonical_match(job: dict, existing_rows: list[dict]) -> dict | None:
 
     matching_bucket = [
         row for row in ordered_rows
-        if normalize_company(row.get("company")) == target_company
+        if target_location
+        and normalize_company(row.get("company")) == target_company
         and normalize_role_title(row.get("job_title")) == target_title
+        and bool(normalize_location(row.get("location")))
+        and normalize_location(row.get("location")) == target_location
     ]
     if len(matching_bucket) > 200:
         return None
@@ -249,7 +387,7 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
             supabase.table(config.SUPABASE_TABLE_NAME)
             .select(
                 "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
-                "listing_instances, seen_count, repost_count, latest_job_id, last_seen_posted_at, "
+                "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_posted_at, "
                 "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
                 "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
                 "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
@@ -266,9 +404,12 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
         offset += page_size
 
 
-def save_linkedin_jobs_canonicalized(jobs_data: list):
+def save_jobs_canonicalized(jobs_data: list):
     candidates_cache = {}
-    for job in jobs_data:
+    scrape_run_id = datetime.now(timezone.utc).isoformat()
+    for raw_job in jobs_data:
+        job = dict(raw_job)
+        job.setdefault("scrape_run_id", scrape_run_id)
         if not getattr(config, "ENABLE_REPOST_DEDUP", True):
             save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
             continue
@@ -282,12 +423,28 @@ def save_linkedin_jobs_canonicalized(jobs_data: list):
 
         if match:
             payload = prepare_repost_update_payload(match, job)
-            supabase.table(config.SUPABASE_TABLE_NAME).upsert([payload]).execute()
+            query = (
+                supabase.table(config.SUPABASE_TABLE_NAME)
+                .update({key: value for key, value in payload.items() if key != "job_id"})
+                .eq("job_id", match["job_id"])
+                .eq("listing_instances", json.dumps(match.get("listing_instances") or []))
+            )
+            last_seen_at = match.get("last_seen_at")
+            query = query.is_("last_seen_at", None) if last_seen_at is None else query.eq("last_seen_at", last_seen_at)
+            response = query.execute()
+            if len(response.data or []) != 1:
+                raise RuntimeError(
+                    f"Concurrent canonical update detected for job_id={match['job_id']}"
+                )
             match.update(payload)
         else:
             payload = prepare_canonical_insert_payload(job)
             save_jobs_to_supabase([payload])
             candidates.append(payload)
+
+
+def save_linkedin_jobs_canonicalized(jobs_data: list):
+    save_jobs_canonicalized(jobs_data)
 
 # --- Supabase Functions ---
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
@@ -433,6 +590,7 @@ def save_jobs_to_supabase(jobs_data: list):
         "last_seen_at",
         "last_seen_posted_at",
         "seen_count",
+        "posting_wave_count",
         "repost_count",
         "listing_instances",
         "description_fingerprint",

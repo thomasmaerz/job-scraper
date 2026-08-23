@@ -27,7 +27,7 @@ METADATA_FIELDS = (
 def fetch_candidates(limit: int) -> list[dict]:
     return (
         supabase_utils.supabase.table(config.SUPABASE_TABLE_NAME)
-        .select("job_id, latest_job_id, listing_instances")
+        .select("job_id, latest_job_id, location, listing_instances")
         .eq("provider", "linkedin")
         .is_("detail_metadata_checked_at", None)
         .order("is_active", desc=True)
@@ -55,8 +55,13 @@ def build_metadata_payload(row: dict, details: dict) -> dict:
         for field in METADATA_FIELDS:
             if details.get(field) is not None:
                 instance[field] = details[field]
+        if details.get("location") is not None:
+            instance["location"] = details["location"]
         instance["detail_metadata_checked_at"] = payload["detail_metadata_checked_at"]
+        instances, posting_wave_count, repost_count = supabase_utils.calculate_posting_waves(instances)
         payload["listing_instances"] = instances
+        payload["posting_wave_count"] = posting_wave_count
+        payload["repost_count"] = repost_count
         break
     return payload
 

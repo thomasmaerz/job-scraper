@@ -3,6 +3,28 @@ import asyncio
 import job_manager
 
 
+def test_mark_expired_jobs_uses_last_seen_at(monkeypatch):
+    filters = []
+
+    class FakeQuery:
+        def select(self, _fields): return self
+        def lt(self, field, value):
+            filters.append((field, value))
+            return self
+        @property
+        def not_(self): return self
+        def in_(self, *_args): return self
+        def eq(self, *_args): return self
+        def execute(self): return type("Resp", (), {"data": []})()
+
+    monkeypatch.setattr(job_manager, "supabase", type("Client", (), {"table": lambda *_: FakeQuery()})())
+
+    asyncio.run(job_manager.mark_expired_jobs())
+
+    assert any(field == "last_seen_at" for field, _value in filters)
+    assert not any(field == "scraped_at" for field, _value in filters)
+
+
 def test_check_linkedin_job_activity_uses_latest_job_id_for_fetch_and_canonical_job_id_for_updates(monkeypatch):
     selected = []
     checked_ids = []

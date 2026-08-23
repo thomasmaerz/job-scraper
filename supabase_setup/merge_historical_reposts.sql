@@ -205,21 +205,31 @@ BEGIN
                     jsonb_strip_nulls(jsonb_build_object(
                         'job_id', source_job_id,
                         'scraped_at', COALESCE(source_snapshot->>'scraped_at', observed_at::text),
+                        'last_seen_at', COALESCE(source_snapshot->>'last_seen_at', source_snapshot->>'scraped_at', observed_at::text),
+                        'scrape_run_id', source_snapshot->>'scrape_run_id',
+                        'location', source_snapshot->>'location',
                         'posted_at', source_snapshot->>'posted_at',
                         'posted_relative_text', source_snapshot->>'posted_relative_text',
                         'applicant_count', source_snapshot->'applicant_count',
                         'applicant_count_text', source_snapshot->>'applicant_count_text',
                         'applicant_count_type', source_snapshot->>'applicant_count_type',
                         'salary_text', source_snapshot->>'salary_text',
+                        'salary_min', source_snapshot->'salary_min',
+                        'salary_max', source_snapshot->'salary_max',
+                        'salary_currency', source_snapshot->>'salary_currency',
                         'recruiter_name', source_snapshot->>'recruiter_name',
                         'recruiter_profile_url', source_snapshot->>'recruiter_profile_url',
                         'recruiter_identifier', source_snapshot->>'recruiter_identifier',
                         'detail_metadata_checked_at', source_snapshot->>'detail_metadata_checked_at'
                     ))
                     ORDER BY observed_at, source_job_id
-                ) listing_instances
+                ) raw_listing_instances
             FROM public.job_listing_archive
             WHERE canonical_job_id = survivor
+        ), listing_waves AS (
+            SELECT waves.*
+            FROM listing_values lv
+            CROSS JOIN LATERAL public.calculate_listing_posting_waves(lv.raw_listing_instances) waves
         )
         UPDATE public.jobs target SET
             company = a.company,
@@ -265,10 +275,11 @@ BEGIN
             recruiter_profile_url = a.recruiter_profile_url,
             recruiter_identifier = a.recruiter_identifier,
             seen_count = l.seen_count,
-            repost_count = GREATEST(l.seen_count - 1, 0),
-            listing_instances = l.listing_instances,
+            posting_wave_count = w.posting_wave_count,
+            repost_count = w.repost_count,
+            listing_instances = w.listing_instances,
             detail_metadata_checked_at = a.detail_metadata_checked_at
-        FROM aggregate_values a, listing_values l
+        FROM aggregate_values a, listing_values l, listing_waves w
         WHERE target.job_id = survivor;
 
         DELETE FROM public.jobs

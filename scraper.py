@@ -10,10 +10,12 @@ import user_agents
 import supabase_utils
 from markdownify import markdownify as md
 import json
+import uuid
 from urllib.parse import urlparse
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+SCRAPE_RUN_ID = str(uuid.uuid4())
 
 
 def _resolve_archetype_config(archetype: str | None) -> tuple[str, dict]:
@@ -561,6 +563,7 @@ def process_linkedin_query(
             details["search_query"] = search_query
             details["archetype"] = resolved_archetype
             details["filter_profile"] = resolved_filter_profile
+            details["scrape_run_id"] = SCRAPE_RUN_ID
             description = details.get('description')
             if description and description.strip(): 
                 if 'job_id' in details and details['job_id'] is not None:
@@ -845,7 +848,7 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
     detailed_new_jobs = []
     processed_count = 0
 
-    for job_id in job_ids_to_process:
+    for job_id in new_job_ids_to_process:
         details = _fetch_careers_future_job_details(job_id)
         if details:
             # --- NEW: Check for description before adding ---
@@ -917,7 +920,7 @@ if __name__ == "__main__":
             # 2. Save the NEW scraped data to Supabase
             if new_careers_future_job_details:
                 logging.info(f"\n--- Saving {len(new_careers_future_job_details)} new job(s) for query '{query}' ---")
-                supabase_utils.save_jobs_to_supabase(new_careers_future_job_details)
+                supabase_utils.save_jobs_canonicalized(new_careers_future_job_details)
                 total_new_jobs_saved += len(new_careers_future_job_details)
             else:
                 logging.info(f"\nNo new job details were fetched or processed for query '{query}'.")

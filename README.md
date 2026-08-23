@@ -17,6 +17,7 @@ This project is a comprehensive suite of tools designed to automate and enhance 
   - Periodically checks if active jobs are still available.
     ([job_manager.py](job_manager.py))
 - **Data Storage**: Uses Supabase to store job data, resume details, and application statuses. (Utility functions in [supabase_utils.py](supabase_utils.py))
+- **Canonical Listing History**: Preserves every source listing ID while distinguishing simultaneous variants, location variants, and confirmed later posting waves.
 - **Custom PDF Resume Generation**: Generates ATS-friendly PDF resumes from structured resume data. ([pdf_generator.py](pdf_generator.py))
 - **AI-Powered Text Processing**: Leverages any configured LLM for tasks like resume parsing and job description formatting.
 - **Quota Management**: Built-in rate limiting, exponential backoff, and daily budget tracking for LLM API calls. Features task-specific Gemini fallback chains for job scoring and job insights extraction.
@@ -210,6 +211,52 @@ The individual Python scripts can still be run locally for development or testin
 4. Confirm the rebuilt aggregate contains the expected `software_tpm` / `Python` / `technology` row with count `2` when the source facts include two matching software TPM rows.
 5. Verify the server query or RPC used by the web app is explicitly archetype-scoped before any UI tab filtering is applied.
 6. In the web app, verify the Insights page category tabs filter only within the already-scoped `software_tpm` dataset returned from Supabase, so switching tabs never reintroduces rows from a different archetype.
+
+### Listing identity and repost semantics
+
+- `seen_count` is the number of distinct source listing IDs retained in `listing_instances`. A source ID is an observation or variant, not proof of a repost.
+- A posting wave groups source IDs at the same known normalized location when they share an effective `posted_at` date or a `scrape_run_id`. If both are unavailable, observations on the same UTC scrape date are grouped conservatively. Instances with unknown location remain variants but never confirm chronological reposts.
+- `posting_wave_count` is the maximum wave count for any one normalized location. `repost_count` is `max(posting_wave_count - 1, 0)`.
+- Recruiter-only changes and multiple source IDs in one wave are `simultaneous_variant` instances and do not increment `repost_count`.
+- Exact normalized locations are required for automatic canonical matching. Cross-location records are not silently merged. Historical grouped data can retain `location_variant` instances, which remain outside `repost_count`.
+- Every new instance stores `location`, `normalized_location`, `posting_wave_key`, `posting_wave_index`, and `variant_type`. Missing historical locations remain null unless recovered from an archived source snapshot.
+
+Apply `supabase_setup/add_posting_wave_semantics.sql` before deploying code that writes `posting_wave_count`. Then inspect the idempotent repair dry run:
+
+```bash
+python repair_repost_history.py
+```
+
+Only after reviewing its counts, apply it explicitly:
+
+```bash
+python repair_repost_history.py --apply
+```
+
+The repair reads archived source snapshots when available, preserves every distinct source ID, fills only recoverable locations, and recalculates wave annotations and counts. Do not run the migration or `--apply` command against production without explicit authorization.
+
+After the archive repair, unresolved LinkedIn source IDs can be sampled with a conservative dry run:
+
+```bash
+python backfill_historical_linkedin_locations.py --limit 50
+```
+
+Apply only reviewed recoveries with:
+
+```bash
+python backfill_historical_linkedin_locations.py --limit 50 --apply
+```
+
+The rescrape command fetches exact source IDs, writes only previously missing locations, records `location_source=linkedin_rescrape` and observation time, and recalculates waves. A failed or unavailable historical page leaves the location null. It does not infer historical `posted_at`, replace existing locations, or create listing IDs.
+
+Stored instance salary text can be normalized without network requests:
+
+```bash
+python backfill_listing_instance_salary.py
+python backfill_listing_instance_salary.py --apply
+```
+
+This fills only missing `salary_min`, `salary_max`, and `salary_currency`, preserves existing structured values, and records `salary_metadata_source=salary_text_parser`.
 
 ## Project Structure
 

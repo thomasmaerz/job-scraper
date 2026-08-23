@@ -8,6 +8,9 @@ BEGIN;
 ALTER TABLE IF EXISTS "public"."jobs" DROP CONSTRAINT IF EXISTS jobs_customized_resume_id_fkey;
 
 -- Step 2: Drop job-scraper tables (CASCADE will handle indexes)
+DROP TABLE IF EXISTS "public"."job_repost_merge_plan" CASCADE;
+DROP TABLE IF EXISTS "public"."job_resume_links" CASCADE;
+DROP TABLE IF EXISTS "public"."job_listing_archive" CASCADE;
 DROP TABLE IF EXISTS "public"."job_keyword_insights" CASCADE;
 DROP TABLE IF EXISTS "public"."keyword_insights" CASCADE;
 DROP TABLE IF EXISTS "public"."jobs" CASCADE;
@@ -25,6 +28,8 @@ DROP FUNCTION IF EXISTS "public"."get_top_scored_jobs_custom_sort"(integer, inte
 DROP FUNCTION IF EXISTS "public"."get_top_scored_jobs_custom_sort"(integer, integer, text, integer, integer, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."update_last_updated_column"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."update_base_resume_updated_at_column"() CASCADE;
+DROP FUNCTION IF EXISTS "public"."merge_historical_repost_plan"() CASCADE;
+DROP FUNCTION IF EXISTS "public"."calculate_listing_posting_waves"(jsonb) CASCADE;
 
 -- Step 4: Drop storage bucket for personalized_resumes
 DELETE FROM storage.objects WHERE bucket_id = 'personalized_resumes';

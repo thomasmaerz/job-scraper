@@ -9,12 +9,19 @@ def test_build_historical_listing_instance_uses_stored_row_values():
         "job_id": 4426608777,
         "scraped_at": "2026-06-14T10:15:00+00:00",
         "posted_at": "2026-06-12",
+        "location": "Toronto, Ontario, Canada",
         "posted_relative_text": "2 days ago",
         "applicant_count": 17,
+        "applicant_count_text": "17 applicants",
+        "applicant_count_type": "exact",
         "salary_text": "$120,000-$135,000 CAD",
+        "salary_min": 120000,
+        "salary_max": 135000,
+        "salary_currency": "CAD",
         "recruiter_name": "Jane Recruiter",
         "recruiter_profile_url": "https://www.linkedin.com/in/jane-recruiter",
         "recruiter_identifier": "jane-recruiter",
+        "detail_metadata_checked_at": "2026-06-14T10:16:00+00:00",
     }
 
     listing = run_all_backfills.build_historical_listing_instance(row)
@@ -22,13 +29,22 @@ def test_build_historical_listing_instance_uses_stored_row_values():
     assert listing == {
         "job_id": "4426608777",
         "scraped_at": "2026-06-14T10:15:00+00:00",
+        "last_seen_at": "2026-06-14T10:15:00+00:00",
+        "scrape_run_id": None,
+        "location": "Toronto, Ontario, Canada",
         "posted_at": "2026-06-12",
         "posted_relative_text": "2 days ago",
         "applicant_count": 17,
+        "applicant_count_text": "17 applicants",
+        "applicant_count_type": "exact",
         "salary_text": "$120,000-$135,000 CAD",
+        "salary_min": 120000,
+        "salary_max": 135000,
+        "salary_currency": "CAD",
         "recruiter_name": "Jane Recruiter",
         "recruiter_profile_url": "https://www.linkedin.com/in/jane-recruiter",
         "recruiter_identifier": "jane-recruiter",
+        "detail_metadata_checked_at": "2026-06-14T10:16:00+00:00",
     }
 
 
@@ -60,11 +76,18 @@ def test_build_historical_backfill_payload_uses_scraped_at_not_runtime_now():
     assert payload["last_seen_at"] == "2026-06-14T10:15:00+00:00"
     assert payload["last_seen_posted_at"] == "2026-06-12"
     assert payload["seen_count"] == 1
+    assert payload["posting_wave_count"] == 1
     assert payload["repost_count"] == 0
-    assert payload["listing_instances"] == [
-        run_all_backfills.build_historical_listing_instance(row)
-    ]
+    expected_instance = run_all_backfills.build_historical_listing_instance(row)
+    assert payload["listing_instances"][0] == {
+        **expected_instance,
+        "normalized_location": "toronto ontario canada",
+        "posting_wave_key": "toronto ontario canada|posted:2026-06-12",
+        "posting_wave_index": 1,
+        "variant_type": "original",
+    }
     assert payload["description_fingerprint"] is not None
+    assert payload["listing_instances"][0]["location"] == "Toronto / Ontario - Canada"
 
 
 def test_needs_canonical_repair_detects_partial_state():
@@ -137,6 +160,53 @@ def test_needs_canonical_repair_returns_true_when_description_fingerprint_null_b
         "description_fingerprint": None,
         "description": "long description " * 50,
     }) is True
+
+
+def test_historical_repair_preserves_existing_listing_history_and_identity():
+    row = {
+        "job_id": "canonical",
+        "provider": "linkedin",
+        "company": "Acme",
+        "job_title": "TPM",
+        "location": "Toronto",
+        "description": "long description " * 50,
+        "scraped_at": "2026-01-01T00:00:00Z",
+        "first_seen_at": "2026-01-01T00:00:00Z",
+        "last_seen_at": "2026-02-01T00:00:00Z",
+        "original_job_id": "source-1",
+        "latest_job_id": "source-2",
+        "listing_instances": [
+            {"job_id": "source-1", "location": "Toronto", "posted_at": "2026-01-01"},
+            {"job_id": "source-2", "location": "Toronto", "posted_at": "2026-02-01"},
+        ],
+    }
+
+    payload = run_all_backfills.build_historical_backfill_payload(row)
+
+    assert payload["original_job_id"] == "source-1"
+    assert payload["latest_job_id"] == "source-2"
+    assert payload["seen_count"] == 2
+    assert payload["posting_wave_count"] == 2
+    assert payload["repost_count"] == 1
+    assert [instance["job_id"] for instance in payload["listing_instances"]] == ["source-1", "source-2"]
+
+
+def test_historical_repair_adds_known_latest_id_missing_from_history():
+    row = {
+        "job_id": "canonical",
+        "provider": "linkedin",
+        "company": "Acme",
+        "job_title": "TPM",
+        "location": "Toronto",
+        "original_job_id": "source-1",
+        "latest_job_id": "source-2",
+        "listing_instances": [{"job_id": "source-1", "location": "Toronto"}],
+    }
+
+    payload = run_all_backfills.build_historical_backfill_payload(row)
+
+    assert payload["seen_count"] == 2
+    assert [instance["job_id"] for instance in payload["listing_instances"]] == ["source-1", "source-2"]
 
 
 def test_fetch_repair_candidates_returns_only_rows_needing_repair(monkeypatch):

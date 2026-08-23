@@ -109,7 +109,7 @@ async def mark_expired_jobs():
         # Select jobs to expire
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
             .select("job_id")\
-            .lt("scraped_at", expiry_date_str)\
+            .lt("last_seen_at", expiry_date_str)\
             .not_.in_("status", excluded_statuses)\
             .eq("is_active", True)\
             .execute()

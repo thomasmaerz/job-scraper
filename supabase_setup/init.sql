@@ -140,6 +140,7 @@ ALTER TABLE "public"."jobs"
     ADD COLUMN IF NOT EXISTS "first_seen_at" timestamp with time zone DEFAULT now(),
     ADD COLUMN IF NOT EXISTS "last_seen_at" timestamp with time zone DEFAULT now(),
     ADD COLUMN IF NOT EXISTS "seen_count" integer DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS "posting_wave_count" integer NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS "repost_count" integer DEFAULT 0,
     ADD COLUMN IF NOT EXISTS "listing_instances" jsonb DEFAULT '[]'::jsonb;
 
@@ -157,6 +158,9 @@ COMMENT ON COLUMN "public"."jobs"."job_id" IS 'Canonical row identifier for the 
 COMMENT ON COLUMN "public"."jobs"."original_job_id" IS 'First LinkedIn listing ID observed for this canonical role.';
 COMMENT ON COLUMN "public"."jobs"."latest_job_id" IS 'Most recent LinkedIn listing ID observed for this canonical role. Use this for outbound LinkedIn fetches.';
 COMMENT ON COLUMN "public"."jobs"."listing_instances" IS 'Append-only listing history for repost tracking, including per-listing scrape metadata.';
+COMMENT ON COLUMN "public"."jobs"."seen_count" IS 'Distinct source listing-ID count retained for compatibility.';
+COMMENT ON COLUMN "public"."jobs"."posting_wave_count" IS 'Maximum chronological posting-wave count for one normalized location in listing_instances.';
+COMMENT ON COLUMN "public"."jobs"."repost_count" IS 'Confirmed later posting waves: greatest(posting_wave_count - 1, 0). Simultaneous and location variants do not increment it.';
 
 
 

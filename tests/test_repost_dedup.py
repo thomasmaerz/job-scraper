@@ -12,6 +12,7 @@ class _RecordingQuery:
         self.selected = None
         self.filters = []
         self.upsert_payloads = []
+        self.update_payloads = []
 
     def select(self, fields):
         self.selected = fields
@@ -31,6 +32,14 @@ class _RecordingQuery:
 
     def upsert(self, payload):
         self.upsert_payloads.append(payload)
+        return self
+
+    def update(self, payload):
+        self.update_payloads.append(payload)
+        return self
+
+    def is_(self, field, value):
+        self.filters.append(("is", field, value))
         return self
 
     def execute(self):
@@ -145,19 +154,23 @@ def test_prepare_canonical_insert_payload():
     assert payload["original_job_id"] == "4426608777"
     assert payload["latest_job_id"] == "4426608777"
     assert payload["seen_count"] == 1
+    assert payload["posting_wave_count"] == 1
     assert payload["repost_count"] == 0
     assert payload["listing_instances"][0]["job_id"] == "4426608777"
+    assert payload["listing_instances"][0]["location"] == "Chalk River, Ontario, Canada"
+    assert payload["listing_instances"][0]["variant_type"] == "original"
 
 
 def test_prepare_repost_update_payload():
     existing = {
         "job_id": "4394716706",
-        "listing_instances": [{"job_id": "4394716706", "scraped_at": "2026-05-29T12:00:00Z"}],
+        "listing_instances": [{"job_id": "4394716706", "location": "Toronto", "posted_at": "2026-05-29", "scraped_at": "2026-05-29T12:00:00Z"}],
         "seen_count": 1,
         "repost_count": 0,
     }
     new_job = {
         "job_id": "4426608777",
+        "location": "Toronto",
         "posted_at": "2026-06-12",
         "posted_relative_text": "18 hours ago",
         "applicant_count": 26,
@@ -168,6 +181,7 @@ def test_prepare_repost_update_payload():
 
     assert update["latest_job_id"] == "4426608777"
     assert update["seen_count"] == 2
+    assert update["posting_wave_count"] == 2
     assert update["repost_count"] == 1
     assert len(update["listing_instances"]) == 2
 
@@ -268,9 +282,190 @@ def test_prepare_repost_update_payload_does_not_count_same_listing_twice():
     )
 
     assert update["seen_count"] == 2
-    assert update["repost_count"] == 1
+    assert update["repost_count"] == 0
     assert len(update["listing_instances"]) == 2
     assert update["listing_instances"][1]["applicant_count"] == 42
+
+
+def test_eight_simultaneous_ids_are_one_wave_with_zero_reposts():
+    existing = {
+        "job_id": "source-1",
+        "listing_instances": [{
+            "job_id": "source-1",
+            "location": "Toronto, Ontario, Canada",
+            "posted_at": "2026-08-20",
+            "scrape_run_id": "affirm-run",
+        }],
+        "seen_count": 1,
+        "repost_count": 0,
+    }
+
+    for index in range(1, 8):
+        existing.update(supabase_utils.prepare_repost_update_payload(existing, {
+            "job_id": f"source-{index + 1}",
+            "location": "Toronto, Ontario, Canada",
+            "posted_at": "2026-08-20",
+            "scrape_run_id": "affirm-run",
+        }))
+
+    assert existing["seen_count"] == 8
+    assert existing["posting_wave_count"] == 1
+    assert existing["repost_count"] == 0
+    assert len(existing["listing_instances"]) == 8
+    assert {instance["variant_type"] for instance in existing["listing_instances"]} == {
+        "original", "simultaneous_variant"
+    }
+
+
+def test_recruiter_variant_in_same_wave_does_not_increment_reposts():
+    existing = {
+        "job_id": "source-1",
+        "listing_instances": [{
+            "job_id": "source-1",
+            "location": "Toronto",
+            "posted_at": "2026-08-20",
+            "scrape_run_id": "run-1",
+            "recruiter_identifier": "recruiter-a",
+        }],
+        "seen_count": 1,
+        "repost_count": 0,
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, {
+        "job_id": "source-2",
+        "location": "Toronto",
+        "posted_at": "2026-08-20",
+        "scrape_run_id": "run-1",
+        "recruiter_identifier": "recruiter-b",
+    })
+
+    assert update["seen_count"] == 2
+    assert update["posting_wave_count"] == 1
+    assert update["repost_count"] == 0
+    assert update["listing_instances"][1]["recruiter_identifier"] == "recruiter-b"
+
+
+def test_multiple_ids_in_two_posting_waves_count_one_repost():
+    instances = [
+        {"job_id": "1", "location": "Toronto", "posted_at": "2026-08-01", "scrape_run_id": "run-a"},
+        {"job_id": "2", "location": "Toronto", "posted_at": "2026-08-01", "scrape_run_id": "run-a"},
+        {"job_id": "3", "location": "Toronto", "posted_at": "2026-08-20", "scrape_run_id": "run-b"},
+        {"job_id": "4", "location": "Toronto", "posted_at": "2026-08-20", "scrape_run_id": "run-b"},
+    ]
+
+    annotated, wave_count, repost_count = supabase_utils.calculate_posting_waves(instances)
+
+    assert len(annotated) == 4
+    assert wave_count == 2
+    assert repost_count == 1
+    assert [instance["posting_wave_index"] for instance in annotated] == [1, 1, 2, 2]
+
+
+def test_missing_posted_at_same_scrape_run_is_one_wave():
+    _, wave_count, repost_count = supabase_utils.calculate_posting_waves([
+        {"job_id": "1", "location": "Toronto", "posted_at": None, "scrape_run_id": "run-a"},
+        {"job_id": "2", "location": "Toronto", "posted_at": None, "scrape_run_id": "run-a"},
+    ])
+
+    assert wave_count == 1
+    assert repost_count == 0
+
+
+def test_missing_all_wave_timestamps_does_not_confirm_reposts():
+    _, wave_count, repost_count = supabase_utils.calculate_posting_waves([
+        {"job_id": "1", "location": "Toronto"},
+        {"job_id": "2", "location": "Toronto"},
+    ])
+
+    assert wave_count == 1
+    assert repost_count == 0
+
+
+def test_unknown_locations_never_confirm_chronological_reposts():
+    _, wave_count, repost_count = supabase_utils.calculate_posting_waves([
+        {"job_id": "1", "location": None, "posted_at": "2026-08-01"},
+        {"job_id": "2", "location": None, "posted_at": "2026-08-20"},
+    ])
+
+    assert wave_count == 1
+    assert repost_count == 0
+
+
+def test_repeat_source_id_preserves_original_scrape_run_wave():
+    existing = {
+        "job_id": "source-1",
+        "listing_instances": [{
+            "job_id": "source-1",
+            "location": "Toronto",
+            "scrape_run_id": "original-run",
+        }],
+        "seen_count": 99,
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, {
+        "job_id": "source-1",
+        "location": "Toronto",
+        "scrape_run_id": "later-run",
+    })
+
+    assert update["seen_count"] == 1
+    assert update["repost_count"] == 0
+    assert update["listing_instances"][0]["scrape_run_id"] == "original-run"
+
+
+def test_repeat_source_id_without_run_keeps_original_scrape_date_fallback():
+    existing = {
+        "job_id": "source-1",
+        "listing_instances": [{
+            "job_id": "source-1",
+            "location": "Toronto",
+            "scraped_at": "2026-08-01T10:00:00Z",
+        }],
+        "seen_count": 1,
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, {
+        "job_id": "source-1",
+        "location": "Toronto",
+        "scrape_run_id": "later-run",
+    })
+
+    assert update["listing_instances"][0].get("scrape_run_id") is None
+    assert update["listing_instances"][0]["posting_wave_key"] == "toronto|scrape_date:2026-08-01"
+
+
+def test_cross_location_variants_do_not_inflate_repost_count():
+    annotated, wave_count, repost_count = supabase_utils.calculate_posting_waves([
+        {"job_id": "toronto-1", "location": "Toronto", "posted_at": "2026-08-01"},
+        {"job_id": "calgary-1", "location": "Calgary", "posted_at": "2026-08-01"},
+        {"job_id": "calgary-2", "location": "Calgary", "posted_at": "2026-08-01"},
+    ])
+
+    assert wave_count == 1
+    assert repost_count == 0
+    assert annotated[1]["variant_type"] == "location_variant"
+    assert annotated[2]["variant_type"] == "simultaneous_variant"
+
+
+def test_same_normalized_location_later_wave_is_one_repost():
+    _, wave_count, repost_count = supabase_utils.calculate_posting_waves([
+        {"job_id": "1", "location": "Toronto, Ontario", "posted_at": "2026-08-01"},
+        {"job_id": "2", "location": "Toronto / Ontario", "posted_at": "2026-08-20"},
+    ])
+
+    assert wave_count == 2
+    assert repost_count == 1
+
+
+def test_posting_wave_indexes_follow_observation_chronology_not_run_id():
+    annotated, _, _ = supabase_utils.calculate_posting_waves([
+        {"job_id": "later", "location": "Toronto", "scraped_at": "2026-02-01T00:00:00Z", "scrape_run_id": "a"},
+        {"job_id": "earlier", "location": "Toronto", "scraped_at": "2026-01-01T00:00:00Z", "scrape_run_id": "z"},
+    ])
+
+    by_id = {instance["job_id"]: instance for instance in annotated}
+    assert by_id["earlier"]["posting_wave_index"] == 1
+    assert by_id["later"]["posting_wave_index"] == 2
 
 
 def test_prepare_repost_update_payload_reactivates_expired_canonical_role():
@@ -324,7 +519,7 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
 
     assert query.selected == (
         "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
-        "listing_instances, seen_count, repost_count, latest_job_id, last_seen_posted_at, "
+        "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_posted_at, "
         "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
         "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
         "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
@@ -332,22 +527,45 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
     )
 
 
-def test_find_canonical_match_uses_freehire_style_fuzzy_description_match():
+def test_find_canonical_match_does_not_merge_different_locations():
     shared = " ".join(f"delivery token{index}" for index in range(100))
     existing = {
         "job_id": "old",
         "company": "Example Inc.",
         "job_title": "Senior Project Manager - Toronto",
+        "location": "Toronto",
         "description": shared + " legacy",
         "description_fingerprint": "different",
     }
     job = {
         "company": "Example Inc",
         "job_title": "Senior Project Manager - Calgary",
+        "location": "Calgary",
         "description": shared + " updated",
     }
 
-    assert supabase_utils.find_canonical_match(job, [existing]) == existing
+    assert supabase_utils.find_canonical_match(job, [existing]) is None
+
+
+def test_find_canonical_match_requires_known_location_for_content_match():
+    description = " ".join(f"delivery token{index}" for index in range(100))
+    existing = {
+        "job_id": "old",
+        "company": "Example Inc",
+        "job_title": "Senior Project Manager",
+        "location": None,
+        "description": description,
+        "description_fingerprint": "same",
+    }
+    job = {
+        "job_id": "new",
+        "company": "Example Inc",
+        "job_title": "Senior Project Manager",
+        "location": None,
+        "description": description,
+    }
+
+    assert supabase_utils.find_canonical_match(job, [existing]) is None
 
 
 def test_find_canonical_match_rejects_low_similarity_same_title():
@@ -462,10 +680,11 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
 
     assert ("eq", "company", "Foo-Bar") not in query.filters
     assert inserted_payloads == []
-    assert query.upsert_payloads
-    assert query.upsert_payloads[0][0]["job_id"] == "4394716706"
-    assert query.upsert_payloads[0][0]["latest_job_id"] == "4426608777"
-    assert query.upsert_payloads[0][0]["salary_text"] == "$120,000-$135,000 CAD"
+    assert query.update_payloads
+    assert query.update_payloads[0]["latest_job_id"] == "4426608777"
+    assert query.update_payloads[0]["salary_text"] == "$120,000-$135,000 CAD"
+    assert ("eq", "job_id", "4394716706") in query.filters
+    assert any(filter_[0:2] == ("eq", "listing_instances") for filter_ in query.filters)
 
 
 def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypatch):
@@ -506,3 +725,23 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
 
     assert calls == ["linkedin"]
     assert len(inserted_payloads) == 2
+
+
+def test_provider_agnostic_canonical_save_builds_listing_history(monkeypatch):
+    saved = []
+    monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [])
+    monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", lambda payloads: saved.extend(payloads))
+
+    supabase_utils.save_jobs_canonicalized([{
+        "job_id": "career-1",
+        "provider": "careers_future",
+        "company": "Acme",
+        "job_title": "Program Manager",
+        "location": "Singapore",
+        "posted_at": "2026-08-22",
+    }])
+
+    assert saved[0]["seen_count"] == 1
+    assert saved[0]["posting_wave_count"] == 1
+    assert saved[0]["repost_count"] == 0
+    assert saved[0]["listing_instances"][0]["location"] == "Singapore"

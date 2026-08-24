@@ -387,7 +387,7 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
             supabase.table(config.SUPABASE_TABLE_NAME)
             .select(
                 "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
-                "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_posted_at, "
+                "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_at, last_seen_posted_at, "
                 "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
                 "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
                 "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "

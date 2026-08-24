@@ -206,6 +206,7 @@ def test_prepare_repost_update_payload_preserves_existing_canonical_fields_on_pa
     existing = {
         "job_id": "4394716706",
         "latest_job_id": "4394716706",
+        "last_seen_at": "2026-05-29T12:00:00Z",
         "last_seen_posted_at": "2026-05-29",
         "posted_relative_text": "2 weeks ago",
         "applicant_count": 13,
@@ -519,7 +520,7 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
 
     assert query.selected == (
         "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
-        "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_posted_at, "
+        "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_at, last_seen_posted_at, "
         "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
         "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
         "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
@@ -638,6 +639,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
         "seen_count": 1,
         "repost_count": 0,
         "latest_job_id": "4394716706",
+        "last_seen_at": "2026-05-29T12:00:00Z",
         "last_seen_posted_at": "2026-05-29",
         "posted_relative_text": "2 weeks ago",
         "applicant_count": 13,
@@ -685,6 +687,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
     assert query.update_payloads[0]["salary_text"] == "$120,000-$135,000 CAD"
     assert ("eq", "job_id", "4394716706") in query.filters
     assert any(filter_[0:2] == ("eq", "listing_instances") for filter_ in query.filters)
+    assert ("eq", "last_seen_at", "2026-05-29T12:00:00Z") in query.filters
 
 
 def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypatch):

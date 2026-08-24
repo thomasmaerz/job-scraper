@@ -288,6 +288,30 @@ def test_prepare_repost_update_payload_does_not_count_same_listing_twice():
     assert update["listing_instances"][1]["applicant_count"] == 42
 
 
+def test_prepare_repost_update_payload_does_not_mutate_cas_source_snapshot():
+    existing = {
+        "job_id": "canonical",
+        "listing_instances": [{
+            "job_id": "source-1",
+            "location": "Toronto",
+            "scraped_at": "2026-08-01T00:00:00Z",
+            "applicant_count": 10,
+        }],
+        "seen_count": 1,
+    }
+
+    update = supabase_utils.prepare_repost_update_payload(existing, {
+        "job_id": "source-1",
+        "location": "Toronto",
+        "applicant_count": 25,
+    })
+
+    assert existing["listing_instances"][0]["applicant_count"] == 10
+    assert "last_seen_at" not in existing["listing_instances"][0]
+    assert update["listing_instances"][0]["applicant_count"] == 25
+    assert update["listing_instances"][0]["last_seen_at"]
+
+
 def test_eight_simultaneous_ids_are_one_wave_with_zero_reposts():
     existing = {
         "job_id": "source-1",

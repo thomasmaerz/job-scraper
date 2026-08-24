@@ -262,7 +262,9 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
 
 
 def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
-    listing_instances = list(existing.get("listing_instances") or [])
+    listing_instances = [
+        dict(instance) for instance in (existing.get("listing_instances") or [])
+    ]
     new_job_id = new_job.get("job_id")
     new_job_id = str(new_job_id) if new_job_id is not None else None
     known_listing_ids = {

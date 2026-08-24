@@ -1,6 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time 
 import random 
 import logging
@@ -11,11 +11,38 @@ import supabase_utils
 from markdownify import markdownify as md
 import json
 import uuid
+import math
 from urllib.parse import urlparse
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 SCRAPE_RUN_ID = str(uuid.uuid4())
+
+
+def resolve_linkedin_lookback_hours(
+    last_success_at: str | None,
+    now: datetime | None = None,
+) -> int:
+    configured_hours = config.LINKEDIN_LOOKBACK_HOURS
+    if not last_success_at:
+        return configured_hours
+
+    try:
+        parsed = datetime.fromisoformat(last_success_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        logging.warning("Invalid LinkedIn scrape watermark %r; using %s hours", last_success_at, configured_hours)
+        return configured_hours
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    elapsed_hours = max(0, math.ceil((now - parsed).total_seconds() / 3600))
+    return min(
+        config.LINKEDIN_MAX_LOOKBACK_HOURS,
+        max(configured_hours, elapsed_hours + config.LINKEDIN_LOOKBACK_OVERLAP_HOURS),
+    )
 
 
 def _resolve_archetype_config(archetype: str | None) -> tuple[str, dict]:
@@ -227,17 +254,22 @@ def _get_careers_future_job_company_name(job_item: dict) -> str | None:
     return None
 
 # --- LinkedIn Scraping Logic ---
-def _fetch_linkedin_job_ids(search_query: str, location: str) -> list:
+def _fetch_linkedin_job_ids(
+    search_query: str,
+    location: str,
+    posting_date_filter: str | None = None,
+) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
     scraped_cards = []
     start = 0
     max_start = config.LINKEDIN_MAX_START
+    posting_date_filter = posting_date_filter or config.LINKEDIN_JOB_POSTING_DATE
 
 
     logging.info(f"--- Starting Phase 1: Scraping Job IDs (Max Start: {max_start}) ---")
     while start <= max_start:
-        target_url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={search_query.replace(' ', '%20')}&location={location}&geoId={config.LINKEDIN_GEO_ID}&f_TPR={config.LINKEDIN_JOB_POSTING_DATE}&f_JT={config.LINKEDIN_JOB_TYPE}&f_WT={config.LINKEDIN_F_WT}&start={start}"
+        target_url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={search_query.replace(' ', '%20')}&location={location}&geoId={config.LINKEDIN_GEO_ID}&f_TPR={posting_date_filter}&f_JT={config.LINKEDIN_JOB_TYPE}&f_WT={config.LINKEDIN_F_WT}&start={start}"
 
         if start > 0:
             sleep_time = random.uniform(5.0, 15.0)
@@ -492,6 +524,7 @@ def process_linkedin_query(
     limit: int = None,
     archetype: str | None = None,
     filter_profile: str | None = None,
+    posting_date_filter: str | None = None,
 ) -> list:
     """
     Orchestrates scraping and detail fetching for a single query,
@@ -499,7 +532,11 @@ def process_linkedin_query(
     Returns a list of new job details found.
     """
 
-    scraped_cards = _fetch_linkedin_job_ids(search_query, location)
+    scraped_cards = _fetch_linkedin_job_ids(
+        search_query,
+        location,
+        posting_date_filter=posting_date_filter,
+    )
     if not scraped_cards:
     
         logging.info("No job IDs found in Phase 1. Skipping detail fetching.")
@@ -880,6 +917,14 @@ if __name__ == "__main__":
     # Get jobs from LinkedIn
     if "linkedin" in config.SCRAPING_SOURCES:
         logging.info("\n--- Starting LinkedIn Job Scraping ---")
+        last_success_at = config.LINKEDIN_LAST_SUCCESS_AT
+        lookback_hours = resolve_linkedin_lookback_hours(last_success_at)
+        posting_date_filter = f"r{lookback_hours * 3600}"
+        logging.info(
+            "LinkedIn lookback: %s hours (last successful run: %s)",
+            lookback_hours,
+            last_success_at or "unavailable",
+        )
         max_jobs_per_search = config.MAX_JOBS_PER_SEARCH.get("linkedin", getattr(config, 'DEFAULT_MAX_JOBS_PER_SEARCH', 10))
         for archetype_name, archetype_config in config.ARCHETYPE_CONFIGS.items():
             if archetype_config["provider"] != "linkedin":
@@ -895,6 +940,7 @@ if __name__ == "__main__":
                     limit=max_jobs_per_search,
                     archetype=archetype_name,
                     filter_profile=archetype_config["filter_profile"],
+                    posting_date_filter=posting_date_filter,
                 )
 
                 # 2. Save the NEW scraped data to Supabase

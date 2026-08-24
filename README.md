@@ -258,6 +258,16 @@ python backfill_listing_instance_salary.py --apply
 
 This fills only missing `salary_min`, `salary_max`, and `salary_currency`, preserves existing structured values, and records `salary_metadata_source=salary_text_parser`.
 
+### Scrape recovery window
+
+- Scheduled LinkedIn runs use a 48-hour lookback, providing overlap beyond the daily schedule.
+- GitHub Actions supplies the timestamp of the last successful scraper workflow. Failed or partial runs are excluded from this watermark.
+- The next run expands its lookback to elapsed time since that watermark plus six hours, capped at seven days.
+- Source listing-ID deduplication and posting-wave calculation make overlapping searches idempotent.
+- A last-seen listing ID is not used as a cursor because LinkedIn search ordering is not a durable total order and one ID cannot represent all configured queries.
+
+For one-off recovery, run the scraper workflow with `lookback_hours=96` or `168`. Normal scheduled runs return to the watermark-derived 48-hour minimum automatically.
+
 ## Project Structure
 
 ```

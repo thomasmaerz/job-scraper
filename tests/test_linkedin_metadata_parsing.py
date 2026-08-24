@@ -67,7 +67,7 @@ def test_parse_salary_rejects_project_budget_ranges():
 def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
     cards = [{"job_id": "123", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
 
-    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location: cards)
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location, posting_date_filter=None: cards)
     monkeypatch.setattr(scraper.supabase_utils, "get_existing_jobs_from_supabase", lambda: (set(), set()))
     monkeypatch.setattr(scraper.supabase_utils, "get_incomplete_linkedin_metadata_ids", lambda _ids: set())
     monkeypatch.setattr(scraper, "_fetch_linkedin_job_details", lambda job_id, search_card=None: {
@@ -90,7 +90,7 @@ def test_process_linkedin_query_skips_ids_already_seen_as_latest_job_id(monkeypa
     cards = [{"job_id": "linkedin-live-99", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
     fetched_job_ids = []
 
-    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location: cards)
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location, posting_date_filter=None: cards)
     monkeypatch.setattr(
         scraper.supabase_utils,
         "get_existing_jobs_from_supabase",
@@ -113,7 +113,7 @@ def test_existing_job_with_stale_metadata_is_refetched(monkeypatch):
     monkeypatch.setattr(
         scraper,
         "_fetch_linkedin_job_ids",
-        lambda query, location: [{"job_id": "existing", "posted_at": "2026-06-12"}],
+        lambda query, location, posting_date_filter=None: [{"job_id": "existing", "posted_at": "2026-06-12"}],
     )
     monkeypatch.setattr(
         scraper.supabase_utils,

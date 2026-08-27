@@ -41,6 +41,15 @@ def test_init_sql_documents_existing_scrape_run_state_contract():
     assert 'GRANT ALL ON TABLE "public"."scrape_run_state" TO service_role;' in sql
 
 
+def test_scrape_run_state_migration_is_idempotent_and_private():
+    sql = (ROOT / "supabase_setup" / "add_scrape_run_state.sql").read_text()
+    assert "CREATE TABLE IF NOT EXISTS public.scrape_run_state" in sql
+    assert "ON CONFLICT (id) DO NOTHING" in sql
+    assert "ALTER TABLE public.scrape_run_state ENABLE ROW LEVEL SECURITY" in sql
+    assert "REVOKE ALL ON TABLE public.scrape_run_state FROM PUBLIC, anon, authenticated" in sql
+    assert "GRANT ALL ON TABLE public.scrape_run_state TO service_role" in sql
+
+
 def test_cleanup_sql_drops_job_keyword_insights_table():
     sql = (ROOT / "supabase_setup" / "cleanup.sql").read_text()
 

@@ -13,6 +13,19 @@ JOBS_FIELDS = (
     "job_id,provider,location,description,last_seen_at,listing_instances,seen_count,posting_wave_count,"
     "repost_count,same_id_relist_count"
 )
+SELECTED_IDS_QUERY_CHUNK_SIZE = 100
+
+
+def _selected_id_chunks(selected_ids: list[str] | None) -> list[list[str] | None]:
+    if selected_ids is None:
+        return [None]
+
+    # Avoid duplicate queries/results while retaining the caller's ID order.
+    unique_ids = list(dict.fromkeys(selected_ids))
+    return [
+        unique_ids[start:start + SELECTED_IDS_QUERY_CHUNK_SIZE]
+        for start in range(0, len(unique_ids), SELECTED_IDS_QUERY_CHUNK_SIZE)
+    ]
 
 
 def fetch_all(
@@ -24,18 +37,22 @@ def fetch_all(
     id_field: str = "canonical_job_id",
 ) -> list[dict]:
     rows = []
-    offset = 0
-    while limit is None or len(rows) < limit:
-        end = offset + page_size - 1 if limit is None else min(offset + page_size, limit) - 1
-        query = supabase_utils.supabase.table(table).select(fields)
-        if selected_ids:
-            query = query.in_(id_field, selected_ids)
-        page = query.range(offset, end).execute().data or []
-        rows.extend(page)
-        if len(page) < end - offset + 1:
+    for selected_id_chunk in _selected_id_chunks(selected_ids):
+        offset = 0
+        while limit is None or len(rows) < limit:
+            request_size = page_size if limit is None else min(page_size, limit - len(rows))
+            end = offset + request_size - 1
+            query = supabase_utils.supabase.table(table).select(fields)
+            if selected_id_chunk is not None:
+                query = query.in_(id_field, selected_id_chunk)
+            page = query.range(offset, end).execute().data or []
+            rows.extend(page)
+            if len(page) < request_size:
+                break
+            offset += len(page)
+        if limit is not None and len(rows) >= limit:
             break
-        offset += len(page)
-    return rows if limit is None else rows[:limit]
+    return rows
 
 
 def build_payload(row: dict, observations: list[dict]) -> dict:

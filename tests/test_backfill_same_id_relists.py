@@ -7,10 +7,11 @@ class Response:
 
 
 class Query:
-    def __init__(self, rows_by_table, table, updates):
+    def __init__(self, rows_by_table, table, updates, in_queries):
         self.rows_by_table = rows_by_table
         self.table = table
         self.updates = updates
+        self.in_queries = in_queries
         self.start = 0
         self.end = 999
         self.payload = None
@@ -39,6 +40,7 @@ class Query:
         return self
 
     def in_(self, field, values):
+        self.in_queries.append((self.table, field, list(values)))
         self.rows_by_table = {
             **self.rows_by_table,
             self.table: [
@@ -58,9 +60,71 @@ class Client:
     def __init__(self, rows_by_table):
         self.rows_by_table = rows_by_table
         self.updates = []
+        self.in_queries = []
 
     def table(self, table):
-        return Query(self.rows_by_table, table, self.updates)
+        return Query(self.rows_by_table, table, self.updates, self.in_queries)
+
+
+def test_selected_id_chunks_deduplicate_without_reordering():
+    assert backfill._selected_id_chunks(["canonical-b", "canonical-a", "canonical-b", "canonical-c"]) == [
+        ["canonical-b", "canonical-a", "canonical-c"]
+    ]
+
+
+def test_fetch_all_chunks_1000_selected_ids_and_paginates_each_chunk(monkeypatch):
+    selected_ids = [f"canonical-{index:04d}" for index in range(1000)]
+    rows = {
+        "listing_observations": [
+            {"canonical_job_id": canonical_id, "sequence": index}
+            for index, canonical_id in enumerate(selected_ids)
+        ]
+    }
+    client = Client(rows)
+    monkeypatch.setattr(backfill.supabase_utils, "supabase", client)
+
+    result = backfill.fetch_all(
+        "listing_observations",
+        "canonical_job_id,sequence",
+        None,
+        page_size=73,
+        selected_ids=selected_ids,
+    )
+
+    assert [row["sequence"] for row in result] == list(range(1000))
+    assert len(client.in_queries) == 20
+    assert all(
+        len(query_ids) <= backfill.SELECTED_IDS_QUERY_CHUNK_SIZE
+        for _table, _field, query_ids in client.in_queries
+    )
+    assert {
+        query_id
+        for _table, _field, query_ids in client.in_queries
+        for query_id in query_ids
+    } == set(selected_ids)
+
+
+def test_fetch_all_applies_limit_across_selected_id_chunks(monkeypatch):
+    selected_ids = [f"canonical-{index:04d}" for index in range(1000)]
+    rows = {
+        "listing_observations": [
+            {"canonical_job_id": canonical_id, "sequence": index}
+            for index, canonical_id in enumerate(selected_ids)
+        ]
+    }
+    client = Client(rows)
+    monkeypatch.setattr(backfill.supabase_utils, "supabase", client)
+
+    result = backfill.fetch_all(
+        "listing_observations",
+        "canonical_job_id,sequence",
+        157,
+        page_size=73,
+        selected_ids=selected_ids,
+    )
+
+    assert [row["sequence"] for row in result] == list(range(157))
+    assert len(client.in_queries) == 3
 
 
 def test_run_is_dry_run_by_default_and_apply_uses_guard(monkeypatch):

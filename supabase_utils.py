@@ -646,20 +646,6 @@ def get_last_successful_scrape_at() -> Optional[str]:
     return rows[0].get("last_successful_scrape_at")
 
 
-def _request_scrape_run_state_representation(query: Any) -> Any:
-    """Request mutation rows when the installed PostgREST builder supports it."""
-    select = getattr(query, "select", None)
-    if not callable(select):
-        return query
-    try:
-        return select("id,last_successful_scrape_at")
-    except (AttributeError, TypeError, NotImplementedError):
-        # Older clients cannot chain select() onto mutation builders. Their
-        # successful execute() may legitimately return data=[], so the write is
-        # checked with a separate read-back instead.
-        return query
-
-
 def _scrape_run_state_matches(finished_at: str) -> bool:
     """Confirm that the singleton row contains the exact timestamp written."""
     try:
@@ -697,12 +683,12 @@ def record_scrape_success() -> bool:
     payload = {"last_successful_scrape_at": finished_at}
 
     try:
-        query = (
+        (
             supabase.table("scrape_run_state")
             .update(payload)
             .eq("id", SCRAPE_RUN_STATE_ID)
+            .execute()
         )
-        _request_scrape_run_state_representation(query).execute()
         if _scrape_run_state_matches(finished_at):
             return True
     except Exception as error:
@@ -710,11 +696,14 @@ def record_scrape_success() -> bool:
 
     try:
         # A fresh database may have the table but not its singleton row yet.
-        query = supabase.table("scrape_run_state").upsert(
-            {"id": SCRAPE_RUN_STATE_ID, **payload},
-            on_conflict="id",
+        (
+            supabase.table("scrape_run_state")
+            .upsert(
+                {"id": SCRAPE_RUN_STATE_ID, **payload},
+                on_conflict="id",
+            )
+            .execute()
         )
-        _request_scrape_run_state_representation(query).execute()
         if _scrape_run_state_matches(finished_at):
             return True
     except Exception as error:

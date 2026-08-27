@@ -86,10 +86,74 @@ def test_record_scrape_success_updates_existing_run_state(monkeypatch):
     assert calls[0][1]["last_successful_scrape_at"].endswith("+00:00")
     assert calls[1:] == [
         ("eq", "id", 1),
-        ("select", "id,last_successful_scrape_at"),
         ("select", "last_successful_scrape_at"),
         ("eq", "id", 1),
         ("limit", 1),
+    ]
+
+
+def test_record_scrape_success_executes_update_builder_without_select_and_reads_back(monkeypatch):
+    calls = []
+    state = {"id": 1, "last_successful_scrape_at": "2026-08-26T10:32:33+00:00"}
+
+    class MutationBuilder:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def eq(self, column, value):
+            calls.append(("update_eq", column, value))
+            return self
+
+        def execute(self):
+            calls.append(("update_execute",))
+            state.update(self.payload)
+            return SimpleNamespace(data=[])
+
+    class ReadBuilder:
+        def select(self, columns):
+            calls.append(("select", columns))
+            return self
+
+        def eq(self, column, value):
+            calls.append(("select_eq", column, value))
+            return self
+
+        def limit(self, value):
+            calls.append(("limit", value))
+            return self
+
+        def execute(self):
+            calls.append(("select_execute",))
+            return SimpleNamespace(data=[state.copy()])
+
+    class FakeTable:
+        def update(self, payload):
+            calls.append(("update", payload))
+            return MutationBuilder(payload)
+
+        def select(self, columns):
+            return ReadBuilder().select(columns)
+
+        def upsert(self, _payload, **_kwargs):
+            raise AssertionError("upsert fallback should not run after verified update")
+
+    class FakeSupabase:
+        def table(self, table_name):
+            assert table_name == "scrape_run_state"
+            return FakeTable()
+
+    monkeypatch.setattr(supabase_utils, "supabase", FakeSupabase())
+
+    assert supabase_utils.record_scrape_success() is True
+    assert calls[0][0] == "update"
+    assert calls[0][1]["last_successful_scrape_at"].endswith("+00:00")
+    assert calls[1:] == [
+        ("update_eq", "id", 1),
+        ("update_execute",),
+        ("select", "last_successful_scrape_at"),
+        ("select_eq", "id", 1),
+        ("limit", 1),
+        ("select_execute",),
     ]
 
 

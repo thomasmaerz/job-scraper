@@ -10,7 +10,6 @@ import string
 import unicodedata
 import html
 import json
-import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
@@ -624,29 +623,53 @@ def finish_ingestion_run(run_id: str, **metrics: Any) -> None:
     supabase.table("ingestion_runs").update(payload).eq("id", run_id).execute()
 
 
-def record_scrape_success(execution_run_id: str) -> None:
-    """Persist a successful top-level scraper execution watermark.
+SCRAPE_RUN_STATE_ID = 1
 
-    ``ingestion_runs`` created by ``process_linkedin_query`` are query-scoped.
-    The execution watermark therefore gets its own UUID and an explicit
-    provider/scope rather than borrowing the ID of the final query.
-    """
+
+def get_last_successful_scrape_at() -> Optional[str]:
+    """Read the singleton scraper watermark from the historical state table."""
     try:
-        normalized_run_id = str(uuid.UUID(str(execution_run_id)))
-    except (AttributeError, TypeError, ValueError) as error:
-        raise ValueError("execution_run_id must be a valid UUID") from error
+        response = (
+            supabase.table("scrape_run_state")
+            .select("last_successful_scrape_at")
+            .eq("id", SCRAPE_RUN_STATE_ID)
+            .limit(1)
+            .execute()
+        )
+    except Exception as error:
+        logging.error("Failed to read scrape success watermark: %s", error)
+        return None
 
+    rows = response.data or []
+    if not rows:
+        return None
+    return rows[0].get("last_successful_scrape_at")
+
+
+def record_scrape_success() -> bool:
+    """Persist the required top-level scraper watermark in scrape_run_state."""
     finished_at = datetime.now(timezone.utc).isoformat()
-    supabase.table("ingestion_runs").upsert({
-        "id": normalized_run_id,
-        "provider": "scraper",
-        "query_scope": "top-level-execution",
-        "started_at": finished_at,
-        "finished_at": finished_at,
-        "status": "complete",
-        "coverage_complete": True,
-        "coverage_reason": "all configured scraper orchestration completed",
-    }, on_conflict="id").execute()
+    payload = {"last_successful_scrape_at": finished_at}
+
+    try:
+        response = (
+            supabase.table("scrape_run_state")
+            .update(payload)
+            .eq("id", SCRAPE_RUN_STATE_ID)
+            .execute()
+        )
+        if response.data:
+            return True
+
+        # A fresh database may have the table but not its singleton row yet.
+        response = supabase.table("scrape_run_state").upsert(
+            {"id": SCRAPE_RUN_STATE_ID, **payload},
+            on_conflict="id",
+        ).execute()
+        return bool(response.data)
+    except Exception as error:
+        logging.error("Failed to persist scrape success watermark: %s", error)
+        return False
 
 
 def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> dict[str, dict]:

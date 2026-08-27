@@ -33,6 +33,14 @@ def _freehire_view_source_columns(sql):
     return identifiers - aliases - {"and", "coalesce", "is", "not", "null", "where"}
 
 
+def test_init_sql_documents_existing_scrape_run_state_contract():
+    sql = (ROOT / "supabase_setup" / "init.sql").read_text()
+
+    assert 'CREATE TABLE IF NOT EXISTS "public"."scrape_run_state" (' in sql
+    assert '"last_successful_scrape_at" timestamp with time zone' in sql
+    assert 'GRANT ALL ON TABLE "public"."scrape_run_state" TO service_role;' in sql
+
+
 def test_cleanup_sql_drops_job_keyword_insights_table():
     sql = (ROOT / "supabase_setup" / "cleanup.sql").read_text()
 

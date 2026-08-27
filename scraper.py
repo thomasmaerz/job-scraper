@@ -1075,13 +1075,15 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
 
 def main() -> list[str]:
     """Run configured scrapers and return the canonical job IDs that were saved."""
-    execution_run_id = str(uuid.uuid4())
     saved_job_ids: list[str] = []
 
     # Get jobs from LinkedIn
     if "linkedin" in config.SCRAPING_SOURCES:
         logging.info("\n--- Starting LinkedIn Job Scraping ---")
-        last_success_at = config.LINKEDIN_LAST_SUCCESS_AT
+        last_success_at = (
+            supabase_utils.get_last_successful_scrape_at()
+            or config.LINKEDIN_LAST_SUCCESS_AT
+        )
         lookback_hours = resolve_linkedin_lookback_hours(last_success_at)
         posting_date_filter = f"r{lookback_hours * 3600}"
         logging.info(
@@ -1146,7 +1148,8 @@ def main() -> list[str]:
     # --- End of Script ---
     logging.info(f"\n{'='*20} Job scraping script finished {'='*20}")
     logging.info(f"Total new jobs saved across all queries: {len(saved_job_ids)}")
-    supabase_utils.record_scrape_success(execution_run_id)
+    if not supabase_utils.record_scrape_success():
+        raise RuntimeError("Failed to persist scrape success watermark")
     return saved_job_ids
 
 

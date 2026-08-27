@@ -284,7 +284,7 @@ This fills only missing `salary_min`, `salary_max`, and `salary_currency`, prese
 ### Scrape recovery window
 
 - Scheduled LinkedIn runs use a 48-hour lookback, providing overlap beyond the daily schedule.
-- GitHub Actions supplies the timestamp of the last successful scraper workflow. Failed or partial runs are excluded from this watermark.
+- `public.scrape_run_state` stores the required successful-completion watermark. GitHub Actions supplies the last successful workflow timestamp as a recovery fallback. Failed or partial runs do not advance the database watermark.
 - The next run expands its lookback to elapsed time since that watermark plus six hours, capped at seven days.
 - Source listing-ID deduplication and posting-wave calculation make overlapping searches idempotent.
 - A last-seen listing ID is not used as a cursor because LinkedIn search ordering is not a durable total order and one ID cannot represent all configured queries.

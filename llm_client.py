@@ -101,6 +101,7 @@ class LLMClient:
         self.daily_budget = daily_budget
         self.request_delay = request_delay
         self.model_chain = model_chain
+        self.last_model_used = None
         self.rate_limiter = RateLimiter(max_rpm)
 
         # Daily budget tracking
@@ -153,6 +154,7 @@ class LLMClient:
         response_format: Optional[Type[BaseModel]] = None,
         model_override: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        max_api_attempts: Optional[int] = None,
     ) -> str:
         """
         Generate content using the configured LLM.
@@ -209,6 +211,8 @@ class LLMClient:
 
         # Ensure we retry enough times to try all models in the pool if dynamic
         max_attempts = max(self.max_retries + 1, len(gemini_pool)) if use_model_pool else self.max_retries + 1
+        if max_api_attempts is not None:
+            max_attempts = min(max_attempts, max(1, max_api_attempts))
 
         for attempt in range(max_attempts):
             try:
@@ -227,6 +231,7 @@ class LLMClient:
 
                 logger.debug(f"LLM request attempt {attempt + 1}/{max_attempts} to {current_model}")
                 response = litellm.completion(**kwargs)
+                self.last_model_used = current_model
 
                 # Track daily usage
                 self._daily_count += 1
@@ -313,4 +318,10 @@ job_insights_client = _create_client(
     model=config.LLM_MODEL,
     api_key=config.LLM_API_KEY,
     model_chain=config.JOB_INSIGHTS_MODEL_CHAIN,
+)
+
+freehire_classify_client = _create_client(
+    model=config.LLM_MODEL,
+    api_key=config.LLM_API_KEY,
+    model_chain=config.FREEHIRE_CLASSIFY_MODEL_CHAIN,
 )

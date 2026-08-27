@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional, Dict, Any
 
 class Education(BaseModel):
@@ -32,6 +32,8 @@ class Links(BaseModel):
     portfolio: str = ""
 
 class Resume(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = ""
     email: str = ""
     phone: str = ""

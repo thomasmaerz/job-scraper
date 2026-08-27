@@ -1,4 +1,5 @@
 import supabase_utils
+import freehire_compat
 
 
 class _FakeResponse:
@@ -159,6 +160,9 @@ def test_prepare_canonical_insert_payload():
     assert payload["listing_instances"][0]["job_id"] == "4426608777"
     assert payload["listing_instances"][0]["location"] == "Chalk River, Ontario, Canada"
     assert payload["listing_instances"][0]["variant_type"] == "original"
+    assert payload["freehire_compat_status"] == "pending"
+    assert payload["freehire_compat_input_hash"]
+    assert payload["is_remote"] is False
 
 
 def test_prepare_repost_update_payload():
@@ -167,6 +171,11 @@ def test_prepare_repost_update_payload():
         "listing_instances": [{"job_id": "4394716706", "location": "Toronto", "posted_at": "2026-05-29", "scraped_at": "2026-05-29T12:00:00Z"}],
         "seen_count": 1,
         "repost_count": 0,
+        "provider": "linkedin",
+        "job_title": "Project Manager",
+        "location": "Toronto",
+        "description": "Delivery",
+        "freehire_compat_input_hash": "old",
     }
     new_job = {
         "job_id": "4426608777",
@@ -184,6 +193,8 @@ def test_prepare_repost_update_payload():
     assert update["posting_wave_count"] == 2
     assert update["repost_count"] == 1
     assert len(update["listing_instances"]) == 2
+    assert update["freehire_compat_status"] == "pending"
+    assert update["freehire_compat_input_hash"] != "old"
 
 
 def test_prepare_canonical_insert_payload_preserves_missing_job_id_as_none():
@@ -248,6 +259,32 @@ def test_prepare_repost_update_payload_preserves_existing_canonical_fields_on_pa
     assert update["recruiter_name"] == "Jane Recruiter"
     assert update["recruiter_profile_url"] == "https://www.linkedin.com/in/jane-recruiter"
     assert update["recruiter_identifier"] == "jane-recruiter"
+
+
+def test_partial_repost_none_values_do_not_invalidate_current_classification():
+    existing = {
+        "job_id": "canonical",
+        "provider": "linkedin",
+        "job_title": "Senior TPM",
+        "location": "Toronto",
+        "description": "Remote delivery",
+        "level": "Senior",
+        "listing_instances": [{"job_id": "source-1"}],
+    }
+    existing["freehire_compat_input_hash"] = freehire_compat.compute_classification_hash(existing)
+    existing["freehire_compat_status"] = "current"
+
+    update = supabase_utils.prepare_repost_update_payload(existing, {
+        "job_id": "source-1",
+        "job_title": None,
+        "location": None,
+        "description": None,
+        "level": None,
+    })
+
+    assert "freehire_compat_status" not in update
+    assert "freehire_compat_input_hash" not in update
+    assert update["is_remote"] is True
 
 
 def test_prepare_repost_update_payload_preserves_existing_latest_job_id_when_new_job_id_missing():
@@ -548,7 +585,9 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
         "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
         "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
         "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
-        "is_active, job_state"
+        "is_active, job_state, same_id_relist_count, provider, level, "
+        "freehire_category, freehire_seniority, is_remote, freehire_remote_evidence, "
+        "freehire_compat_status, freehire_compat_input_hash, freehire_compat_import_hash"
     )
 
 
@@ -646,6 +685,9 @@ def test_save_jobs_to_supabase_preserves_canonical_and_task2_metadata_fields(mon
     assert saved["repost_count"] == 0
     assert saved["listing_instances"] == payload["listing_instances"]
     assert saved["description_fingerprint"] == payload["description_fingerprint"]
+    assert saved["freehire_compat_status"] == "pending"
+    assert saved["freehire_compat_input_hash"] == payload["freehire_compat_input_hash"]
+    assert saved["is_remote"] is False
 
 
 def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_company_variants(monkeypatch):
@@ -684,6 +726,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
         inserted_payloads.extend(payloads)
 
     monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", fake_save_jobs_to_supabase)
+    monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
 
     supabase_utils.save_linkedin_jobs_canonicalized([{
         "job_id": "4426608777",
@@ -728,6 +771,7 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
 
     monkeypatch.setattr(supabase_utils, "get_canonical_candidates", fake_get_canonical_candidates)
     monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", fake_save_jobs_to_supabase)
+    monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
 
     jobs = [
         {
@@ -772,3 +816,19 @@ def test_provider_agnostic_canonical_save_builds_listing_history(monkeypatch):
     assert saved[0]["posting_wave_count"] == 1
     assert saved[0]["repost_count"] == 0
     assert saved[0]["listing_instances"][0]["location"] == "Singapore"
+
+
+def test_existing_id_lookup_includes_historical_listing_instance_ids(monkeypatch):
+    query = _RecordingQuery(response_data=[{
+        "job_id": "canonical",
+        "latest_job_id": "latest",
+        "company": "Acme",
+        "job_title": "TPM",
+        "listing_instances": [{"job_id": "historical"}],
+    }])
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+
+    ids, _ = supabase_utils.get_existing_jobs_from_supabase()
+
+    assert ids == {"canonical", "latest", "historical"}
+    assert "listing_instances" in query.selected

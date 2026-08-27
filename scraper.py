@@ -13,10 +13,13 @@ import json
 import uuid
 import math
 from urllib.parse import urlparse
+import relist_tracking
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 SCRAPE_RUN_ID = str(uuid.uuid4())
+_relist_detail_fetches_used = 0
+_linkedin_search_coverage = {"pages_attempted": 0, "pages_completed": 0}
 
 
 def resolve_linkedin_lookback_hours(
@@ -261,6 +264,8 @@ def _fetch_linkedin_job_ids(
 ) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
+    global _linkedin_search_coverage
+    _linkedin_search_coverage = {"pages_attempted": 0, "pages_completed": 0}
     scraped_cards = []
     start = 0
     max_start = config.LINKEDIN_MAX_START
@@ -269,6 +274,7 @@ def _fetch_linkedin_job_ids(
 
     logging.info(f"--- Starting Phase 1: Scraping Job IDs (Max Start: {max_start}) ---")
     while start <= max_start:
+        _linkedin_search_coverage["pages_attempted"] += 1
         target_url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={search_query.replace(' ', '%20')}&location={location}&geoId={config.LINKEDIN_GEO_ID}&f_TPR={posting_date_filter}&f_JT={config.LINKEDIN_JOB_TYPE}&f_WT={config.LINKEDIN_F_WT}&start={start}"
 
         if start > 0:
@@ -324,6 +330,8 @@ def _fetch_linkedin_job_ids(
             
              logging.info(f"Received empty response text at start={start}, stopping.")
              break
+
+        _linkedin_search_coverage["pages_completed"] += 1
 
         soup = BeautifulSoup(res.text, 'html.parser')
         all_jobs_on_this_page = soup.find_all('li')
@@ -532,13 +540,44 @@ def process_linkedin_query(
     Returns a list of new job details found.
     """
 
+    global _relist_detail_fetches_used, _linkedin_search_coverage
+    resolved_archetype, archetype_config = _resolve_archetype_config(archetype)
+    resolved_filter_profile = filter_profile or archetype_config["filter_profile"]
+    run_id = str(uuid.uuid4())
+    query_scope = json.dumps({
+        "archetype": resolved_archetype,
+        "filter_profile": resolved_filter_profile,
+        "location": location,
+        "posting_date_filter": posting_date_filter or config.LINKEDIN_JOB_POSTING_DATE,
+        "search_query": search_query,
+    }, sort_keys=True, separators=(",", ":"))
+    tracking_enabled = getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
+    if tracking_enabled:
+        supabase_utils.start_ingestion_run(
+            run_id,
+            provider="linkedin",
+            search_query=search_query,
+            archetype=resolved_archetype,
+            filter_profile=resolved_filter_profile,
+            query_scope=query_scope,
+        )
+
     scraped_cards = _fetch_linkedin_job_ids(
         search_query,
         location,
         posting_date_filter=posting_date_filter,
     )
     if not scraped_cards:
-    
+        if tracking_enabled:
+            supabase_utils.finish_ingestion_run(
+                run_id,
+                status="incomplete",
+                pages_attempted=_linkedin_search_coverage["pages_attempted"],
+                pages_completed=_linkedin_search_coverage["pages_completed"],
+                cards_seen=0,
+                coverage_complete=False,
+                coverage_reason="zero cards; empty result or parser/request failure",
+            )
         logging.info("No job IDs found in Phase 1. Skipping detail fetching.")
         return []
 
@@ -552,6 +591,84 @@ def process_linkedin_query(
     card_by_job_id = {card['job_id']: card for card in normalized_cards}
     unique_linkedin_job_ids = list(card_by_job_id.keys())
 
+    tracking_context = (
+        supabase_utils.get_listing_tracking_context("linkedin", unique_linkedin_job_ids)
+        if tracking_enabled
+        else {}
+    )
+    relist_candidates = []
+    min_forward_days = getattr(config, "LINKEDIN_RELIST_MIN_FORWARD_DAYS", 2)
+    stable_observations = getattr(config, "LINKEDIN_RELIST_STABLE_OBSERVATIONS", 2)
+    for job_id in unique_linkedin_job_ids:
+        card = card_by_job_id[job_id]
+        prior = tracking_context.get(str(job_id)) or {}
+        observations = list(prior.get("observations") or [])
+        observation_already_recorded = any(
+            str(item.get("ingestion_run_id") or item.get("scrape_run_id") or "") == run_id
+            for item in observations
+        )
+        if not observation_already_recorded:
+            observations.append({
+                "posted_at": card.get("posted_at"),
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "ingestion_run_id": run_id,
+            })
+        fold = relist_tracking.fold_observations(
+            observations,
+            min_forward_days=min_forward_days,
+            stable_observations=stable_observations,
+        )
+        prior_trusted_date = supabase_utils._date_part(
+            prior.get("latest_trusted_posted_date")
+            or (prior.get("observations") or [{}])[-1].get("posted_at")
+        )
+        pending_event = relist_tracking.latest_pending_event(
+            fold, prior.get("accepted_relist_dates")
+        )
+        if (
+            observation_already_recorded
+            and pending_event
+            and str(pending_event.get("ingestion_run_id") or "") == run_id
+        ):
+            pending_event = None
+        pending_date = relist_tracking.date_part(prior.get("pending_relist_on"))
+        if pending_event or pending_date:
+            event = pending_event or {
+                "relisted_on": pending_date,
+                "algorithm_version": relist_tracking.ALGORITHM_VERSION,
+                "pending_state_recovery": True,
+            }
+            card["same_id_relist_candidate"] = True
+            card["same_id_relist_date"] = event["relisted_on"]
+            card["same_id_relist_evidence"] = event
+            card["trigger_evidence"] = {"classification": "relist_candidate", **event}
+            relist_candidates.append(str(job_id))
+        elif fold["corrections"]:
+            card["trigger_evidence"] = {
+                "classification": "correction",
+                **fold["corrections"][-1],
+            }
+        else:
+            card["trigger_evidence"] = {"classification": "unchanged"}
+
+    if tracking_enabled:
+        canonical_by_source = {
+            str(job_id): (tracking_context.get(str(job_id)) or {}).get("canonical_job_id")
+            for job_id in unique_linkedin_job_ids
+        }
+        supabase_utils.save_listing_observations(
+            normalized_cards,
+            run_id=run_id,
+            provider="linkedin",
+            query_scope=query_scope,
+            canonical_by_source=canonical_by_source,
+        )
+        supabase_utils.save_listing_states(
+            normalized_cards,
+            tracking_context,
+            canonical_by_source=canonical_by_source,
+            provider="linkedin",
+        )
     logging.info(f"Found {len(scraped_cards)} raw job cards, {len(unique_linkedin_job_ids)} unique IDs after scraping.")
 
 
@@ -564,11 +681,25 @@ def process_linkedin_query(
         if str(job_id) not in job_ids_set
     ]
     enrichment_limit = getattr(config, "LINKEDIN_METADATA_ENRICH_LIMIT_PER_QUERY", 10)
+    query_relist_limit = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY", 3)
+    run_relist_remaining = max(
+        0,
+        getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", 20) - _relist_detail_fetches_used,
+    )
+    relist_limit = min(query_relist_limit, run_relist_remaining)
+    relist_job_ids_to_process = [
+        job_id for job_id in relist_candidates if job_id in job_ids_set
+    ][:relist_limit]
     metadata_job_ids_to_process = [
         str(job_id) for job_id in unique_linkedin_job_ids
         if str(job_id) in incomplete_metadata_ids
     ][:enrichment_limit]
-    job_ids_to_process = list(dict.fromkeys(new_job_ids_to_process + metadata_job_ids_to_process))
+    if limit is not None:
+        reserved = min(limit, len(relist_job_ids_to_process))
+        new_job_ids_to_process = new_job_ids_to_process[:max(0, limit - reserved)]
+    job_ids_to_process = list(dict.fromkeys(
+        relist_job_ids_to_process + new_job_ids_to_process + metadata_job_ids_to_process
+    ))
 
 
     logging.info(f"Found {len(unique_linkedin_job_ids)} unique scraped IDs.")
@@ -578,7 +709,17 @@ def process_linkedin_query(
     logging.info(f"Identified {len(new_job_ids_to_process)} new job IDs to fetch details for.")
 
     if not job_ids_to_process:
-    
+        if tracking_enabled:
+            supabase_utils.finish_ingestion_run(
+                run_id,
+                status="complete",
+                pages_attempted=_linkedin_search_coverage["pages_attempted"],
+                pages_completed=_linkedin_search_coverage["pages_completed"],
+                cards_seen=len(normalized_cards),
+                detail_budget_used=0,
+                coverage_complete=False,
+                coverage_reason="LinkedIn guest recent-window search cannot prove absence",
+            )
         logging.info("No new job IDs to process after filtering.")
         return []
 
@@ -591,16 +732,20 @@ def process_linkedin_query(
     processed_count = 0
 
     ids_to_fetch = job_ids_to_process
-    resolved_archetype, archetype_config = _resolve_archetype_config(archetype)
-    resolved_filter_profile = filter_profile or archetype_config["filter_profile"]
-
     for job_id in ids_to_fetch:
         details = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
         if details:
             details["search_query"] = search_query
             details["archetype"] = resolved_archetype
             details["filter_profile"] = resolved_filter_profile
-            details["scrape_run_id"] = SCRAPE_RUN_ID
+            details["scrape_run_id"] = run_id
+            if job_id in relist_job_ids_to_process:
+                details["same_id_relist_candidate"] = bool(
+                    getattr(config, "ENABLE_LINKEDIN_RELIST_EFFECTS", True)
+                )
+                details["same_id_relist_date"] = card_by_job_id[job_id].get("same_id_relist_date")
+                details["same_id_relist_evidence"] = card_by_job_id[job_id].get("same_id_relist_evidence")
+                _relist_detail_fetches_used += 1
             description = details.get('description')
             if description and description.strip(): 
                 if 'job_id' in details and details['job_id'] is not None:
@@ -618,6 +763,21 @@ def process_linkedin_query(
 
 
     logging.info(f"--- Finished Phase 2: Successfully fetched details for {processed_count} new job(s) ---")
+    if tracking_enabled:
+        supabase_utils.finish_ingestion_run(
+            run_id,
+            status="complete" if processed_count == len(ids_to_fetch) else "incomplete",
+            pages_attempted=_linkedin_search_coverage["pages_attempted"],
+            pages_completed=_linkedin_search_coverage["pages_completed"],
+            cards_seen=len(normalized_cards),
+            detail_budget_used=len(ids_to_fetch),
+            coverage_complete=False,
+            coverage_reason=(
+                "LinkedIn guest recent-window search cannot prove absence"
+                if processed_count == len(ids_to_fetch)
+                else f"detail validation accepted {processed_count} of {len(ids_to_fetch)} selected IDs"
+            ),
+        )
     return detailed_new_jobs
 
 def _fetch_careers_future_jobs(search_query: str) -> list:

@@ -37,7 +37,8 @@ def test_linkedin_lookback_caps_long_outage(monkeypatch):
     assert hours == 168
 
 
-def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile():
+def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile(monkeypatch):
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
     fake_details = {
         "job_id": "123",
         "job_title": "Technical Program Manager",
@@ -48,6 +49,7 @@ def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile
 
     with patch.object(scraper, "_fetch_linkedin_job_ids", return_value=["123"]), \
          patch.object(scraper.supabase_utils, "get_existing_jobs_from_supabase", return_value=(set(), set())), \
+         patch.object(scraper.supabase_utils, "get_incomplete_linkedin_metadata_ids", return_value=set()), \
          patch.object(scraper, "_fetch_linkedin_job_details", return_value=fake_details):
         jobs = scraper.process_linkedin_query(
             search_query="Technical Program Manager",
@@ -57,6 +59,8 @@ def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile
             filter_profile="software_tpm_v1",
         )
 
+    assert len(jobs) == 1
+    assert jobs[0].pop("scrape_run_id") != scraper.SCRAPE_RUN_ID
     assert jobs == [{
         "job_id": "123",
         "job_title": "Technical Program Manager",
@@ -66,11 +70,11 @@ def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile
         "search_query": "Technical Program Manager",
         "archetype": "software_tpm",
         "filter_profile": "software_tpm_v1",
-        "scrape_run_id": scraper.SCRAPE_RUN_ID,
     }]
 
 
-def test_process_linkedin_query_raises_clear_error_for_unknown_archetype():
+def test_process_linkedin_query_raises_clear_error_for_unknown_archetype(monkeypatch):
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
     with patch.object(scraper, "_fetch_linkedin_job_ids", return_value=["123"]), \
          patch.object(scraper.supabase_utils, "get_existing_jobs_from_supabase", return_value=(set(), set())):
         with pytest.raises(ValueError, match="Unknown archetype 'not_real'"):
@@ -82,6 +86,7 @@ def test_process_linkedin_query_raises_clear_error_for_unknown_archetype():
 
 
 def test_process_linkedin_query_raises_clear_error_for_missing_filter_profile(monkeypatch):
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
     original_configs = scraper.config.ARCHETYPE_CONFIGS
     monkeypatch.setattr(
         scraper.config,

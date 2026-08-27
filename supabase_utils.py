@@ -11,6 +11,8 @@ import unicodedata
 import html
 import json
 from datetime import date, datetime, timezone, timedelta
+import relist_tracking
+import freehire_compat
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -73,6 +75,10 @@ def make_description_fingerprint(description: str) -> str | None:
     if len(normalized) < min_len:
         return None
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def make_description_content_hash(description: str | None) -> str | None:
+    return relist_tracking.make_content_hash(description)
 
 
 def normalize_role_title(title: str) -> str:
@@ -258,6 +264,14 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
     payload["repost_count"] = repost_count
     payload["listing_instances"] = listing_instances
     payload["description_fingerprint"] = make_description_fingerprint(job.get("description"))
+    if job.get("provider") == "linkedin":
+        is_remote, evidence = freehire_compat.classify_remote(payload)
+        payload["is_remote"] = is_remote
+        payload["freehire_remote_evidence"] = evidence
+        payload["freehire_compat_input_hash"] = freehire_compat.compute_classification_hash(payload)
+        payload["freehire_compat_import_hash"] = freehire_compat.compute_import_hash(payload, is_remote=is_remote)
+        payload["freehire_compat_status"] = "pending"
+        payload["freehire_compat_schema_version"] = config.FREEHIRE_COMPAT_SCHEMA_VERSION
     return payload
 
 
@@ -273,7 +287,18 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
         if instance.get("job_id") is not None
     }
     is_new_listing = new_job_id is not None and new_job_id not in known_listing_ids
-    if is_new_listing:
+    relist_date = _date_part(new_job.get("same_id_relist_date") or new_job.get("posted_at"))
+    accepted_same_id_relist = bool(
+        new_job.get("same_id_relist_candidate")
+        and new_job_id in known_listing_ids
+        and relist_date
+        and not any(
+            str(instance.get("job_id")) == new_job_id
+            and _date_part(instance.get("posted_at")) == relist_date
+            for instance in listing_instances
+        )
+    )
+    if is_new_listing or accepted_same_id_relist:
         listing_instances.append(build_listing_instance(new_job))
     elif new_job_id is not None:
         for instance in listing_instances:
@@ -327,10 +352,32 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
         "repost_count": repost_count,
         "listing_instances": listing_instances,
         "detail_metadata_checked_at": new_job.get("detail_metadata_checked_at") or existing.get("detail_metadata_checked_at"),
+        "same_id_relist_count": int(existing.get("same_id_relist_count") or 0) + int(accepted_same_id_relist),
     }
-    if is_new_listing and existing.get("job_state") in {"expired", "removed"}:
+    description = new_job.get("description")
+    if description is not None:
+        content_hash = make_description_content_hash(description)
+        if content_hash and content_hash != make_description_content_hash(existing.get("description")):
+            payload["description"] = description
+            payload["description_fingerprint"] = make_description_fingerprint(description)
+    if (is_new_listing or accepted_same_id_relist) and existing.get("job_state") in {"expired", "removed"}:
         payload["is_active"] = True
         payload["job_state"] = "new"
+    if existing.get("provider") == "linkedin" or new_job.get("provider") == "linkedin":
+        latest_values = {key: value for key, value in new_job.items() if value is not None}
+        merged = {**existing, **latest_values, **payload, "job_id": existing["job_id"]}
+        input_hash = freehire_compat.compute_classification_hash(merged)
+        is_remote, evidence = freehire_compat.classify_remote(merged)
+        payload["is_remote"] = is_remote
+        payload["freehire_remote_evidence"] = evidence
+        payload["freehire_compat_import_hash"] = freehire_compat.compute_import_hash(
+            merged, is_remote=is_remote
+        )
+        if input_hash != existing.get("freehire_compat_input_hash"):
+            payload["freehire_compat_input_hash"] = input_hash
+            payload["freehire_compat_status"] = "pending"
+            payload["freehire_compat_schema_version"] = config.FREEHIRE_COMPAT_SCHEMA_VERSION
+            payload["freehire_compat_error"] = None
     return payload
 
 
@@ -393,7 +440,9 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
                 "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
                 "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
                 "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
-                "is_active, job_state"
+                "is_active, job_state, same_id_relist_count, provider, level, "
+                "freehire_category, freehire_seniority, is_remote, freehire_remote_evidence, "
+                "freehire_compat_status, freehire_compat_input_hash, freehire_compat_import_hash"
             )
             .eq("provider", provider)
             .range(offset, offset + page_size - 1)
@@ -425,30 +474,340 @@ def save_jobs_canonicalized(jobs_data: list):
 
         if match:
             payload = prepare_repost_update_payload(match, job)
-            query = (
-                supabase.table(config.SUPABASE_TABLE_NAME)
-                .update({key: value for key, value in payload.items() if key != "job_id"})
-                .eq("job_id", match["job_id"])
-                .eq("listing_instances", json.dumps(match.get("listing_instances") or []))
+            accepted_relist = bool(
+                job.get("provider") == "linkedin"
+                and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
+                and job.get("same_id_relist_candidate")
             )
-            last_seen_at = match.get("last_seen_at")
-            query = query.is_("last_seen_at", None) if last_seen_at is None else query.eq("last_seen_at", last_seen_at)
-            response = query.execute()
-            if len(response.data or []) != 1:
-                raise RuntimeError(
-                    f"Concurrent canonical update detected for job_id={match['job_id']}"
+            if accepted_relist:
+                apply_accepted_relist(
+                    job,
+                    canonical_job_id=match["job_id"],
+                    projection=payload,
+                    expected_listing_instances=match.get("listing_instances") or [],
+                    expected_last_seen_at=match.get("last_seen_at"),
                 )
+            else:
+                query = (
+                    supabase.table(config.SUPABASE_TABLE_NAME)
+                    .update({key: value for key, value in payload.items() if key != "job_id"})
+                    .eq("job_id", match["job_id"])
+                    .eq("listing_instances", json.dumps(match.get("listing_instances") or []))
+                )
+                last_seen_at = match.get("last_seen_at")
+                query = query.is_("last_seen_at", None) if last_seen_at is None else query.eq("last_seen_at", last_seen_at)
+                response = query.execute()
+                if len(response.data or []) != 1:
+                    raise RuntimeError(
+                        f"Concurrent canonical update detected for job_id={match['job_id']}"
+                    )
+                if job.get("provider") == "linkedin" and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True):
+                    save_listing_content_version(job, canonical_job_id=match["job_id"])
             match.update(payload)
         else:
             payload = prepare_canonical_insert_payload(job)
             save_jobs_to_supabase([payload])
             candidates.append(payload)
+            if job.get("provider") == "linkedin" and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True):
+                save_listing_content_version(job, canonical_job_id=payload["job_id"])
 
 
 def save_linkedin_jobs_canonicalized(jobs_data: list):
     save_jobs_canonicalized(jobs_data)
 
 # --- Supabase Functions ---
+def start_ingestion_run(
+    run_id: str,
+    provider: str,
+    search_query: str | None = None,
+    archetype: str | None = None,
+    filter_profile: str | None = None,
+    query_scope: str | None = None,
+) -> None:
+    supabase.table("ingestion_runs").upsert({
+        "id": run_id,
+        "provider": provider,
+        "search_query": search_query,
+        "archetype": archetype,
+        "filter_profile": filter_profile,
+        "query_scope": query_scope or "",
+    }, on_conflict="id", ignore_duplicates=True).execute()
+
+
+def finish_ingestion_run(run_id: str, **metrics: Any) -> None:
+    payload = {key: value for key, value in metrics.items() if value is not None}
+    payload["finished_at"] = datetime.now(timezone.utc).isoformat()
+    supabase.table("ingestion_runs").update(payload).eq("id", run_id).execute()
+
+
+def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> dict[str, dict]:
+    ids = list(dict.fromkeys(str(job_id) for job_id in source_job_ids if job_id is not None))
+    if not ids:
+        return {}
+    context: dict[str, dict] = {}
+    state_response = (
+        supabase.table("listing_states")
+        .select("source_job_id,canonical_job_id,latest_trusted_posted_date,last_seen_at,same_id_relist_count,pending_relist_on")
+        .eq("provider", provider)
+        .in_("source_job_id", ids)
+        .execute()
+    )
+    for row in state_response.data or []:
+        context[str(row["source_job_id"])] = dict(row)
+    unresolved = set(ids) - set(context)
+    if unresolved:
+        offset = 0
+        while unresolved:
+            response = (
+                supabase.table(config.SUPABASE_TABLE_NAME)
+                .select("job_id,latest_job_id,listing_instances")
+                .eq("provider", provider)
+                .range(offset, offset + 999)
+                .execute()
+            )
+            rows = response.data or []
+            for row in rows:
+                canonical_id = str(row["job_id"])
+                known_ids = {canonical_id, str(row.get("latest_job_id"))}
+                known_ids.update(
+                    str(instance["job_id"])
+                    for instance in (row.get("listing_instances") or [])
+                    if instance.get("job_id") is not None
+                )
+                for source_id in unresolved & known_ids:
+                    context.setdefault(source_id, {})["canonical_job_id"] = canonical_id
+            unresolved -= set(context)
+            if len(rows) < 1000:
+                break
+            offset += 1000
+    by_source: dict[str, list[dict]] = {}
+    offset = 0
+    while True:
+        observations = (
+            supabase.table("listing_observations")
+            .select("source_job_id,posted_at,observed_at,ingestion_run_id,query_scope")
+            .eq("provider", provider)
+            .in_("source_job_id", ids)
+            .order("observed_at", desc=False)
+            .range(offset, offset + 999)
+            .execute()
+        )
+        page = observations.data or []
+        for row in page:
+            by_source.setdefault(str(row["source_job_id"]), []).append(row)
+        if len(page) < 1000:
+            break
+        offset += len(page)
+    for source_id, rows in by_source.items():
+        context.setdefault(source_id, {})["observations"] = rows
+    offset = 0
+    while True:
+        response = (
+            supabase.table("listing_relist_events")
+            .select("source_job_id,relisted_on")
+            .eq("provider", provider)
+            .in_("source_job_id", ids)
+            .is_("superseded_by", "null")
+            .range(offset, offset + 999)
+            .execute()
+        )
+        page = response.data or []
+        for row in page:
+            context.setdefault(str(row["source_job_id"]), {}).setdefault(
+                "accepted_relist_dates", []
+            ).append(_date_part(row.get("relisted_on")))
+        if len(page) < 1000:
+            break
+        offset += len(page)
+    return context
+
+
+def save_listing_observations(
+    cards: list[dict],
+    run_id: str,
+    provider: str = "linkedin",
+    query_scope: str | None = None,
+    canonical_by_source: dict[str, str | None] | None = None,
+) -> dict:
+    canonical_by_source = canonical_by_source or {}
+    observed_at = datetime.now(timezone.utc).isoformat()
+    payloads = []
+    skipped_missing_date = 0
+    for card in cards:
+        source_id = card.get("job_id")
+        posted_at = _date_part(card.get("posted_at"))
+        if source_id is None or posted_at is None:
+            skipped_missing_date += 1
+            continue
+        payloads.append({
+            "provider": provider,
+            "source_job_id": str(source_id),
+            "canonical_job_id": canonical_by_source.get(str(source_id)),
+            "ingestion_run_id": run_id,
+            "observed_at": observed_at,
+            "posted_at": posted_at,
+            "posted_relative_text": card.get("posted_relative_text"),
+            "location": card.get("location"),
+            "card_label": card.get("card_label"),
+            "result": "seen",
+            "query_scope": query_scope,
+            "trigger_evidence": card.get("trigger_evidence") or {},
+        })
+    if payloads:
+        (
+            supabase.table("listing_observations")
+            .upsert(
+                payloads,
+                on_conflict="provider,source_job_id,ingestion_run_id,query_scope,result",
+                ignore_duplicates=True,
+            )
+            .execute()
+        )
+    return {"attempted": len(payloads), "skipped_missing_date": skipped_missing_date}
+
+
+def save_listing_states(
+    cards: list[dict],
+    prior_context: dict[str, dict],
+    canonical_by_source: dict[str, str | None] | None = None,
+    provider: str = "linkedin",
+) -> None:
+    canonical_by_source = canonical_by_source or {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payloads = []
+    for card in cards:
+        source_id = str(card.get("job_id"))
+        posted_at = _date_part(card.get("posted_at"))
+        if source_id == "None" or posted_at is None:
+            continue
+        prior = prior_context.get(source_id) or {}
+        fold = relist_tracking.fold_observations(
+            list(prior.get("observations") or []) + [{
+                "posted_at": posted_at,
+                "observed_at": now_iso,
+                "ingestion_run_id": card.get("scrape_run_id"),
+            }],
+            min_forward_days=getattr(config, "LINKEDIN_RELIST_MIN_FORWARD_DAYS", 2),
+            stable_observations=getattr(config, "LINKEDIN_RELIST_STABLE_OBSERVATIONS", 2),
+        )
+        pending_event = relist_tracking.latest_pending_event(
+            fold, prior.get("accepted_relist_dates")
+        )
+        payloads.append({
+            "provider": provider,
+            "source_job_id": source_id,
+            "canonical_job_id": canonical_by_source.get(source_id) or prior.get("canonical_job_id"),
+            "first_seen_at": prior.get("first_seen_at") or now_iso,
+            "last_seen_at": now_iso,
+            "latest_trusted_posted_date": fold["latest_trusted_posted_date"] or posted_at,
+            "pending_relist_on": (
+                pending_event.get("relisted_on") if pending_event
+                else prior.get("pending_relist_on")
+            ),
+            "same_id_relist_count": max(
+                int(prior.get("same_id_relist_count") or 0),
+                len(prior.get("accepted_relist_dates") or []),
+            ),
+        })
+    if payloads:
+        supabase.table("listing_states").upsert(payloads, on_conflict="provider,source_job_id").execute()
+
+
+def save_listing_content_version(job: dict, canonical_job_id: str | None) -> str | None:
+    description = job.get("description")
+    source_id = job.get("job_id")
+    content_hash = make_description_content_hash(description)
+    if source_id is None or content_hash is None:
+        return None
+    observed_at = job.get("detail_metadata_checked_at") or datetime.now(timezone.utc).isoformat()
+    existing = (
+        supabase.table("listing_content_versions")
+        .select("observation_count,last_ingestion_run_id")
+        .eq("provider", job.get("provider") or "linkedin")
+        .eq("source_job_id", str(source_id))
+        .eq("content_hash", content_hash)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    ingestion_run_id = job.get("scrape_run_id")
+    if existing and ingestion_run_id and existing[0].get("last_ingestion_run_id") != ingestion_run_id:
+        (
+            supabase.table("listing_content_versions")
+            .update({
+                "last_observed_at": observed_at,
+                "observation_count": int(existing[0].get("observation_count") or 1) + 1,
+                "last_ingestion_run_id": ingestion_run_id,
+            })
+            .eq("provider", job.get("provider") or "linkedin")
+            .eq("source_job_id", str(source_id))
+            .eq("content_hash", content_hash)
+            .execute()
+        )
+    elif not existing:
+        supabase.table("listing_content_versions").insert({
+            "provider": job.get("provider") or "linkedin",
+            "source_job_id": str(source_id),
+            "content_hash": content_hash,
+            "canonical_job_id": canonical_job_id,
+            "description": description,
+            "description_fingerprint": make_description_fingerprint(description),
+            "first_observed_at": observed_at,
+            "last_observed_at": observed_at,
+            "last_ingestion_run_id": ingestion_run_id,
+        }).execute()
+    (
+        supabase.table("listing_states")
+        .update({"canonical_job_id": canonical_job_id, "current_content_hash": content_hash})
+        .eq("provider", job.get("provider") or "linkedin")
+        .eq("source_job_id", str(source_id))
+        .execute()
+    )
+    return content_hash
+
+
+def save_relist_event(job: dict, canonical_job_id: str | None) -> None:
+    relisted_on = _date_part(job.get("same_id_relist_date") or job.get("posted_at"))
+    if not relisted_on or job.get("job_id") is None:
+        return
+    supabase.table("listing_relist_events").upsert({
+        "provider": job.get("provider") or "linkedin",
+        "source_job_id": str(job["job_id"]),
+        "canonical_job_id": canonical_job_id,
+        "relisted_on": relisted_on,
+        "observed_at": job.get("detail_metadata_checked_at") or datetime.now(timezone.utc).isoformat(),
+        "ingestion_run_id": job.get("scrape_run_id"),
+        "evidence": job.get("same_id_relist_evidence") or {},
+    }, on_conflict="provider,source_job_id,relisted_on", ignore_duplicates=True).execute()
+
+
+def apply_accepted_relist(
+    job: dict,
+    canonical_job_id: str,
+    projection: dict,
+    expected_listing_instances: list[dict],
+    expected_last_seen_at: str | None,
+) -> None:
+    content_hash = make_description_content_hash(job.get("description"))
+    response = supabase.rpc("apply_linkedin_relist_projection", {
+        "p_canonical_job_id": canonical_job_id,
+        "p_source_job_id": str(job["job_id"]),
+        "p_ingestion_run_id": job.get("scrape_run_id"),
+        "p_relisted_on": _date_part(job.get("same_id_relist_date") or job.get("posted_at")),
+        "p_observed_at": job.get("detail_metadata_checked_at") or datetime.now(timezone.utc).isoformat(),
+        "p_projection": {key: value for key, value in projection.items() if key != "job_id"},
+        "p_expected_listing_instances": expected_listing_instances,
+        "p_expected_last_seen_at": expected_last_seen_at,
+        "p_evidence": job.get("same_id_relist_evidence") or {},
+        "p_description": job.get("description"),
+        "p_content_hash": content_hash,
+        "p_description_fingerprint": make_description_fingerprint(job.get("description")),
+    }).execute()
+    if response.data is not True and response.data != [True]:
+        raise RuntimeError(f"Atomic relist projection rejected for job_id={canonical_job_id}")
+
+
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
     """
     Fetches all existing job IDs and company-title pairs from the Supabase 'jobs' table.
@@ -464,7 +823,7 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
         while True:
             response = (
                 supabase.table(config.SUPABASE_TABLE_NAME)
-                .select("job_id, latest_job_id, company, job_title")
+                .select("job_id, latest_job_id, company, job_title, listing_instances")
                 .range(offset, offset + batch_size - 1)
                 .execute()
             )
@@ -486,11 +845,19 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
                 if latest_job_id:
                     existing_ids.add(str(latest_job_id))
 
+                existing_ids.update(
+                    str(instance["job_id"])
+                    for instance in (item.get("listing_instances") or [])
+                    if instance.get("job_id") is not None
+                )
+
                 if company and job_title:
                     normalized_company = company.strip().lower()
                     normalized_title = job_title.strip().lower()
                     existing_company_title_keys.add((normalized_company, normalized_title))
 
+            if len(data) < batch_size:
+                break
             offset += batch_size
 
         print(f"Fetched {len(existing_ids)} job IDs and {len(existing_company_title_keys)} company-title pairs.")
@@ -596,6 +963,7 @@ def save_jobs_to_supabase(jobs_data: list):
         "repost_count",
         "listing_instances",
         "description_fingerprint",
+        "same_id_relist_count",
         "posted_relative_text",
         "applicant_count",
         "applicant_count_text",
@@ -608,6 +976,24 @@ def save_jobs_to_supabase(jobs_data: list):
         "recruiter_profile_url",
         "recruiter_identifier",
         "detail_metadata_checked_at",
+        "freehire_category",
+        "freehire_seniority",
+        "is_remote",
+        "freehire_remote_evidence",
+        "freehire_compat_status",
+        "freehire_compat_input_hash",
+        "freehire_compat_import_hash",
+        "freehire_compat_model",
+        "freehire_compat_prompt_version",
+        "freehire_compat_schema_version",
+        "freehire_compat_confidence",
+        "freehire_compat_classified_at",
+        "freehire_compat_error",
+        "freehire_compat_attempts",
+        "freehire_compat_claimed_at",
+        "freehire_compat_claimed_by",
+        "freehire_compat_next_retry_at",
+        "freehire_compat_provenance",
     }
     processed_jobs_data = []
     for job in jobs_data:
@@ -1219,8 +1605,7 @@ def download_resume_from_storage(file_name: str = "resume.pdf") -> Optional[byte
 
 def save_base_resume(resume_data: dict) -> bool:
     """
-    Saves (upserts) the parsed base resume JSON to the 'base_resume' table.
-    Deletes any existing rows first to ensure only one base resume exists.
+    Atomically replaces the parsed base resume through a database RPC.
 
     Args:
         resume_data: The parsed resume data as a dictionary.
@@ -1232,24 +1617,16 @@ def save_base_resume(resume_data: dict) -> bool:
         logging.error("No resume data provided to save.")
         return False
 
-    table_name = config.SUPABASE_BASE_RESUME_TABLE_NAME
     try:
-        # Delete any existing base resume rows (there should only be one)
-        logging.info(f"Clearing existing base resume data from '{table_name}'...")
-        supabase.table(table_name).delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-
-        # Insert the new base resume
-        logging.info(f"Saving parsed base resume to '{table_name}'...")
-        response = supabase.table(table_name).insert({
-            "resume_data": resume_data
-        }).execute()
-
-        if response.data and len(response.data) > 0:
-            logging.info(f"Successfully saved base resume to '{table_name}'.")
+        response = supabase.rpc(
+            "replace_base_resume",
+            {"p_resume_data": resume_data},
+        ).execute()
+        if response.data is True or response.data == [True]:
+            logging.info("Successfully replaced base resume atomically.")
             return True
-        else:
-            logging.warning(f"Base resume insert returned no data. Response: {response}")
-            return False
+        logging.error("Base resume replacement returned an unexpected response: %r", response.data)
+        return False
 
     except Exception as e:
         logging.error(f"Error saving base resume to Supabase: {e}", exc_info=True)

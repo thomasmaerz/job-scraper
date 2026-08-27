@@ -4,10 +4,19 @@
 
 BEGIN;
 
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '15min';
+
 -- Step 1: Drop foreign key constraints
 ALTER TABLE IF EXISTS "public"."jobs" DROP CONSTRAINT IF EXISTS jobs_customized_resume_id_fkey;
 
 -- Step 2: Drop job-scraper tables (CASCADE will handle indexes)
+DROP VIEW IF EXISTS "public"."freehire_jobs" CASCADE;
+DROP TABLE IF EXISTS "public"."listing_relist_events" CASCADE;
+DROP TABLE IF EXISTS "public"."listing_content_versions" CASCADE;
+DROP TABLE IF EXISTS "public"."listing_observations" CASCADE;
+DROP TABLE IF EXISTS "public"."listing_states" CASCADE;
+DROP TABLE IF EXISTS "public"."ingestion_runs" CASCADE;
 DROP TABLE IF EXISTS "public"."job_repost_merge_plan" CASCADE;
 DROP TABLE IF EXISTS "public"."job_resume_links" CASCADE;
 DROP TABLE IF EXISTS "public"."job_listing_archive" CASCADE;
@@ -30,6 +39,7 @@ DROP FUNCTION IF EXISTS "public"."update_last_updated_column"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."update_base_resume_updated_at_column"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."merge_historical_repost_plan"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."calculate_listing_posting_waves"(jsonb) CASCADE;
+DROP FUNCTION IF EXISTS "public"."prevent_listing_observation_mutation"() CASCADE;
 
 -- Step 4: Drop storage bucket for personalized_resumes
 DELETE FROM storage.objects WHERE bucket_id = 'personalized_resumes';

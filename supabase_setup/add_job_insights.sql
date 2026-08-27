@@ -1,6 +1,11 @@
 -- Job insights analysis schema migration.
 -- Run this once in Supabase SQL Editor for existing databases.
 
+BEGIN;
+
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '15min';
+
 ALTER TABLE "public"."jobs"
 ADD COLUMN IF NOT EXISTS "insights_analyzed_at" timestamp with time zone;
 
@@ -126,3 +131,5 @@ GRANT ALL ON TABLE "public"."keyword_insights" TO "service_role";
 GRANT ALL ON TABLE "public"."job_keyword_insights" TO "anon";
 GRANT ALL ON TABLE "public"."job_keyword_insights" TO "authenticated";
 GRANT ALL ON TABLE "public"."job_keyword_insights" TO "service_role";
+
+COMMIT;

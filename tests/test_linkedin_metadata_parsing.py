@@ -5,6 +5,10 @@ from bs4 import BeautifulSoup
 import scraper
 
 
+def _disable_relist_tracking(monkeypatch):
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
+
+
 def test_extract_search_card_metadata():
     html = Path("tests/fixtures/linkedin_search_results.html").read_text()
     soup = BeautifulSoup(html, "html.parser")
@@ -65,6 +69,7 @@ def test_parse_salary_rejects_project_budget_ranges():
 
 
 def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
+    _disable_relist_tracking(monkeypatch)
     cards = [{"job_id": "123", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
 
     monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location, posting_date_filter=None: cards)
@@ -87,6 +92,7 @@ def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
 
 
 def test_process_linkedin_query_skips_ids_already_seen_as_latest_job_id(monkeypatch):
+    _disable_relist_tracking(monkeypatch)
     cards = [{"job_id": "linkedin-live-99", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
     fetched_job_ids = []
 
@@ -110,6 +116,7 @@ def test_process_linkedin_query_skips_ids_already_seen_as_latest_job_id(monkeypa
 
 
 def test_existing_job_with_stale_metadata_is_refetched(monkeypatch):
+    _disable_relist_tracking(monkeypatch)
     monkeypatch.setattr(
         scraper,
         "_fetch_linkedin_job_ids",

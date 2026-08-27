@@ -3,6 +3,13 @@ name: Parse Resume Manually
 on:
   workflow_dispatch:
 
+concurrency:
+  group: parse-base-resume
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   parse_resume_job:
     runs-on: ubuntu-latest

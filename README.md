@@ -136,6 +136,7 @@ Once the setup is complete and GitHub Actions are enabled, the workflows defined
 - **`score_jobs.yml`**: Periodically scores the newly scraped jobs and jobs with custom resumes against your parsed resume / custom resume and updates the scores in the database.
 - **`job_manager.yml`**: Periodically manages job statuses (e.g., marks old jobs as expired, checks if active jobs are still available).
 - **`analyze_jobs.yml`**: Runs `analyze_jobs.py` on a schedule or manually to extract recurring market keywords from unanalyzed jobs and update `keyword_insights`. Manual dispatch also supports a `drain_backlog` input to keep processing until no eligible unanalyzed jobs remain.
+- **`freehire_compat.yml`**: Frontfills pending or changed LinkedIn rows after scraping and every four hours using strict token-budgeted Freehire category batches. Manual dispatch supports bounded, draining, and replacement passes.
 - **`hourly_resume_customization.yml`**: (If enabled and configured) May run tasks related to customizing resumes for specific jobs.
 
 You can monitor the execution of these actions in the "Actions" tab of your repository.
@@ -155,6 +156,14 @@ A Next.js web application is available to view and manage the scraped jobs, your
 - **Insights UI:** The companion `zeroluck/job-scraper-web` application displays records from `keyword_insights` on its Insights page. The `job_keyword_insights` table provides idempotent per-job source facts behind those aggregates. The UI category tabs are a client-side refinement only; they do not replace server-side archetype scoping in the underlying Supabase query or RPC.
 
 The individual Python scripts can still be run locally for development or testing, but this requires setting up a local Python environment, installing dependencies from `requirements.txt`, and creating a local `.env` file with the necessary credentials (mirroring the GitHub secrets).
+
+### Freehire compatibility contract
+
+Apply `supabase_setup/add_freehire_compat.sql` before enabling the frontfill. `public.freehire_jobs` is the service-role-only publication contract. It keeps canonical `job_id` as downstream identity, exposes `COALESCE(latest_job_id, job_id)` as `live_listing_id`, preserves source timestamps and metadata sidecars, and excludes candidate workflow/resume fields. Only LinkedIn rows with `freehire_compat_status='current'` and a pinned category are published; pending, processing, and failed rows are excluded. The current-status view is a persisted hash/version contract: consumers must not republish independently from raw `public.jobs`, and should compare `freehire_compat_import_hash` during complete keyset sweeps.
+
+`is_remote` is true only for standalone visible-text `remote`; it is never inferred. `freehire_compat_input_hash` binds classification to canonical normalized title, visible description, location, LinkedIn level, canonical `job_id`, and schema/taxonomy version. `freehire_compat_import_hash` tracks every published source/projection, classification, deterministic remote, live-ID, and effective timestamp field. Claims and writes compare the expected database source snapshot, and workers reread the claimed row before classification. `backfill_freehire_compat.py` performs a complete bounded keyset sweep and defaults to dry-run; use `--apply` only after reviewing counts.
+
+The downstream private Freehire derive/restore implementation remains a dependency outside this repository. Run source classification and preservation before derive, then order restoration as `derive -> linkedin-restore -> workbc-restore -> reindex -> supabase_out`. Restore only hash-matched source facets; keep `external_id=job_id` and use `latest_job_id` only for the live URL. This repository does not modify stock Freehire. The unrelated WorkBC `closed_reason='missing'` constraint failure and `supabase_out` datetime JSON serialization failure are explicitly out of scope.
 
 **Local Development Setup (Optional):**
 
@@ -220,6 +229,12 @@ The individual Python scripts can still be run locally for development or testin
 - Recruiter-only changes and multiple source IDs in one wave are `simultaneous_variant` instances and do not increment `repost_count`.
 - Exact normalized locations are required for automatic canonical matching. Cross-location records are not silently merged. Historical grouped data can retain `location_variant` instances, which remain outside `repost_count`.
 - Every new instance stores `location`, `normalized_location`, `posting_wave_key`, `posting_wave_index`, and `variant_type`. Missing historical locations remain null unless recovered from an archived source snapshot.
+- Guest search cards are recorded before known-ID filtering in append-only `listing_observations`, scoped to an `ingestion_runs` row. Replaying one run is idempotent, while failed or partial coverage remains explicit and cannot prove that a listing disappeared.
+- A known ID becomes a relist detail candidate only after its stable card date moves forward by at least two calendar days. At least two observations must establish the prior date. One-day moves, backward dates, and late/out-of-order dates remain auditable corrections and never create relist events.
+- Detail work reserves bounded capacity for accepted-but-unprojected same-ID relists before new IDs, then handles stale metadata. Pending relists remain durable in `listing_states.pending_relist_on` and are retried after failed or deferred detail fetches. `LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY` and `LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN` cap relist detail requests; the existing guest detail retry and User-Agent path is reused.
+- Exact description hashes are stored in `listing_content_versions`. New hashes retain one full version and update the canonical description/fingerprint; unchanged hashes update version timestamps and observation count only. Description edits alone are content edits, not relists.
+- Accepted `listing_relist_events` are deterministic lower-bound evidence. `same_id_relist_count` means "relisted at least once" rather than an exact historical count. Same-ID evidence joins the location/date posting-wave fold without increasing distinct-ID `seen_count` or double-counting a simultaneous new-ID variant.
+- `ENABLE_LINKEDIN_RELIST_TRACKING=false` is the observation kill switch; `ENABLE_LINKEDIN_RELIST_EFFECTS=false` keeps shadow collection while suppressing same-ID relist effects.
 
 Apply `supabase_setup/add_posting_wave_semantics.sql` before deploying code that writes `posting_wave_count`. Then inspect the idempotent repair dry run:
 
@@ -234,6 +249,14 @@ python repair_repost_history.py --apply
 ```
 
 The repair reads archived source snapshots when available, preserves every distinct source ID, fills only recoverable locations, and recalculates wave annotations and counts. Do not run the migration or `--apply` command against production without explicit authorization.
+
+Apply `supabase_setup/add_same_id_relist_tracking.sql` before enabling observation writes. Review the same-ID repair in dry-run mode:
+
+```bash
+python backfill_same_id_relists.py --limit 500
+```
+
+Only reviewed output should be applied with `--apply`. The repair uses stored observations and listing instances only, is idempotent, and cannot invent intermediate relists, employer intent, or missing evidence. Scope is prospective guest-card detection plus an honest lower-bound backfill; authenticated LinkedIn scraping is explicitly excluded.
 
 After the archive repair, unresolved LinkedIn source IDs can be sampled with a conservative dry run:
 
@@ -275,12 +298,16 @@ For one-off recovery, run the scraper workflow with `lookback_hours=96` or `168`
 ├── .github/                    # GitHub Actions workflows
 │   └── workflows/
 │       ├── analyze_jobs.yml
+│       ├── freehire_compat.yml
 │       ├── hourly_resume_customization.yml
 │       ├── job_manager.yml
 │       ├── parse_resume.yml
 │       ├── score_jobs.yml
 │       └── scrape_jobs.yml
 ├── analyze_jobs.py              # Extracts recurring keyword insights from new jobs
+├── backfill_freehire_compat.py   # Dry-run-default compatibility sweep and classifier
+├── freehire_compat.py            # Shared deterministic and LLM compatibility contract
+├── frontfill_freehire_compat.py  # Continuous pending-row compatibility worker
 ├── .gitignore                  # Specifies intentionally untracked files that Git should ignore
 ├── README.md                   # This file
 ├── config.py                   # Configuration settings (API keys, search parameters)

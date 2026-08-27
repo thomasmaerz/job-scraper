@@ -1,5 +1,8 @@
 BEGIN;
 
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '15min';
+
 ALTER TABLE public.jobs
     ADD COLUMN IF NOT EXISTS posting_wave_count integer NOT NULL DEFAULT 1;
 
@@ -16,7 +19,7 @@ CREATE OR REPLACE FUNCTION public.calculate_listing_posting_waves(instances json
 RETURNS TABLE(listing_instances jsonb, posting_wave_count integer, repost_count integer)
 LANGUAGE sql
 IMMUTABLE
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 WITH RECURSIVE source AS (
     SELECT
@@ -160,7 +163,7 @@ SELECT
 FROM result;
 $$;
 
-REVOKE ALL ON FUNCTION public.calculate_listing_posting_waves(jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.calculate_listing_posting_waves(jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.calculate_listing_posting_waves(jsonb) TO service_role;
 
 COMMIT;

@@ -19,7 +19,7 @@ on:
           - "168"
 
 concurrency:
-  group: daily-job-scraper
+  group: linkedin-freehire-pipeline
   cancel-in-progress: false
 
 permissions:
@@ -60,3 +60,15 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python scraper.py
+
+      - name: Frontfill Freehire compatibility
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || secrets.GEMINI_FIRST_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          FREEHIRE_DRAIN_BACKLOG: "false"
+          FREEHIRE_CLASSIFY_LIMIT: "100"
+        run: python frontfill_freehire_compat.py

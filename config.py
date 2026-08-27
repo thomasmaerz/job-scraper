@@ -171,6 +171,63 @@ JOB_INSIGHTS_MODEL_CHAIN = [
     "gemini/gemini-3-flash-preview",
 ]
 
+FREEHIRE_CATEGORIES = frozenset({
+    "software_engineering", "backend", "frontend", "fullstack", "mobile",
+    "devops", "sre", "network_engineering", "data_engineering", "data_science",
+    "data_analytics", "ml_ai", "ai_engineering", "qa", "security", "hardware",
+    "embedded", "blockchain", "architecture", "design", "engineering_design",
+    "product", "project_management", "management", "marketing", "sales",
+    "support", "business_analysis", "solutions_engineering", "developer_relations",
+    "technical_writing", "recruiting", "hr", "finance", "legal", "operations",
+    "customer_success", "other",
+})
+FREEHIRE_SENIORITY_LEVELS = frozenset({
+    "", "intern", "junior", "middle", "senior", "lead", "staff", "principal", "c_level",
+})
+FREEHIRE_COMPAT_SCHEMA_VERSION = "freehire-compat-v1"
+FREEHIRE_COMPAT_PROMPT_VERSION = "freehire-category-v1"
+FREEHIRE_CLASSIFY_MODEL_CHAIN = JOB_INSIGHTS_MODEL_CHAIN
+FREEHIRE_INPUT_TOKEN_BUDGET = max(
+    1000, int(os.environ.get("FREEHIRE_INPUT_TOKEN_BUDGET", "32000"))
+)
+FREEHIRE_MAX_BATCH_JOBS = min(
+    50, max(1, int(os.environ.get("FREEHIRE_MAX_BATCH_JOBS", "50")))
+)
+FREEHIRE_DESCRIPTION_MAX_CHARS = max(
+    1000, int(os.environ.get("FREEHIRE_DESCRIPTION_MAX_CHARS", "12000"))
+)
+FREEHIRE_CHARS_PER_TOKEN = max(
+    1.0, float(os.environ.get("FREEHIRE_CHARS_PER_TOKEN", "4"))
+)
+FREEHIRE_OUTPUT_TOKENS_PER_JOB = max(
+    20, int(os.environ.get("FREEHIRE_OUTPUT_TOKENS_PER_JOB", "60"))
+)
+FREEHIRE_CLASSIFY_MAX_RETRIES = max(
+    1, int(os.environ.get("FREEHIRE_CLASSIFY_MAX_RETRIES", "3"))
+)
+FREEHIRE_CLASSIFY_RETRY_BASE_SECONDS = max(
+    0.0, float(os.environ.get("FREEHIRE_CLASSIFY_RETRY_BASE_SECONDS", "2"))
+)
+FREEHIRE_CLASSIFY_PAGE_SIZE = max(
+    1, int(os.environ.get("FREEHIRE_CLASSIFY_PAGE_SIZE", "500"))
+)
+FREEHIRE_CLASSIFY_LIMIT = max(
+    1, int(os.environ.get("FREEHIRE_CLASSIFY_LIMIT", "200"))
+)
+FREEHIRE_CLASSIFY_REQUEST_BUDGET = max(
+    1, int(os.environ.get("FREEHIRE_CLASSIFY_REQUEST_BUDGET", "40"))
+)
+FREEHIRE_CLASSIFY_MAX_DURABLE_ATTEMPTS = max(
+    1, int(os.environ.get("FREEHIRE_CLASSIFY_MAX_DURABLE_ATTEMPTS", "6"))
+)
+FREEHIRE_CLASSIFY_RETRY_COOLDOWN_MINUTES = max(
+    1, int(os.environ.get("FREEHIRE_CLASSIFY_RETRY_COOLDOWN_MINUTES", "30"))
+)
+FREEHIRE_CLASSIFY_RETRY_COOLDOWN_MAX_MINUTES = max(
+    FREEHIRE_CLASSIFY_RETRY_COOLDOWN_MINUTES,
+    int(os.environ.get("FREEHIRE_CLASSIFY_RETRY_COOLDOWN_MAX_MINUTES", "1440")),
+)
+
 # --- Job Insights Analysis ---
 JOB_INSIGHTS_MAX_JOBS = 700
 JOB_INSIGHTS_BATCH_SIZE = 10
@@ -196,6 +253,20 @@ ENABLE_REPOST_DEDUP = True
 DESCRIPTION_FINGERPRINT_MIN_LENGTH = 500
 REPOST_DESCRIPTION_SIMILARITY_THRESHOLD = 0.90
 LINKEDIN_METADATA_ENRICH_LIMIT_PER_QUERY = 5
+ENABLE_LINKEDIN_RELIST_TRACKING = os.environ.get("ENABLE_LINKEDIN_RELIST_TRACKING", "true").lower() == "true"
+ENABLE_LINKEDIN_RELIST_EFFECTS = os.environ.get("ENABLE_LINKEDIN_RELIST_EFFECTS", "true").lower() == "true"
+LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY = max(
+    0, int(os.environ.get("LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY", "3"))
+)
+LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN = max(
+    0, int(os.environ.get("LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", "20"))
+)
+LINKEDIN_RELIST_MIN_FORWARD_DAYS = max(
+    2, int(os.environ.get("LINKEDIN_RELIST_MIN_FORWARD_DAYS", "2"))
+)
+LINKEDIN_RELIST_STABLE_OBSERVATIONS = max(
+    2, int(os.environ.get("LINKEDIN_RELIST_STABLE_OBSERVATIONS", "2"))
+)
 
 TITLE_NORMALIZATION_REPLACEMENTS = {
     "sr.": "senior",

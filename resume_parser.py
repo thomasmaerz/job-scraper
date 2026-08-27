@@ -1,10 +1,142 @@
 import pdfplumber
 import config
 import json
+import logging
 import models
+import re
 import sys
 import time
 from llm_client import primary_client
+from pydantic import ValidationError
+
+
+logger = logging.getLogger(__name__)
+
+TRUNCATED_OUTPUT = "truncated_output"
+INVALID_JSON = "invalid_json"
+SCHEMA_VALIDATION_FAILED = "schema_validation_failed"
+
+
+class ResumeParseError(ValueError):
+    def __init__(self, category, stage, detail):
+        super().__init__(detail)
+        self.category = category
+        self.stage = stage
+        self.detail = detail
+
+
+def _find_object_end(text, start):
+    stack = []
+    in_string = False
+    escaped = False
+
+    for index in range(start, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+
+        if character == '"':
+            in_string = True
+        elif character in "{[":
+            stack.append(character)
+        elif character in "}]":
+            expected = "{" if character == "}" else "["
+            if not stack or stack[-1] != expected:
+                return index + 1
+            stack.pop()
+            if not stack:
+                return index + 1
+
+    return None
+
+
+def extract_first_json_object(response_text):
+    """Extract the first complete, valid top-level JSON object from LLM text."""
+    if not isinstance(response_text, str) or not response_text.strip():
+        raise ResumeParseError(INVALID_JSON, "extraction", "empty response")
+
+    search_from = 0
+    found_object_start = False
+    last_decode_error = None
+
+    while True:
+        start = response_text.find("{", search_from)
+        if start == -1:
+            break
+
+        following_text = response_text[start + 1:].lstrip()
+        if following_text and not following_text.startswith(('"', '}')):
+            search_from = start + 1
+            continue
+
+        found_object_start = True
+        end = _find_object_end(response_text, start)
+        if end is None:
+            raise ResumeParseError(
+                TRUNCATED_OUTPUT,
+                "extraction",
+                "JSON object was not closed before the response ended",
+            )
+
+        candidate = response_text[start:end]
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError as error:
+            last_decode_error = error
+            search_from = end
+            continue
+
+        if isinstance(decoded, dict):
+            return candidate
+        search_from = end
+
+    if found_object_start and last_decode_error is not None:
+        detail = f"JSON decoding failed at position {last_decode_error.pos}"
+    else:
+        detail = "response did not contain a JSON object"
+    raise ResumeParseError(INVALID_JSON, "json_decode", detail)
+
+
+def _sanitize_payload_snippet(payload, limit=160):
+    if not isinstance(payload, str):
+        return "<empty>"
+
+    snippet = " ".join(payload.split())
+    snippet = re.sub(r"[\w@.+/-]+", "<text>", snippet)
+    return snippet[:limit]
+
+
+def _log_parse_failure(error, payload, attempt, max_retries):
+    response_length = len(payload) if isinstance(payload, str) else 0
+    model_name = getattr(primary_client, "model", "unknown")
+    snippet = _sanitize_payload_snippet(payload)
+    logger.warning(
+        "Resume parse failed: category=%s stage=%s attempt=%s/%s "
+        "response_length=%s model=%s payload_snippet=%s",
+        error.category,
+        error.stage,
+        attempt,
+        max_retries,
+        response_length,
+        model_name,
+        snippet,
+        extra={
+            "event": "resume_parse_failure",
+            "parse_category": error.category,
+            "parse_stage": error.stage,
+            "attempt": attempt,
+            "max_attempts": max_retries,
+            "response_length": response_length,
+            "llm_model": model_name,
+            "payload_snippet": snippet,
+        },
+    )
 
 def extract_text_from_pdf(pdf_path):
     """
@@ -87,19 +219,51 @@ def parse_and_validate_resume(resume_text, max_retries=config.MAX_RETRIES):
     """
     for attempt in range(max_retries):
         parsed_resume_details_str = parse_resume_with_ai(resume_text)
-        
-        if not parsed_resume_details_str:
-            print(f"Attempt {attempt + 1}: Received empty response from AI. Retrying...")
-            time.sleep(config.RETRY_DELAY_SECONDS)
-            continue
-            
+
         try:
-            resume_data_dict = json.loads(parsed_resume_details_str)
-            return replace_empty_with_na(resume_data_dict)
-        except json.JSONDecodeError as e:
-            print(f"Attempt {attempt + 1}: JSON decode error: {e}. Retrying...")
+            json_object = extract_first_json_object(parsed_resume_details_str)
+            resume_data_dict = replace_empty_with_na(json.loads(json_object))
+            validated = models.Resume.model_validate(resume_data_dict)
+            meaningful_fields = (
+                validated.name,
+                validated.email,
+                validated.phone,
+                validated.summary,
+                validated.skills,
+                validated.education,
+                validated.experience,
+                validated.projects,
+                validated.certifications,
+            )
+            if not any(value and value != "NA" for value in meaningful_fields):
+                raise ResumeParseError(
+                    SCHEMA_VALIDATION_FAILED,
+                    "usability_validation",
+                    "Resume payload contains no usable identity, contact, or history data",
+                )
+            return replace_empty_with_na(validated.model_dump())
+        except ValidationError as error:
+            parse_error = ResumeParseError(
+                SCHEMA_VALIDATION_FAILED,
+                "schema_validation",
+                f"Resume validation failed with {error.error_count()} error(s)",
+            )
+        except ResumeParseError as error:
+            parse_error = error
+
+        _log_parse_failure(
+            parse_error,
+            parsed_resume_details_str,
+            attempt + 1,
+            max_retries,
+        )
+        print(
+            f"Attempt {attempt + 1}: Resume parse failed "
+            f"({parse_error.category}). Retrying..."
+        )
+        if attempt < max_retries - 1:
             time.sleep(config.RETRY_DELAY_SECONDS)
-            
+
     print(f"ERROR: Failed to parse resume after {max_retries} attempts.")
     sys.exit(1)
 
@@ -128,13 +292,13 @@ def main():
     else:
         print("ERROR: Could not find resume.pdf in Supabase Storage or locally.")
         print("Please upload your resume.pdf to the 'resumes' bucket in your Supabase Storage dashboard.")
-        return
+        raise RuntimeError("Could not find resume.pdf in storage or locally")
 
     # 2. Extract text from PDF
     resume_text = extract_text_from_pdf(pdf_file_path)
     if not resume_text:
         print("Failed to extract text. Exiting.")
-        return
+        raise RuntimeError("Resume PDF contains no extractable text")
 
     # 3. Parse resume text with AI
     resume_data_dict = parse_and_validate_resume(resume_text)
@@ -144,7 +308,7 @@ def main():
     if save_success:
         print("Successfully saved parsed resume to Supabase database.")
     else:
-        print("WARNING: Failed to save parsed resume to Supabase database.")
+        raise RuntimeError("Failed to save parsed resume to Supabase database")
 
     # 5. Also save to local JSON file (for development/fallback)
     output_path = config.BASE_RESUME_PATH

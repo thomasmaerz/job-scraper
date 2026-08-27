@@ -1,7 +1,36 @@
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _jobs_columns(init_sql):
+    create_table = re.search(
+        r'CREATE TABLE IF NOT EXISTS "public"\."jobs" \((.*?)\n\);',
+        init_sql,
+        re.DOTALL,
+    ).group(1)
+    columns = set(re.findall(r'^\s*"([a-z_]+)"\s+', create_table, re.MULTILINE))
+    columns.update(re.findall(r'ADD COLUMN IF NOT EXISTS "([a-z_]+)"', init_sql))
+    return columns
+
+
+def _freehire_view_source_columns(sql):
+    view = re.search(
+        r'CREATE OR REPLACE VIEW\s+(?:"public"|public)\.(?:"freehire_jobs"|freehire_jobs)\s+AS\s+'
+        r'SELECT(.*?)FROM\s+(?:"public"|public)\.(?:"jobs"|jobs)(.*?);',
+        sql,
+        re.DOTALL | re.IGNORECASE,
+    )
+    select, filters = view.groups()
+    aliases = set(re.findall(r'\bAS\s+"?([a-z_]+)"?', select, re.IGNORECASE))
+    references = re.sub(r"'[^']*'", "", select + filters)
+    identifiers = {
+        quoted or bare
+        for quoted, bare in re.findall(r'"([a-z_]+)"|\b([a-z_]+)\b', references)
+    }
+    return identifiers - aliases - {"and", "coalesce", "is", "not", "null", "where"}
 
 
 def test_cleanup_sql_drops_job_keyword_insights_table():
@@ -224,6 +253,18 @@ def test_freehire_contract_migration_has_pinned_checks_and_safe_publication_view
     for private_field in ("application_date", "resume_score", "is_interested", "customized_resume_id"):
         view = sql.split("CREATE OR REPLACE VIEW public.freehire_jobs AS", 1)[1]
         assert private_field not in view
+
+
+def test_freehire_view_sources_exist_in_jobs_ddl_and_match_init():
+    init_sql = (ROOT / "supabase_setup" / "init.sql").read_text()
+    migration_sql = (ROOT / "supabase_setup" / "add_freehire_compat.sql").read_text()
+    jobs_columns = _jobs_columns(init_sql)
+    init_sources = _freehire_view_source_columns(init_sql)
+    migration_sources = _freehire_view_source_columns(migration_sql)
+
+    assert init_sources <= jobs_columns, init_sources - jobs_columns
+    assert migration_sources <= jobs_columns, migration_sources - jobs_columns
+    assert migration_sources == init_sources
 
 
 def test_remediation_migrations_are_transactional_and_define_atomic_rpcs():

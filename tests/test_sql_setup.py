@@ -74,6 +74,35 @@ def test_scrape_run_state_migration_is_idempotent_and_private():
     assert "GRANT ALL ON TABLE public.scrape_run_state TO service_role" in sql
 
 
+def test_scrape_success_rpc_is_secure_idempotent_and_service_role_only():
+    for filename in ("init.sql", "add_scrape_run_state.sql"):
+        sql = (ROOT / "supabase_setup" / filename).read_text()
+        normalized = sql.replace('"', "").lower()
+
+        assert "create or replace function public.record_scrape_success" in normalized
+        assert "p_finished_at timestamp with time zone" in normalized or (
+            "p_finished_at timestamptz" in normalized
+        )
+        assert "returns timestamp with time zone" in normalized or "returns timestamptz" in normalized
+        assert "security definer" in normalized
+        assert "set search_path = pg_catalog" in normalized
+        assert "insert into public.scrape_run_state (id, last_successful_scrape_at)" in normalized
+        assert "values (1, p_finished_at)" in normalized
+        assert "on conflict (id) do update" in normalized
+        assert "returning last_successful_scrape_at into persisted_at" in normalized
+        assert re.search(
+            r"revoke all on function public\.record_scrape_success\("
+            r"(?:timestamp with time zone|timestamptz)\) from public, anon, authenticated;",
+            normalized,
+        )
+        assert re.search(
+            r"grant execute on function public\.record_scrape_success\("
+            r"(?:timestamp with time zone|timestamptz)\) to service_role;",
+            normalized,
+        )
+        assert "p_run_id" not in normalized
+
+
 def test_scrape_run_state_policy_does_not_broaden_other_internal_tables():
     for filename in ("init.sql", "add_scrape_run_state.sql"):
         sql = (ROOT / "supabase_setup" / filename).read_text()

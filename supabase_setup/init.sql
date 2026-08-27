@@ -203,6 +203,29 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION "public"."record_scrape_success"("p_finished_at" timestamp with time zone)
+RETURNS timestamp with time zone
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog
+AS $$
+DECLARE
+    persisted_at timestamp with time zone;
+BEGIN
+    IF p_finished_at IS NULL THEN
+        RAISE EXCEPTION 'p_finished_at must not be null' USING ERRCODE = '22004';
+    END IF;
+
+    INSERT INTO public.scrape_run_state (id, last_successful_scrape_at)
+    VALUES (1, p_finished_at)
+    ON CONFLICT (id) DO UPDATE
+    SET last_successful_scrape_at = EXCLUDED.last_successful_scrape_at
+    RETURNING last_successful_scrape_at INTO persisted_at;
+
+    RETURN persisted_at;
+END;
+$$;
+
 DROP TRIGGER IF EXISTS "listing_observations_append_only" ON "public"."listing_observations";
 CREATE TRIGGER "listing_observations_append_only" BEFORE UPDATE OR DELETE ON "public"."listing_observations"
     FOR EACH ROW EXECUTE FUNCTION "public"."prevent_listing_observation_mutation"();
@@ -235,6 +258,9 @@ GRANT SELECT, INSERT ON TABLE "public"."listing_observations" TO service_role;
 GRANT ALL ON TABLE "public"."listing_content_versions" TO service_role;
 GRANT SELECT, INSERT, UPDATE ON TABLE "public"."listing_relist_events" TO service_role;
 GRANT ALL ON TABLE "public"."listing_states" TO service_role;
+
+REVOKE ALL ON FUNCTION "public"."record_scrape_success"(timestamp with time zone) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION "public"."record_scrape_success"(timestamp with time zone) TO service_role;
 
 INSERT INTO "public"."scrape_run_state" ("id")
 VALUES (1)

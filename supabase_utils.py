@@ -665,6 +665,11 @@ def _scrape_run_state_matches(finished_at: str) -> bool:
         return False
 
     persisted_at = rows[0].get("last_successful_scrape_at")
+    return _scrape_timestamps_match(persisted_at, finished_at)
+
+
+def _scrape_timestamps_match(persisted_at: Any, finished_at: str) -> bool:
+    """Compare timestamp values as instants despite Postgres formatting changes."""
     if persisted_at == finished_at:
         return True
     try:
@@ -677,9 +682,29 @@ def _scrape_run_state_matches(finished_at: str) -> bool:
         return False
 
 
-def record_scrape_success() -> bool:
-    """Persist the required top-level scraper watermark in scrape_run_state."""
-    finished_at = datetime.now(timezone.utc).isoformat()
+def _rpc_timestamp(data: Any) -> Any:
+    """Unwrap scalar RPC results across PostgREST client response shapes."""
+    if isinstance(data, Mapping):
+        return data.get("record_scrape_success")
+    if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        if len(data) != 1:
+            return None
+        return _rpc_timestamp(data[0])
+    return data
+
+
+def _record_scrape_success_rpc_is_absent(error: Exception) -> bool:
+    """Only permit the legacy direct-write fallback for a missing RPC."""
+    if isinstance(error, AttributeError) and "rpc" in str(error):
+        return True
+    code = getattr(error, "code", None)
+    if code is None and error.args and isinstance(error.args[0], Mapping):
+        code = error.args[0].get("code")
+    return code == "PGRST202"
+
+
+def _record_scrape_success_direct(finished_at: str) -> bool:
+    """Write directly for deployments that have not installed the RPC yet."""
     payload = {"last_successful_scrape_at": finished_at}
 
     try:
@@ -712,6 +737,39 @@ def record_scrape_success() -> bool:
 
     logging.error("Scrape success watermark did not match after update and upsert")
     return False
+
+
+def record_scrape_success() -> bool:
+    """Persist and verify the required top-level scraper watermark."""
+    finished_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        response = supabase.rpc(
+            "record_scrape_success",
+            {"p_finished_at": finished_at},
+        ).execute()
+    except Exception as error:
+        if _record_scrape_success_rpc_is_absent(error):
+            logging.warning(
+                "record_scrape_success RPC is absent; using legacy direct watermark write"
+            )
+            return _record_scrape_success_direct(finished_at)
+        logging.error("Failed to persist scrape success watermark via RPC: %s", error)
+        return False
+
+    returned_at = _rpc_timestamp(response.data)
+    if not _scrape_timestamps_match(returned_at, finished_at):
+        logging.error(
+            "record_scrape_success RPC returned an unexpected timestamp: %r",
+            returned_at,
+        )
+        return False
+
+    if not _scrape_run_state_matches(finished_at):
+        logging.error("Scrape success watermark did not match after RPC write")
+        return False
+
+    return True
 
 
 def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> dict[str, dict]:

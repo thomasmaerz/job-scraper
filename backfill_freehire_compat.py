@@ -274,26 +274,44 @@ def run(
     return counts
 
 
-if __name__ == "__main__":
-    def positive_int(value: str) -> int:
-        parsed = int(value)
-        if parsed <= 0:
-            raise argparse.ArgumentTypeError("must be a positive integer")
-        return parsed
+def result_status(result: dict) -> str:
+    if result.get("failed", 0) and not result.get("classified", 0):
+        return "all_failed"
+    if result.get("failed", 0):
+        return "partial_success"
+    return "success"
 
+
+def result_exit_code(result: dict) -> int:
+    """Return nonzero only when all attempted classifications failed."""
+    return int(result_status(result) == "all_failed")
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--limit", type=positive_int, default=int(os.getenv("FREEHIRE_CLASSIFY_LIMIT", config.FREEHIRE_CLASSIFY_LIMIT)))
     parser.add_argument("--drain-backlog", action="store_true", default=os.getenv("FREEHIRE_DRAIN_BACKLOG", "false").lower() == "true")
     parser.add_argument("--replacement-backfill", action="store_true", default=os.getenv("FREEHIRE_REPLACEMENT_BACKFILL", "false").lower() == "true")
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parser.parse_args(argv)
     result = run(
         apply=args.apply,
         limit=args.limit,
         drain_backlog=args.drain_backlog,
         replacement_backfill=args.replacement_backfill,
     )
+    logging.info("Freehire compatibility status=%s stats=%s", result_status(result), result)
     print(result)
-    if args.apply and result["failed"]:
-        raise SystemExit(1)
+    return result_exit_code(result) if args.apply else 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    raise SystemExit(main())

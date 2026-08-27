@@ -19,6 +19,10 @@ if __name__ == "__main__":
         limit=limit,
         drain_backlog=os.getenv("FREEHIRE_DRAIN_BACKLOG", "false").lower() == "true",
     )
+    logging.info(
+        "Freehire compatibility status=%s stats=%s",
+        backfill_freehire_compat.result_status(result),
+        result,
+    )
     print(result)
-    if result["failed"] or result["claimed_elsewhere"]:
-        raise SystemExit(1)
+    raise SystemExit(backfill_freehire_compat.result_exit_code(result))

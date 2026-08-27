@@ -127,6 +127,30 @@ class Client:
         return '{"jobs":[{"job_id":"1","category":"project_management","seniority":"senior","confidence":0.9}]}'
 
 
+def test_mixed_success_and_failure_exits_successfully(monkeypatch):
+    result = {"classified": 326, "failed": 174}
+    monkeypatch.setattr(backfill_freehire_compat, "run", lambda **_kwargs: result)
+
+    assert backfill_freehire_compat.result_status(result) == "partial_success"
+    assert backfill_freehire_compat.main(["--apply"]) == 0
+
+
+def test_all_failed_with_zero_progress_exits_nonzero(monkeypatch):
+    result = {"classified": 0, "failed": 174}
+    monkeypatch.setattr(backfill_freehire_compat, "run", lambda **_kwargs: result)
+
+    assert backfill_freehire_compat.result_status(result) == "all_failed"
+    assert backfill_freehire_compat.main(["--apply"]) == 1
+
+
+def test_no_failure_exits_successfully(monkeypatch):
+    result = {"classified": 500, "failed": 0}
+    monkeypatch.setattr(backfill_freehire_compat, "run", lambda **_kwargs: result)
+
+    assert backfill_freehire_compat.result_status(result) == "success"
+    assert backfill_freehire_compat.main(["--apply"]) == 0
+
+
 def test_apply_is_resumable_and_unchanged_rerun_uses_zero_llm_calls():
     db = Db([{
         "job_id": "1",

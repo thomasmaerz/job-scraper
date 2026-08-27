@@ -1,7 +1,6 @@
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -38,6 +37,19 @@ def test_init_sql_documents_existing_scrape_run_state_contract():
 
     assert 'CREATE TABLE IF NOT EXISTS "public"."scrape_run_state" (' in sql
     assert '"last_successful_scrape_at" timestamp with time zone' in sql
+    assert (
+        'DROP POLICY IF EXISTS "service_role_singleton_watermark_access" '
+        'ON "public"."scrape_run_state";'
+    ) in sql
+    assert re.search(
+        r'CREATE POLICY "service_role_singleton_watermark_access"\s+'
+        r'ON "public"\."scrape_run_state"\s+'
+        r'FOR ALL\s+TO service_role\s+'
+        r'USING \("id" = 1\)\s+'
+        r'WITH CHECK \("id" = 1\);',
+        sql,
+    )
+    assert 'REVOKE ALL ON TABLE "public"."scrape_run_state" FROM PUBLIC, anon, authenticated;' in sql
     assert 'GRANT ALL ON TABLE "public"."scrape_run_state" TO service_role;' in sql
 
 
@@ -46,8 +58,45 @@ def test_scrape_run_state_migration_is_idempotent_and_private():
     assert "CREATE TABLE IF NOT EXISTS public.scrape_run_state" in sql
     assert "ON CONFLICT (id) DO NOTHING" in sql
     assert "ALTER TABLE public.scrape_run_state ENABLE ROW LEVEL SECURITY" in sql
+    assert (
+        "DROP POLICY IF EXISTS service_role_singleton_watermark_access "
+        "ON public.scrape_run_state;"
+    ) in sql
+    assert re.search(
+        r"CREATE POLICY service_role_singleton_watermark_access\s+"
+        r"ON public\.scrape_run_state\s+"
+        r"FOR ALL\s+TO service_role\s+"
+        r"USING \(id = 1\)\s+"
+        r"WITH CHECK \(id = 1\);",
+        sql,
+    )
     assert "REVOKE ALL ON TABLE public.scrape_run_state FROM PUBLIC, anon, authenticated" in sql
     assert "GRANT ALL ON TABLE public.scrape_run_state TO service_role" in sql
+
+
+def test_scrape_run_state_policy_does_not_broaden_other_internal_tables():
+    for filename in ("init.sql", "add_scrape_run_state.sql"):
+        sql = (ROOT / "supabase_setup" / filename).read_text()
+        policies = re.findall(
+            r"CREATE POLICY\s+\"?service_role_singleton_watermark_access\"?\s+"
+            r"ON\s+([^\s;]+)",
+            sql,
+            re.IGNORECASE,
+        )
+
+        assert policies in (["public.scrape_run_state"], ['"public"."scrape_run_state"'])
+
+
+def test_scrape_run_state_policy_precedes_idempotent_singleton_seed():
+    for filename in ("init.sql", "add_scrape_run_state.sql"):
+        sql = (ROOT / "supabase_setup" / filename).read_text()
+        seed = (
+            'INSERT INTO "public"."scrape_run_state" ("id")'
+            if filename == "init.sql"
+            else "INSERT INTO public.scrape_run_state (id)"
+        )
+
+        assert sql.index("CREATE POLICY") < sql.index(seed)
 
 
 def test_cleanup_sql_drops_job_keyword_insights_table():

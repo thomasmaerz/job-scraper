@@ -533,11 +533,13 @@ def process_linkedin_query(
     archetype: str | None = None,
     filter_profile: str | None = None,
     posting_date_filter: str | None = None,
-) -> list:
+) -> list[dict]:
     """
     Orchestrates scraping and detail fetching for a single query,
     filtering against existing jobs in Supabase BEFORE fetching details.
-    Returns a list of new job details found.
+    Returns flat job dictionaries ready for persistence. The lower-level detail
+    fetch keeps content and metadata separate for targeted callers; this
+    orchestration boundary merges both dictionaries into each returned job.
     """
 
     global _relist_detail_fetches_used, _linkedin_search_coverage
@@ -736,7 +738,7 @@ def process_linkedin_query(
         detail_result = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
         if detail_result:
             details, detail_metadata = detail_result
-            details.update(detail_metadata)
+            details = {**details, **detail_metadata}
             details["search_query"] = search_query
             details["archetype"] = resolved_archetype
             details["filter_profile"] = resolved_filter_profile

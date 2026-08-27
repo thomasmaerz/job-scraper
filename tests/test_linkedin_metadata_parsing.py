@@ -118,6 +118,55 @@ def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
     assert results[0]["applicant_count"] == 26
 
 
+def test_process_linkedin_query_output_flows_through_linkedin_and_generic_savers(monkeypatch):
+    _disable_relist_tracking(monkeypatch)
+    cards = [{"job_id": "123", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]
+    content = {
+        "job_id": "123",
+        "description": "Real description",
+        "company": "Acme",
+        "job_title": "Technical Project Manager",
+        "location": "Toronto, Ontario, Canada",
+        "provider": "linkedin",
+        "posted_at": "2026-06-12",
+    }
+    detail_metadata = {
+        "applicant_count": 26,
+        "salary_text": "$120,000 CAD",
+        "detail_metadata_checked_at": "2026-06-12T10:00:00+00:00",
+    }
+    saved = []
+
+    monkeypatch.setattr(scraper.config, "ENABLE_REPOST_DEDUP", False)
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location, posting_date_filter=None: cards)
+    monkeypatch.setattr(scraper.supabase_utils, "get_existing_jobs_from_supabase", lambda: (set(), set()))
+    monkeypatch.setattr(scraper.supabase_utils, "get_incomplete_linkedin_metadata_ids", lambda _ids: set())
+    monkeypatch.setattr(
+        scraper,
+        "_fetch_linkedin_job_details",
+        lambda job_id, search_card=None: (content, detail_metadata),
+    )
+    monkeypatch.setattr(scraper.supabase_utils, "save_jobs_to_supabase", lambda jobs: saved.extend(jobs))
+
+    jobs = scraper.process_linkedin_query("TPM", "Canada")
+    scraper.supabase_utils.save_linkedin_jobs_canonicalized(jobs)
+    scraper.supabase_utils.save_jobs_canonicalized(jobs)
+
+    assert len(jobs) == 1
+    assert isinstance(jobs[0], dict)
+    assert jobs[0]["applicant_count"] == 26
+    assert "applicant_count" not in content
+    assert detail_metadata == {
+        "applicant_count": 26,
+        "salary_text": "$120,000 CAD",
+        "detail_metadata_checked_at": "2026-06-12T10:00:00+00:00",
+    }
+    assert len(saved) == 2
+    assert all(job["salary_text"] == "$120,000 CAD" for job in saved)
+    assert all(job["detail_metadata_checked_at"] == "2026-06-12T10:00:00+00:00" for job in saved)
+    assert all(job["listing_instances"][0]["applicant_count"] == 26 for job in saved)
+
+
 def test_process_linkedin_query_skips_ids_already_seen_as_latest_job_id(monkeypatch):
     _disable_relist_tracking(monkeypatch)
     cards = [{"job_id": "linkedin-live-99", "posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"}]

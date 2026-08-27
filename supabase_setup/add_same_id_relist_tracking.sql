@@ -273,6 +273,35 @@ $$;
 REVOKE ALL ON FUNCTION public.apply_linkedin_relist_projection(text, text, uuid, date, timestamptz, jsonb, jsonb, timestamptz, jsonb, text, text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.apply_linkedin_relist_projection(text, text, uuid, date, timestamptz, jsonb, jsonb, timestamptz, jsonb, text, text, text) TO service_role;
 
+CREATE OR REPLACE FUNCTION public.apply_same_id_relist_repair(
+    p_canonical_job_id text,
+    p_expected_listing_instances jsonb,
+    p_expected_last_seen_at timestamptz,
+    p_payload jsonb
+) RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    affected integer;
+BEGIN
+    UPDATE public.jobs
+    SET listing_instances = p_payload->'listing_instances',
+        seen_count = (p_payload->>'seen_count')::integer,
+        posting_wave_count = (p_payload->>'posting_wave_count')::integer,
+        repost_count = (p_payload->>'repost_count')::integer,
+        same_id_relist_count = (p_payload->>'same_id_relist_count')::integer
+    WHERE job_id = p_canonical_job_id
+      AND listing_instances IS NOT DISTINCT FROM p_expected_listing_instances
+      AND last_seen_at IS NOT DISTINCT FROM p_expected_last_seen_at;
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    RETURN affected = 1;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) TO service_role;
+
 -- Seed only directly evidenced historical facts. Re-running this migration is safe.
 INSERT INTO public.listing_content_versions (
     provider, source_job_id, content_hash, canonical_job_id, description,

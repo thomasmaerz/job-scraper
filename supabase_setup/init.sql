@@ -1317,6 +1317,33 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.apply_same_id_relist_repair(
+    p_canonical_job_id text,
+    p_expected_listing_instances jsonb,
+    p_expected_last_seen_at timestamptz,
+    p_payload jsonb
+) RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    affected integer;
+BEGIN
+    UPDATE public.jobs
+    SET listing_instances = p_payload->'listing_instances',
+        seen_count = (p_payload->>'seen_count')::integer,
+        posting_wave_count = (p_payload->>'posting_wave_count')::integer,
+        repost_count = (p_payload->>'repost_count')::integer,
+        same_id_relist_count = (p_payload->>'same_id_relist_count')::integer
+    WHERE job_id = p_canonical_job_id
+      AND listing_instances IS NOT DISTINCT FROM p_expected_listing_instances
+      AND last_seen_at IS NOT DISTINCT FROM p_expected_last_seen_at;
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    RETURN affected = 1;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.claim_freehire_compat_job(
     p_job_id text,
     p_expected_input_hash text,
@@ -1543,10 +1570,12 @@ REVOKE ALL ON FUNCTION public.calculate_listing_posting_waves(jsonb) FROM PUBLIC
 GRANT EXECUTE ON FUNCTION public.calculate_listing_posting_waves(jsonb) TO service_role;
 
 REVOKE ALL ON FUNCTION public.apply_linkedin_relist_projection(text, text, uuid, date, timestamptz, jsonb, jsonb, timestamptz, jsonb, text, text, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.apply_freehire_compat_metadata(text, jsonb, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_freehire_compat_job(text, text, jsonb, text) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.persist_freehire_compat_result(text, text, jsonb, text, jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.apply_linkedin_relist_projection(text, text, uuid, date, timestamptz, jsonb, jsonb, timestamptz, jsonb, text, text, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.apply_freehire_compat_metadata(text, jsonb, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.claim_freehire_compat_job(text, text, jsonb, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.persist_freehire_compat_result(text, text, jsonb, text, jsonb) TO service_role;

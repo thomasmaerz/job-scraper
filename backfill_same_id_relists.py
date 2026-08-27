@@ -1,7 +1,6 @@
 """Dry-run-first lower-bound repair from stored same-ID observations."""
 
 import argparse
-import json
 from collections import defaultdict
 
 import config
@@ -196,6 +195,7 @@ def run(limit: int = 100, apply: bool = False, page_size: int = 1000) -> dict:
         "changed": 0,
         "inferred_lower_bound_events": 0,
         "applied": 0,
+        "conflicts": 0,
         "content_versions_seeded": 0,
         "dry_run": not apply,
     }
@@ -230,17 +230,15 @@ def run(limit: int = 100, apply: bool = False, page_size: int = 1000) -> dict:
         )
         if not apply:
             continue
-        query = (
-            supabase_utils.supabase.table(config.SUPABASE_TABLE_NAME)
-            .update({key: value for key, value in payload.items() if key != "job_id"})
-            .eq("job_id", payload["job_id"])
-            .eq("listing_instances", json.dumps(row.get("listing_instances") or []))
-        )
-        last_seen_at = row.get("last_seen_at")
-        query = query.is_("last_seen_at", None) if last_seen_at is None else query.eq("last_seen_at", last_seen_at)
-        response = query.execute()
-        if len(response.data or []) != 1:
-            raise RuntimeError(f"Concurrent update detected for job_id={payload['job_id']}; backfill stopped")
+        response = supabase_utils.supabase.rpc("apply_same_id_relist_repair", {
+            "p_canonical_job_id": payload["job_id"],
+            "p_expected_listing_instances": row.get("listing_instances"),
+            "p_expected_last_seen_at": row.get("last_seen_at"),
+            "p_payload": {key: value for key, value in payload.items() if key != "job_id"},
+        }).execute()
+        if response.data is not True:
+            result["conflicts"] += 1
+            continue
         result["applied"] += 1
     return result
 

@@ -171,12 +171,31 @@ def test_relist_and_freehire_security_and_snapshot_guards():
     for required in (
         "calculate_listing_posting_waves",
         "apply_linkedin_relist_projection",
+        "apply_same_id_relist_repair",
         "claim_freehire_compat_job",
         "persist_freehire_compat_result",
         "apply_freehire_compat_metadata",
         "jobs_invalidate_freehire_compat_input",
     ):
         assert required in init
+
+
+def test_same_id_repair_rpc_has_jsonb_cas_and_service_role_only_execute():
+    init = (ROOT / "supabase_setup" / "init.sql").read_text()
+    migration = (ROOT / "supabase_setup" / "add_same_id_relist_tracking.sql").read_text()
+    backfill = (ROOT / "backfill_same_id_relists.py").read_text()
+
+    for sql in (init, migration):
+        assert "CREATE OR REPLACE FUNCTION public.apply_same_id_relist_repair(" in sql
+        assert "SECURITY DEFINER" in sql
+        assert "listing_instances IS NOT DISTINCT FROM p_expected_listing_instances" in sql
+        assert "last_seen_at IS NOT DISTINCT FROM p_expected_last_seen_at" in sql
+        assert "REVOKE ALL ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) FROM PUBLIC, anon, authenticated;" in sql
+        assert "GRANT EXECUTE ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) TO service_role;" in sql
+
+    assert 'supabase_utils.supabase.rpc("apply_same_id_relist_repair"' in backfill
+    assert '.eq("listing_instances"' not in backfill
+    assert "json.dumps" not in backfill
 
 
 def test_init_sql_adds_job_archetype_provenance_columns():

@@ -57,13 +57,25 @@ class Query:
 
 
 class Client:
-    def __init__(self, rows_by_table):
+    def __init__(self, rows_by_table, rpc_result=True):
         self.rows_by_table = rows_by_table
         self.updates = []
         self.in_queries = []
+        self.rpc_calls = []
+        self.rpc_result = rpc_result
 
     def table(self, table):
         return Query(self.rows_by_table, table, self.updates, self.in_queries)
+
+    def rpc(self, name, params):
+        self.rpc_calls.append((name, params))
+        result = self.rpc_result
+
+        class Rpc:
+            def execute(self):
+                return Response(result)
+
+        return Rpc()
 
 
 def test_selected_id_chunks_deduplicate_without_reordering():
@@ -153,5 +165,42 @@ def test_run_is_dry_run_by_default_and_apply_uses_guard(monkeypatch):
 
     assert dry_run["dry_run"] is True
     assert dry_run["changed"] == 1
-    assert client.updates
     assert applied["applied"] == 1
+    assert applied["conflicts"] == 0
+    assert client.updates == []
+    assert len(client.rpc_calls) == 1
+    rpc_name, rpc_params = client.rpc_calls[0]
+    assert rpc_name == "apply_same_id_relist_repair"
+    assert rpc_params["p_canonical_job_id"] == "canonical"
+    assert rpc_params["p_expected_listing_instances"] == [
+        {"job_id": "source-1", "location": "Toronto", "posted_at": "2026-08-01"}
+    ]
+    assert rpc_params["p_expected_last_seen_at"] == "2026-08-03T10:00:00Z"
+    assert rpc_params["p_payload"]["same_id_relist_count"] == 1
+
+
+def test_run_counts_rpc_cas_conflicts(monkeypatch):
+    rows = {
+        "jobs": [{
+            "job_id": "canonical",
+            "location": "Toronto",
+            "last_seen_at": None,
+            "listing_instances": [{"job_id": "source-1", "location": "Toronto", "posted_at": "2026-08-01"}],
+            "seen_count": 1,
+            "posting_wave_count": 1,
+            "repost_count": 0,
+            "same_id_relist_count": 0,
+        }],
+        "listing_observations": [
+            {"provider": "linkedin", "source_job_id": "source-1", "canonical_job_id": "canonical", "posted_at": "2026-08-01", "observed_at": "2026-08-01T10:00:00Z", "ingestion_run_id": "a", "result": "seen"},
+            {"provider": "linkedin", "source_job_id": "source-1", "canonical_job_id": "canonical", "posted_at": "2026-08-03", "observed_at": "2026-08-03T10:00:00Z", "ingestion_run_id": "b", "result": "seen"},
+        ],
+    }
+    client = Client(rows, rpc_result=False)
+    monkeypatch.setattr(backfill.supabase_utils, "supabase", client)
+
+    result = backfill.run(limit=10, apply=True)
+
+    assert result["applied"] == 0
+    assert result["conflicts"] == 1
+    assert client.rpc_calls[0][1]["p_expected_last_seen_at"] is None

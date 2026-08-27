@@ -66,3 +66,43 @@ def test_main_consumes_canonical_saver_id_lists_for_all_sources(monkeypatch, cap
     assert linkedin_save_calls == [linkedin_jobs]
     assert generic_save_calls == [careers_future_jobs]
     assert "Total new jobs saved across all queries: 2" in caplog.text
+
+
+def test_main_uses_careers_future_saver_ids_without_renormalizing(monkeypatch):
+    careers_future_jobs = [
+        {"job_id": "careers-future-source-id", "provider": "careers_future"}
+    ]
+    canonical_ids = ["careers-future-canonical-id", "existing-canonical-id"]
+
+    monkeypatch.setattr(scraper.config, "SCRAPING_SOURCES", {"careers_future"})
+    monkeypatch.setattr(
+        scraper.config,
+        "MAX_JOBS_PER_SEARCH",
+        {"careers_future": 10},
+    )
+    monkeypatch.setattr(
+        scraper.config,
+        "CAREERS_FUTURE_SEARCH_QUERIES",
+        ["Program Manager"],
+    )
+    monkeypatch.setattr(
+        scraper,
+        "process_careers_future_query",
+        lambda query, limit=None: careers_future_jobs,
+    )
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "save_jobs_canonicalized",
+        lambda jobs: canonical_ids,
+    )
+
+    def fail_if_renormalized(value):
+        raise AssertionError(f"main must not renormalize saver-returned IDs: {value!r}")
+
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "normalize_job_identifier",
+        fail_if_renormalized,
+    )
+
+    assert scraper.main() == canonical_ids

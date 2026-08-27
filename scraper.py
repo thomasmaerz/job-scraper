@@ -1110,10 +1110,11 @@ def main() -> list[str]:
                 # 2. Save the NEW scraped data to Supabase
                 if new_linkedin_job_details:
                     print(f"\n--- Saving {len(new_linkedin_job_details)} new job(s) for query '{query}' ---")
-                    query_saved_job_ids = supabase_utils.save_linkedin_jobs_canonicalized(
-                        new_linkedin_job_details
+                    saved_job_ids.extend(
+                        supabase_utils.save_linkedin_jobs_canonicalized(
+                            new_linkedin_job_details
+                        )
                     )
-                    saved_job_ids.extend(query_saved_job_ids)
                 else:
                     print(f"\nNo new job details were fetched or processed for query '{query}'.")
     else:
@@ -1132,10 +1133,11 @@ def main() -> list[str]:
             # 2. Save the NEW scraped data to Supabase
             if new_careers_future_job_details:
                 logging.info(f"\n--- Saving {len(new_careers_future_job_details)} new job(s) for query '{query}' ---")
-                query_saved_job_ids = supabase_utils.save_jobs_canonicalized(
-                    new_careers_future_job_details
+                saved_job_ids.extend(
+                    supabase_utils.save_jobs_canonicalized(
+                        new_careers_future_job_details
+                    )
                 )
-                saved_job_ids.extend(query_saved_job_ids)
             else:
                 logging.info(f"\nNo new job details were fetched or processed for query '{query}'.")
     else:

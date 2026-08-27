@@ -146,7 +146,11 @@ def test_process_linkedin_query_output_flows_through_linkedin_and_generic_savers
         "_fetch_linkedin_job_details",
         lambda job_id, search_card=None: (content, detail_metadata),
     )
-    monkeypatch.setattr(scraper.supabase_utils, "save_jobs_to_supabase", lambda jobs: saved.extend(jobs))
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "save_job_to_supabase",
+        lambda job: saved.append(job) or job["job_id"],
+    )
 
     jobs = scraper.process_linkedin_query("TPM", "Canada")
     scraper.supabase_utils.save_linkedin_jobs_canonicalized(jobs)

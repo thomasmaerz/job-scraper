@@ -10,6 +10,7 @@ import string
 import unicodedata
 import html
 import json
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
 import freehire_compat
@@ -20,6 +21,61 @@ if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("Supabase URL and Key must be set in environment variables or config.")
 
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _collect_job_identifiers(value: Any, seen: set[int] | None = None) -> list[str]:
+    """Extract scalar job IDs from job records and Supabase response wrappers."""
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (str, int)):
+        identifier = str(value).strip()
+        return [identifier] if identifier else []
+
+    seen = seen or set()
+    value_identity = id(value)
+    if value_identity in seen:
+        return []
+    seen.add(value_identity)
+
+    if hasattr(value, "data") and not isinstance(value, Mapping):
+        return _collect_job_identifiers(value.data, seen)
+
+    if isinstance(value, Mapping):
+        # Row identifiers take precedence over response-envelope fields. Some
+        # legacy saver results wrapped a complete row in their ``id`` field.
+        for key in ("job_id", "id"):
+            if key in value:
+                identifiers = _collect_job_identifiers(value[key], seen)
+                if identifiers:
+                    return identifiers
+        for key in ("data", "result"):
+            if key in value:
+                identifiers = _collect_job_identifiers(value[key], seen)
+                if identifiers:
+                    return identifiers
+        return []
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        # Older postgrest clients exposed ``(data, count)``. A numeric count is
+        # metadata, not another job identifier.
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], (int, type(None))):
+            return _collect_job_identifiers(value[0], seen)
+        identifiers = []
+        for item in value:
+            identifiers.extend(_collect_job_identifiers(item, seen))
+        return identifiers
+    return []
+
+
+def extract_job_identifiers(value: Any) -> list[str]:
+    """Return unique, ordered scalar job IDs from a saver/Supabase result."""
+    return list(dict.fromkeys(_collect_job_identifiers(value)))
+
+
+def normalize_job_identifier(value: Any) -> str | None:
+    """Normalize a singular job ID/result to a stable string, or reject it."""
+    identifiers = extract_job_identifiers(value)
+    return identifiers[0] if len(identifiers) == 1 else None
 
 
 def _collapse_spaces(value: str) -> str:
@@ -248,8 +304,9 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
         job.get("location"),
     )
     now_iso = datetime.now(timezone.utc).isoformat()
-    job_id = job.get("job_id")
+    job_id = normalize_job_identifier(job.get("job_id"))
     payload = dict(job)
+    payload["job_id"] = job_id
     payload["canonical_key"] = canonical_key
     payload["original_job_id"] = str(job_id) if job_id is not None else None
     payload["latest_job_id"] = str(job_id) if job_id is not None else None
@@ -386,15 +443,23 @@ def find_canonical_match(job: dict, existing_rows: list[dict]) -> dict | None:
     target_title = normalize_role_title(job.get("job_title"))
     target_location = normalize_location(job.get("location"))
     target_fp = make_description_fingerprint(job.get("description"))
-    target_job_id = str(job.get("job_id")) if job.get("job_id") is not None else None
+    target_job_id = normalize_job_identifier(job.get("job_id"))
 
     ordered_rows = sorted(existing_rows, key=lambda row: str(row.get("job_id") or ""))
     for row in ordered_rows:
-        known_ids = {str(row.get("job_id")), str(row.get("latest_job_id"))}
+        known_ids = {
+            identifier
+            for identifier in (
+                normalize_job_identifier(row.get("job_id")),
+                normalize_job_identifier(row.get("latest_job_id")),
+            )
+            if identifier is not None
+        }
         known_ids.update(
-            str(instance.get("job_id"))
+            identifier
             for instance in (row.get("listing_instances") or [])
-            if instance.get("job_id") is not None
+            if isinstance(instance, Mapping)
+            and (identifier := normalize_job_identifier(instance.get("job_id"))) is not None
         )
         if target_job_id and target_job_id in known_ids:
             return row
@@ -455,14 +520,23 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
         offset += page_size
 
 
-def save_jobs_canonicalized(jobs_data: list):
+def save_jobs_canonicalized(jobs_data: list) -> list[str]:
     candidates_cache = {}
+    saved_job_ids: set[str] = set()
     scrape_run_id = datetime.now(timezone.utc).isoformat()
     for raw_job in jobs_data:
         job = dict(raw_job)
+        job_id = normalize_job_identifier(job.get("job_id"))
+        if job_id is None:
+            logging.warning("Skipping job with missing or non-scalar job_id: %r", job.get("job_id"))
+            continue
+        job["job_id"] = job_id
         job.setdefault("scrape_run_id", scrape_run_id)
         if not getattr(config, "ENABLE_REPOST_DEDUP", True):
-            save_jobs_to_supabase([prepare_canonical_insert_payload(job)])
+            result = save_job_to_supabase(prepare_canonical_insert_payload(job))
+            saved_job_id = normalize_job_identifier(result)
+            if saved_job_id is not None:
+                saved_job_ids.add(saved_job_id)
             continue
 
         cache_key = job.get("provider")
@@ -503,17 +577,24 @@ def save_jobs_canonicalized(jobs_data: list):
                     )
                 if job.get("provider") == "linkedin" and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True):
                     save_listing_content_version(job, canonical_job_id=match["job_id"])
+            matched_job_id = normalize_job_identifier(match.get("job_id"))
+            if matched_job_id is not None:
+                saved_job_ids.add(matched_job_id)
             match.update(payload)
         else:
             payload = prepare_canonical_insert_payload(job)
-            save_jobs_to_supabase([payload])
+            result = save_job_to_supabase(payload)
+            saved_job_id = normalize_job_identifier(result)
+            if saved_job_id is not None:
+                saved_job_ids.add(saved_job_id)
             candidates.append(payload)
             if job.get("provider") == "linkedin" and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True):
                 save_listing_content_version(job, canonical_job_id=payload["job_id"])
+    return sorted(saved_job_ids)
 
 
-def save_linkedin_jobs_canonicalized(jobs_data: list):
-    save_jobs_canonicalized(jobs_data)
+def save_linkedin_jobs_canonicalized(jobs_data: list) -> list[str]:
+    return save_jobs_canonicalized(jobs_data)
 
 # --- Supabase Functions ---
 def start_ingestion_run(
@@ -838,17 +919,20 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
                 company = item.get("company")
                 job_title = item.get("job_title")
 
-                if job_id:
-                    existing_ids.add(str(job_id))
+                normalized_job_id = normalize_job_identifier(job_id)
+                if normalized_job_id is not None:
+                    existing_ids.add(normalized_job_id)
 
                 latest_job_id = item.get("latest_job_id")
-                if latest_job_id:
-                    existing_ids.add(str(latest_job_id))
+                normalized_latest_job_id = normalize_job_identifier(latest_job_id)
+                if normalized_latest_job_id is not None:
+                    existing_ids.add(normalized_latest_job_id)
 
                 existing_ids.update(
-                    str(instance["job_id"])
+                    identifier
                     for instance in (item.get("listing_instances") or [])
-                    if instance.get("job_id") is not None
+                    if isinstance(instance, Mapping)
+                    and (identifier := normalize_job_identifier(instance.get("job_id"))) is not None
                 )
 
                 if company and job_title:
@@ -918,14 +1002,26 @@ def match_filter_reason(job: dict) -> tuple[str | None, bool]:
 
     return None, False
 
-def save_jobs_to_supabase(jobs_data: list):
+def save_job_to_supabase(job_data: dict) -> str | None:
+    """Save one job and return only its stable scalar identifier."""
+    job_id = normalize_job_identifier(job_data.get("job_id"))
+    if job_id is None:
+        logging.warning("Skipping job with missing or non-scalar job_id: %r", job_data.get("job_id"))
+        return None
+    job = dict(job_data)
+    job["job_id"] = job_id
+    saved_job_ids = save_jobs_to_supabase([job])
+    return normalize_job_identifier(saved_job_ids)
+
+
+def save_jobs_to_supabase(jobs_data: list) -> list[str]:
     """
     Saves or updates a list of job data dictionaries to the Supabase table using upsert.
     This avoids duplicate key errors by updating existing records based on job_id.
     """
     if not jobs_data:
         print("No job data provided to save/update.")
-        return
+        return []
 
     # Ensure job_id is present and potentially convert to the correct type if needed
     # (Assuming job_id in jobs_data is already the correct string type for your 'text' column)
@@ -997,7 +1093,8 @@ def save_jobs_to_supabase(jobs_data: list):
     }
     processed_jobs_data = []
     for job in jobs_data:
-        if 'job_id' in job and job['job_id'] is not None:
+        job_id = normalize_job_identifier(job.get('job_id'))
+        if job_id is not None:
              # If your Supabase job_id column was numeric, you'd convert here:
              # try:
              #     job['job_id'] = int(job['job_id'])
@@ -1006,7 +1103,7 @@ def save_jobs_to_supabase(jobs_data: list):
              #     print(f"Warning: Invalid job_id format found: {job.get('job_id')}. Skipping.")
              # Since it's text, just ensure it's a string (it likely already is)
              filtered_job = {key: value for key, value in job.items() if key in allowed_fields}
-             filtered_job['job_id'] = str(job['job_id'])
+             filtered_job['job_id'] = job_id
              processed_jobs_data.append(filtered_job)
         else:
             print(f"Warning: Job data missing job_id. Skipping: {job}")
@@ -1014,7 +1111,7 @@ def save_jobs_to_supabase(jobs_data: list):
 
     if not processed_jobs_data:
         print("No valid job data remaining after processing.")
-        return
+        return []
 
     print(f"Attempting to upsert {len(processed_jobs_data)} jobs to Supabase...")
 
@@ -1024,24 +1121,18 @@ def save_jobs_to_supabase(jobs_data: list):
         # or update existing rows if a job_id conflict occurs based on the primary key.
         # Ensure 'job_id' is the primary key or has a unique constraint in your Supabase table.
         # By default, supabase-py's upsert updates the row on conflict.
-        data, count = supabase.table(config.SUPABASE_TABLE_NAME).upsert(processed_jobs_data).execute()
-
-        # Check the actual response structure from your Supabase client version for upsert
-        # It might differ slightly from insert's response structure
-        if data and isinstance(data, tuple) and len(data) > 1:
-             # The actual data returned might be in data[1] for upsert
-             actual_data = data[1]
-             print(f"Successfully upserted/updated {len(processed_jobs_data)} jobs. Supabase response count: {count}")
-             # You might want to log the actual response data for debugging:
-             # print(f"Supabase response data: {actual_data}")
-        else:
-             # Log raw response if structure is unexpected or for debugging
-             print(f"Attempted to upsert {len(processed_jobs_data)} jobs. Supabase response: {data}")
+        response = supabase.table(config.SUPABASE_TABLE_NAME).upsert(processed_jobs_data).execute()
+        response_job_ids = extract_job_identifiers(response)
+        input_job_ids = [job["job_id"] for job in processed_jobs_data]
+        saved_job_ids = response_job_ids or input_job_ids
+        print(f"Successfully upserted/updated {len(processed_jobs_data)} jobs.")
+        return saved_job_ids
 
     except Exception as e:
         print(f"Error upserting data to Supabase: {e}")
         # Consider logging the data that failed to upsert for debugging
         # print(f"Failed data: {processed_jobs_data}")
+        return []
 
 
 def flag_filtered_jobs() -> int:

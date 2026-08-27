@@ -722,10 +722,11 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
 
     inserted_payloads = []
 
-    def fake_save_jobs_to_supabase(payloads):
-        inserted_payloads.extend(payloads)
+    def fake_save_job_to_supabase(payload):
+        inserted_payloads.append(payload)
+        return payload["job_id"]
 
-    monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", fake_save_jobs_to_supabase)
+    monkeypatch.setattr(supabase_utils, "save_job_to_supabase", fake_save_job_to_supabase)
     monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
 
     supabase_utils.save_linkedin_jobs_canonicalized([{
@@ -766,11 +767,12 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
 
     inserted_payloads = []
 
-    def fake_save_jobs_to_supabase(payloads):
-        inserted_payloads.extend(payloads)
+    def fake_save_job_to_supabase(payload):
+        inserted_payloads.append(payload)
+        return payload["job_id"]
 
     monkeypatch.setattr(supabase_utils, "get_canonical_candidates", fake_get_canonical_candidates)
-    monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", fake_save_jobs_to_supabase)
+    monkeypatch.setattr(supabase_utils, "save_job_to_supabase", fake_save_job_to_supabase)
     monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
 
     jobs = [
@@ -801,7 +803,11 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
 def test_provider_agnostic_canonical_save_builds_listing_history(monkeypatch):
     saved = []
     monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [])
-    monkeypatch.setattr(supabase_utils, "save_jobs_to_supabase", lambda payloads: saved.extend(payloads))
+    monkeypatch.setattr(
+        supabase_utils,
+        "save_job_to_supabase",
+        lambda payload: saved.append(payload) or payload["job_id"],
+    )
 
     supabase_utils.save_jobs_canonicalized([{
         "job_id": "career-1",
@@ -832,3 +838,52 @@ def test_existing_id_lookup_includes_historical_listing_instance_ids(monkeypatch
 
     assert ids == {"canonical", "latest", "historical"}
     assert "listing_instances" in query.selected
+
+
+def test_canonical_save_normalizes_dict_valued_saver_result_before_set_lookup(monkeypatch):
+    query = _RecordingQuery(response_data=[{
+        "id": {"job_id": "4459372203"},
+        "result": [{"job_id": "4459372203"}],
+    }])
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+    monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [])
+    monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
+
+    saved_job_ids = supabase_utils.save_linkedin_jobs_canonicalized([{
+        "job_id": 4459372203,
+        "provider": "linkedin",
+        "company": "Acme",
+        "job_title": "Technical Program Manager",
+        "location": "Toronto",
+        "description": "Real description",
+    }])
+
+    assert saved_job_ids == ["4459372203"]
+    assert all(isinstance(job_id, str) for job_id in saved_job_ids)
+    assert query.upsert_payloads[0][0]["job_id"] == "4459372203"
+
+
+def test_single_job_save_extracts_id_from_supabase_response_shape(monkeypatch):
+    query = _RecordingQuery(response_data=[{"job_id": "4459372203"}])
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+
+    saved_job_id = supabase_utils.save_job_to_supabase({
+        "job_id": 4459372203,
+        "provider": "linkedin",
+        "company": "Acme",
+        "job_title": "Technical Program Manager",
+    })
+
+    assert saved_job_id == "4459372203"
+    assert query.upsert_payloads[0][0]["job_id"] == "4459372203"
+
+
+def test_non_scalar_job_ids_are_rejected_instead_of_stringified(monkeypatch):
+    query = _RecordingQuery(response_data=[])
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+
+    assert supabase_utils.save_jobs_to_supabase([
+        {"job_id": {"unexpected": "dict"}},
+        {"job_id": ["unexpected", "list"]},
+    ]) == []
+    assert query.upsert_payloads == []

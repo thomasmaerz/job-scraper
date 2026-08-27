@@ -119,10 +119,12 @@ def run(limit: int, apply: bool) -> dict:
         row = current_rows.get(canonical_id, original_row)
         source_job_id = candidate["source_job_id"]
         result["selected"] += 1
-        details = scraper._fetch_linkedin_job_details(source_job_id)
-        if not details:
+        detail_result = scraper._fetch_linkedin_job_details(source_job_id)
+        if not detail_result:
             result["unavailable"] += 1
             continue
+        details, detail_metadata = detail_result
+        details.update(detail_metadata)
         result["available"] += 1
         observed_at = datetime.now(timezone.utc).isoformat()
         payload = build_location_payload(row, source_job_id, details, observed_at)

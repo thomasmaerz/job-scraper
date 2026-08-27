@@ -35,6 +35,32 @@ def test_extract_detail_metadata_applicants_salary_recruiter():
     assert details["recruiter_identifier"] == "jane-smith-123456"
 
 
+def test_fetch_linkedin_job_details_returns_content_and_metadata(monkeypatch):
+    html = Path("tests/fixtures/linkedin_job_detail_recruiter.html").read_text()
+
+    class Response:
+        text = html
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(scraper.time, "sleep", lambda _seconds: None)
+
+    details, metadata = scraper._fetch_linkedin_job_details(
+        "4428124095",
+        {"posted_at": "2026-06-12", "posted_relative_text": "2 hours ago"},
+    )
+
+    assert details["job_id"] == "4428124095"
+    assert details["posted_at"] == "2026-06-12"
+    assert "applicant_count" not in details
+    assert metadata["applicant_count"] == 26
+    assert metadata["salary_min"] == 120000
+    assert metadata["detail_metadata_checked_at"]
+
+
 def test_parse_salary_supports_common_range_formats():
     assert scraper._parse_salary_fields("CAD $120K to $135K per year") == {
         "salary_text": "CAD $120K to $135K",
@@ -75,7 +101,7 @@ def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
     monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda query, location, posting_date_filter=None: cards)
     monkeypatch.setattr(scraper.supabase_utils, "get_existing_jobs_from_supabase", lambda: (set(), set()))
     monkeypatch.setattr(scraper.supabase_utils, "get_incomplete_linkedin_metadata_ids", lambda _ids: set())
-    monkeypatch.setattr(scraper, "_fetch_linkedin_job_details", lambda job_id, search_card=None: {
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_details", lambda job_id, search_card=None: ({
         "job_id": job_id,
         "description": "Real description",
         "company": "Acme",
@@ -84,11 +110,12 @@ def test_phase1_posted_at_metadata_is_attached_to_detail_record(monkeypatch):
         "provider": "linkedin",
         "posted_at": search_card["posted_at"],
         "posted_relative_text": search_card["posted_relative_text"],
-    })
+    }, {"applicant_count": 26}))
 
     results = scraper.process_linkedin_query("TPM", "Canada")
     assert results[0]["posted_at"] == "2026-06-12"
     assert results[0]["posted_relative_text"] == "2 hours ago"
+    assert results[0]["applicant_count"] == 26
 
 
 def test_process_linkedin_query_skips_ids_already_seen_as_latest_job_id(monkeypatch):
@@ -135,7 +162,7 @@ def test_existing_job_with_stale_metadata_is_refetched(monkeypatch):
     monkeypatch.setattr(
         scraper,
         "_fetch_linkedin_job_details",
-        lambda job_id, search_card=None: {"job_id": job_id, "description": "Updated detail"},
+        lambda job_id, search_card=None: ({"job_id": job_id, "description": "Updated detail"}, {}),
     )
 
     results = scraper.process_linkedin_query("project manager", "Canada")

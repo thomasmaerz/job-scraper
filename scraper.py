@@ -364,8 +364,8 @@ def _fetch_linkedin_job_ids(
     logging.info(f"--- Finished Phase 1: Found {len(scraped_cards)} unique job IDs during scraping ---")
     return scraped_cards
 
-def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) -> dict | None:
-    """Fetches detailed information for a single job ID with delays, rotating user agents, and retries."""
+def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) -> tuple[dict, dict] | None:
+    """Fetch job content and detail metadata, returned as separate dictionaries."""
 
     job_detail_url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
 
@@ -509,8 +509,8 @@ def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) ->
             job_details["description"] = None 
             logging.warning(f"Description HTML was empty for job ID {job_id}. Skipping conversion.") 
 
-        job_details.update(_extract_linkedin_detail_metadata(soup))
-        job_details["detail_metadata_checked_at"] = datetime.now().isoformat()
+        detail_metadata = _extract_linkedin_detail_metadata(soup)
+        detail_metadata["detail_metadata_checked_at"] = datetime.now().isoformat()
 
         # --- Set Provider ---
         job_details["provider"] = "linkedin"
@@ -519,7 +519,7 @@ def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) ->
             job_details["posted_at"] = search_card.get("posted_at")
             job_details["posted_relative_text"] = search_card.get("posted_relative_text")
         
-        return job_details
+        return job_details, detail_metadata
 
     except Exception as e:
          
@@ -733,8 +733,10 @@ def process_linkedin_query(
 
     ids_to_fetch = job_ids_to_process
     for job_id in ids_to_fetch:
-        details = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
-        if details:
+        detail_result = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
+        if detail_result:
+            details, detail_metadata = detail_result
+            details.update(detail_metadata)
             details["search_query"] = search_query
             details["archetype"] = resolved_archetype
             details["filter_profile"] = resolved_filter_profile

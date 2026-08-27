@@ -3,6 +3,7 @@ from uuid import UUID
 
 import scraper
 import requests
+import freehire_compat
 
 
 def _detail(job_id, search_card=None):
@@ -39,7 +40,7 @@ def test_known_card_observation_happens_before_bounded_relist_fetch(monkeypatch)
     monkeypatch.setattr(scraper, "_relist_detail_fetches_used", 0)
 
     with patch.object(scraper, "_fetch_linkedin_job_ids", return_value=cards), \
-         patch.object(scraper, "_fetch_linkedin_job_details", side_effect=lambda job_id, search_card=None: fetched.append(job_id) or _detail(job_id, search_card)), \
+         patch.object(scraper, "_fetch_linkedin_job_details", side_effect=lambda job_id, search_card=None: fetched.append(job_id) or (_detail(job_id, search_card), {"applicant_count": 26})), \
          patch.object(scraper.supabase_utils, "start_ingestion_run"), \
          patch.object(scraper.supabase_utils, "finish_ingestion_run"), \
          patch.object(scraper.supabase_utils, "get_listing_tracking_context", return_value=context), \
@@ -51,7 +52,26 @@ def test_known_card_observation_happens_before_bounded_relist_fetch(monkeypatch)
 
     assert [card["job_id"] for card in saved_observations] == ["1", "2", "3", "4"]
     assert fetched == ["1", "2"]
+    assert all(job["applicant_count"] == 26 for job in jobs)
     assert all(job["same_id_relist_candidate"] is True for job in jobs)
+
+    existing = {
+        "job_id": "canonical-1",
+        "provider": "linkedin",
+        "job_title": "Technical Program Manager",
+        "company": "Acme",
+        "location": "Toronto",
+        "description": "Old delivery description.",
+        "listing_instances": [{"job_id": "1", "posted_at": "2026-08-01"}],
+        "freehire_compat_status": "current",
+    }
+    existing["freehire_compat_input_hash"] = freehire_compat.compute_classification_hash(existing)
+
+    update = scraper.supabase_utils.prepare_repost_update_payload(existing, jobs[0])
+
+    assert update["applicant_count"] == 26
+    assert update["freehire_compat_status"] == "pending"
+    assert update["freehire_compat_input_hash"] != existing["freehire_compat_input_hash"]
 
 
 def test_same_run_without_new_transition_does_not_refetch_known_id():
@@ -101,4 +121,7 @@ def test_relist_refresh_uses_existing_detail_retry_path(monkeypatch):
     result = scraper._fetch_linkedin_job_details("known", {"posted_at": "2026-08-03"})
 
     assert result is not None
+    details, metadata = result
+    assert details["job_id"] == "known"
+    assert metadata["detail_metadata_checked_at"]
     assert responses == []

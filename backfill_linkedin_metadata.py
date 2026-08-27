@@ -70,9 +70,9 @@ def run(limit: int, apply: bool) -> dict:
     result = {"checked": 0, "available": 0, "updated": 0, "unavailable": 0}
     for row in fetch_candidates(limit):
         source_job_id = str(row.get("latest_job_id") or row["job_id"])
-        details = scraper._fetch_linkedin_job_details(source_job_id)
+        detail_result = scraper._fetch_linkedin_job_details(source_job_id)
         result["checked"] += 1
-        if not details:
+        if not detail_result:
             result["unavailable"] += 1
             if apply:
                 (
@@ -82,6 +82,8 @@ def run(limit: int, apply: bool) -> dict:
                     .execute()
                 )
             continue
+        details, detail_metadata = detail_result
+        details.update(detail_metadata)
         result["available"] += 1
         payload = build_metadata_payload(row, details)
         if apply:

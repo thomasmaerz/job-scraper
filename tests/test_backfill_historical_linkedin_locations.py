@@ -69,7 +69,7 @@ def test_run_is_dry_run_by_default_behavior(monkeypatch):
         "listing_instances": [{"job_id": "source-1", "location": None}],
     }
     monkeypatch.setattr(backfill, "fetch_candidates", lambda limit: [{"row": row, "source_job_id": "source-1"}])
-    monkeypatch.setattr(backfill.scraper, "_fetch_linkedin_job_details", lambda _job_id: {"location": "Toronto"})
+    monkeypatch.setattr(backfill.scraper, "_fetch_linkedin_job_details", lambda _job_id: ({"location": "Toronto"}, {}))
 
     result = backfill.run(limit=1, apply=False)
 
@@ -94,7 +94,7 @@ def test_run_applies_multiple_instances_from_same_canonical_row(monkeypatch):
     monkeypatch.setattr(
         backfill.scraper,
         "_fetch_linkedin_job_details",
-        lambda job_id: {"location": "Toronto" if job_id == "source-1" else "Calgary"},
+        lambda job_id: ({"location": "Toronto" if job_id == "source-1" else "Calgary"}, {}),
     )
 
     updates = []

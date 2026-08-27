@@ -50,7 +50,7 @@ def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile
     with patch.object(scraper, "_fetch_linkedin_job_ids", return_value=["123"]), \
          patch.object(scraper.supabase_utils, "get_existing_jobs_from_supabase", return_value=(set(), set())), \
          patch.object(scraper.supabase_utils, "get_incomplete_linkedin_metadata_ids", return_value=set()), \
-         patch.object(scraper, "_fetch_linkedin_job_details", return_value=fake_details):
+         patch.object(scraper, "_fetch_linkedin_job_details", return_value=(fake_details, {})):
         jobs = scraper.process_linkedin_query(
             search_query="Technical Program Manager",
             location="Canada",

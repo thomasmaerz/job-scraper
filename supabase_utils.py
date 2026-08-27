@@ -9,7 +9,6 @@ import re # Import re for filter pattern matching
 import string
 import unicodedata
 import html
-import json
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
@@ -567,8 +566,11 @@ def save_jobs_canonicalized(jobs_data: list) -> list[str]:
                     supabase.table(config.SUPABASE_TABLE_NAME)
                     .update({key: value for key, value in payload.items() if key != "job_id"})
                     .eq("job_id", match["job_id"])
-                    .eq("listing_instances", json.dumps(match.get("listing_instances") or []))
                 )
+                # last_seen_at is the compare-and-swap token for this update. Do
+                # not also filter on listing_instances: PostgREST puts filters
+                # in the PATCH URL, and historical JSON arrays can make that URL
+                # large enough for the server/proxy to reject it with HTTP 400.
                 last_seen_at = match.get("last_seen_at")
                 query = query.is_("last_seen_at", None) if last_seen_at is None else query.eq("last_seen_at", last_seen_at)
                 response = query.execute()

@@ -755,8 +755,8 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
     assert query.update_payloads[0]["latest_job_id"] == "4426608777"
     assert query.update_payloads[0]["salary_text"] == "$120,000-$135,000 CAD"
     assert ("eq", "job_id", "4394716706") in query.filters
-    assert any(filter_[0:2] == ("eq", "listing_instances") for filter_ in query.filters)
     assert ("eq", "last_seen_at", "2026-05-29T12:00:00Z") in query.filters
+    assert not any(filter_[0:2] == ("eq", "listing_instances") for filter_ in query.filters)
 
 
 def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypatch):
@@ -800,6 +800,41 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
     assert saved_job_ids == ["1", "2"]
     assert calls == ["linkedin"]
     assert len(inserted_payloads) == 2
+
+
+def test_canonical_update_does_not_put_listing_history_in_patch_url(monkeypatch):
+    query = _RecordingQuery(response_data=[{"job_id": "canonical-1"}])
+    existing = {
+        "job_id": "canonical-1",
+        "provider": "linkedin",
+        "company": "Acme",
+        "job_title": "Technical Program Manager",
+        "location": "Toronto",
+        "description": "Own technical delivery.",
+        "listing_instances": [{"job_id": str(index), "metadata": "x" * 1000} for index in range(20)],
+        "last_seen_at": "2026-08-26T10:00:00+00:00",
+        "seen_count": 20,
+        "posting_wave_count": 1,
+        "repost_count": 0,
+    }
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+    monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [existing])
+    monkeypatch.setattr(supabase_utils, "find_canonical_match", lambda job, candidates: existing)
+    monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
+
+    saved_job_ids = supabase_utils.save_linkedin_jobs_canonicalized([{
+        "job_id": "source-2",
+        "provider": "linkedin",
+        "company": "Acme",
+        "job_title": "Technical Program Manager",
+        "location": "Toronto",
+        "description": "Own technical delivery.",
+    }])
+
+    assert saved_job_ids == ["canonical-1"]
+    assert ("eq", "job_id", "canonical-1") in query.filters
+    assert ("eq", "last_seen_at", "2026-08-26T10:00:00+00:00") in query.filters
+    assert all(field != "listing_instances" for operation, field, *_ in query.filters if operation in {"eq", "is"})
 
 
 def test_provider_agnostic_canonical_save_builds_listing_history(monkeypatch):

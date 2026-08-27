@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from unittest.mock import patch
+from uuid import UUID
 
 import scraper
 import pytest
@@ -60,7 +61,7 @@ def test_process_linkedin_query_stamps_search_query_archetype_and_filter_profile
         )
 
     assert len(jobs) == 1
-    assert jobs[0].pop("scrape_run_id") != scraper.SCRAPE_RUN_ID
+    assert UUID(jobs[0].pop("scrape_run_id")).version == 4
     assert jobs == [{
         "job_id": "123",
         "job_title": "Technical Program Manager",

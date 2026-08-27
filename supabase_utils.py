@@ -10,6 +10,7 @@ import string
 import unicodedata
 import html
 import json
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
@@ -621,6 +622,31 @@ def finish_ingestion_run(run_id: str, **metrics: Any) -> None:
     payload = {key: value for key, value in metrics.items() if value is not None}
     payload["finished_at"] = datetime.now(timezone.utc).isoformat()
     supabase.table("ingestion_runs").update(payload).eq("id", run_id).execute()
+
+
+def record_scrape_success(execution_run_id: str) -> None:
+    """Persist a successful top-level scraper execution watermark.
+
+    ``ingestion_runs`` created by ``process_linkedin_query`` are query-scoped.
+    The execution watermark therefore gets its own UUID and an explicit
+    provider/scope rather than borrowing the ID of the final query.
+    """
+    try:
+        normalized_run_id = str(uuid.UUID(str(execution_run_id)))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("execution_run_id must be a valid UUID") from error
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    supabase.table("ingestion_runs").upsert({
+        "id": normalized_run_id,
+        "provider": "scraper",
+        "query_scope": "top-level-execution",
+        "started_at": finished_at,
+        "finished_at": finished_at,
+        "status": "complete",
+        "coverage_complete": True,
+        "coverage_reason": "all configured scraper orchestration completed",
+    }, on_conflict="id").execute()
 
 
 def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> dict[str, dict]:

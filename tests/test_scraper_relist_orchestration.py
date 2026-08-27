@@ -75,6 +75,7 @@ def test_known_card_observation_happens_before_bounded_relist_fetch(monkeypatch)
 
 
 def test_same_run_without_new_transition_does_not_refetch_known_id():
+    query_run_id = "f3a4a116-9ac4-4a45-9933-581964f8dbdd"
     card = {"job_id": "1", "posted_at": "2026-08-03"}
     context = {
         "1": {
@@ -82,11 +83,11 @@ def test_same_run_without_new_transition_does_not_refetch_known_id():
             "observations": [
                 {"posted_at": "2026-08-01", "observed_at": "2026-08-01T10:00:00Z", "ingestion_run_id": "a"},
                 {"posted_at": "2026-08-01", "observed_at": "2026-08-02T10:00:00Z", "ingestion_run_id": "b"},
-                {"posted_at": "2026-08-03", "observed_at": "2026-08-03T10:00:00Z", "ingestion_run_id": scraper.SCRAPE_RUN_ID},
+                {"posted_at": "2026-08-03", "observed_at": "2026-08-03T10:00:00Z", "ingestion_run_id": query_run_id},
             ],
         }
     }
-    with patch.object(scraper.uuid, "uuid4", return_value=UUID(scraper.SCRAPE_RUN_ID)), \
+    with patch.object(scraper.uuid, "uuid4", return_value=UUID(query_run_id)), \
          patch.object(scraper, "_fetch_linkedin_job_ids", return_value=[card]), \
          patch.object(scraper, "_fetch_linkedin_job_details") as fetch_details, \
          patch.object(scraper.supabase_utils, "start_ingestion_run"), \

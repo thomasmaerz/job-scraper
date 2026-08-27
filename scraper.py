@@ -17,7 +17,6 @@ import relist_tracking
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-SCRAPE_RUN_ID = str(uuid.uuid4())
 _relist_detail_fetches_used = 0
 _linkedin_search_coverage = {"pages_attempted": 0, "pages_completed": 0}
 
@@ -1076,6 +1075,7 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
 
 def main() -> list[str]:
     """Run configured scrapers and return the canonical job IDs that were saved."""
+    execution_run_id = str(uuid.uuid4())
     saved_job_ids: list[str] = []
 
     # Get jobs from LinkedIn
@@ -1146,6 +1146,7 @@ def main() -> list[str]:
     # --- End of Script ---
     logging.info(f"\n{'='*20} Job scraping script finished {'='*20}")
     logging.info(f"Total new jobs saved across all queries: {len(saved_job_ids)}")
+    supabase_utils.record_scrape_success(execution_run_id)
     return saved_job_ids
 
 

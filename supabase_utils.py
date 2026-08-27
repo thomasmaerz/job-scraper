@@ -521,6 +521,7 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
 
 
 def save_jobs_canonicalized(jobs_data: list) -> list[str]:
+    """Save jobs against canonical records and return their canonical IDs."""
     candidates_cache = {}
     saved_job_ids: set[str] = set()
     scrape_run_id = datetime.now(timezone.utc).isoformat()
@@ -594,6 +595,7 @@ def save_jobs_canonicalized(jobs_data: list) -> list[str]:
 
 
 def save_linkedin_jobs_canonicalized(jobs_data: list) -> list[str]:
+    """Save LinkedIn jobs and return the same list[str] canonical-ID contract."""
     return save_jobs_canonicalized(jobs_data)
 
 # --- Supabase Functions ---

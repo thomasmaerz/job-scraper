@@ -1073,10 +1073,10 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
     logging.info(f"--- Finished Phase 4: Successfully fetched details for {processed_count} new job(s) ---")
     return detailed_new_jobs
 
-# --- Main Execution ---
-if __name__ == "__main__":
 
-    total_new_jobs_saved = 0
+def main() -> list[str]:
+    """Run configured scrapers and return the canonical job IDs that were saved."""
+    saved_job_ids: list[str] = []
 
     # Get jobs from LinkedIn
     if "linkedin" in config.SCRAPING_SOURCES:
@@ -1110,8 +1110,10 @@ if __name__ == "__main__":
                 # 2. Save the NEW scraped data to Supabase
                 if new_linkedin_job_details:
                     print(f"\n--- Saving {len(new_linkedin_job_details)} new job(s) for query '{query}' ---")
-                    supabase_utils.save_linkedin_jobs_canonicalized(new_linkedin_job_details)
-                    total_new_jobs_saved += len(new_linkedin_job_details)
+                    query_saved_job_ids = supabase_utils.save_linkedin_jobs_canonicalized(
+                        new_linkedin_job_details
+                    )
+                    saved_job_ids.extend(query_saved_job_ids)
                 else:
                     print(f"\nNo new job details were fetched or processed for query '{query}'.")
     else:
@@ -1130,13 +1132,21 @@ if __name__ == "__main__":
             # 2. Save the NEW scraped data to Supabase
             if new_careers_future_job_details:
                 logging.info(f"\n--- Saving {len(new_careers_future_job_details)} new job(s) for query '{query}' ---")
-                supabase_utils.save_jobs_canonicalized(new_careers_future_job_details)
-                total_new_jobs_saved += len(new_careers_future_job_details)
+                query_saved_job_ids = supabase_utils.save_jobs_canonicalized(
+                    new_careers_future_job_details
+                )
+                saved_job_ids.extend(query_saved_job_ids)
             else:
                 logging.info(f"\nNo new job details were fetched or processed for query '{query}'.")
     else:
         logging.info("\n--- Skipping Careers Future Job Scraping per config ---")
 
-    # --- End of Script ---      
+    # --- End of Script ---
     logging.info(f"\n{'='*20} Job scraping script finished {'='*20}")
-    logging.info(f"Total new jobs saved across all queries: {total_new_jobs_saved}")
+    logging.info(f"Total new jobs saved across all queries: {len(saved_job_ids)}")
+    return saved_job_ids
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    main()

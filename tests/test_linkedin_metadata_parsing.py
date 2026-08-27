@@ -153,11 +153,13 @@ def test_process_linkedin_query_output_flows_through_linkedin_and_generic_savers
     )
 
     jobs = scraper.process_linkedin_query("TPM", "Canada")
-    scraper.supabase_utils.save_linkedin_jobs_canonicalized(jobs)
-    scraper.supabase_utils.save_jobs_canonicalized(jobs)
+    linkedin_saved_job_ids = scraper.supabase_utils.save_linkedin_jobs_canonicalized(jobs)
+    generic_saved_job_ids = scraper.supabase_utils.save_jobs_canonicalized(jobs)
 
     assert len(jobs) == 1
     assert isinstance(jobs[0], dict)
+    assert linkedin_saved_job_ids == ["123"]
+    assert generic_saved_job_ids == ["123"]
     assert jobs[0]["applicant_count"] == 26
     assert "applicant_count" not in content
     assert detail_metadata == {

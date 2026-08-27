@@ -729,7 +729,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
     monkeypatch.setattr(supabase_utils, "save_job_to_supabase", fake_save_job_to_supabase)
     monkeypatch.setattr(supabase_utils, "save_listing_content_version", lambda *args, **kwargs: None)
 
-    supabase_utils.save_linkedin_jobs_canonicalized([{
+    saved_job_ids = supabase_utils.save_linkedin_jobs_canonicalized([{
         "job_id": "4426608777",
         "provider": "linkedin",
         "company": "Foo-Bar",
@@ -748,6 +748,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
         "recruiter_identifier": None,
     }])
 
+    assert saved_job_ids == ["4394716706"]
     assert ("eq", "company", "Foo-Bar") not in query.filters
     assert inserted_payloads == []
     assert query.update_payloads
@@ -794,8 +795,9 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
         },
     ]
 
-    supabase_utils.save_linkedin_jobs_canonicalized(jobs)
+    saved_job_ids = supabase_utils.save_linkedin_jobs_canonicalized(jobs)
 
+    assert saved_job_ids == ["1", "2"]
     assert calls == ["linkedin"]
     assert len(inserted_payloads) == 2
 
@@ -809,7 +811,7 @@ def test_provider_agnostic_canonical_save_builds_listing_history(monkeypatch):
         lambda payload: saved.append(payload) or payload["job_id"],
     )
 
-    supabase_utils.save_jobs_canonicalized([{
+    saved_job_ids = supabase_utils.save_jobs_canonicalized([{
         "job_id": "career-1",
         "provider": "careers_future",
         "company": "Acme",
@@ -818,6 +820,7 @@ def test_provider_agnostic_canonical_save_builds_listing_history(monkeypatch):
         "posted_at": "2026-08-22",
     }])
 
+    assert saved_job_ids == ["career-1"]
     assert saved[0]["seen_count"] == 1
     assert saved[0]["posting_wave_count"] == 1
     assert saved[0]["repost_count"] == 0

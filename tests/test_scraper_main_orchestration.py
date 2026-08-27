@@ -42,19 +42,37 @@ def test_get_last_successful_scrape_at_reads_existing_run_state(monkeypatch):
 
 
 def test_record_scrape_success_updates_existing_run_state(monkeypatch):
-    writes = []
+    calls = []
+    state = {}
 
     class FakeQuery:
+        operation = None
+
         def update(self, payload):
-            writes.append(("update", payload))
+            self.operation = "update"
+            self.payload = payload
+            calls.append(("update", payload))
             return self
 
         def eq(self, column, value):
-            writes.append(("eq", column, value))
+            calls.append(("eq", column, value))
+            return self
+
+        def select(self, columns):
+            calls.append(("select", columns))
+            if self.operation is None:
+                self.operation = "select"
+            return self
+
+        def limit(self, value):
+            calls.append(("limit", value))
             return self
 
         def execute(self):
-            return SimpleNamespace(data=[{"id": 1}])
+            if self.operation == "update":
+                state.update(self.payload)
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(data=[state.copy()])
 
     class FakeSupabase:
         def table(self, table_name):
@@ -64,14 +82,20 @@ def test_record_scrape_success_updates_existing_run_state(monkeypatch):
     monkeypatch.setattr(supabase_utils, "supabase", FakeSupabase())
 
     assert supabase_utils.record_scrape_success() is True
-
-    assert writes[0][0] == "update"
-    assert writes[0][1]["last_successful_scrape_at"].endswith("+00:00")
-    assert writes[1] == ("eq", "id", 1)
+    assert calls[0][0] == "update"
+    assert calls[0][1]["last_successful_scrape_at"].endswith("+00:00")
+    assert calls[1:] == [
+        ("eq", "id", 1),
+        ("select", "id,last_successful_scrape_at"),
+        ("select", "last_successful_scrape_at"),
+        ("eq", "id", 1),
+        ("limit", 1),
+    ]
 
 
 def test_record_scrape_success_upserts_missing_singleton_row(monkeypatch):
     writes = []
+    state = {}
 
     class FakeQuery:
         operation = None
@@ -84,14 +108,27 @@ def test_record_scrape_success_upserts_missing_singleton_row(monkeypatch):
         def eq(self, _column, _value):
             return self
 
+        def select(self, _columns):
+            if self.operation is None:
+                self.operation = "select"
+            return self
+
+        def limit(self, _value):
+            return self
+
         def upsert(self, payload, **kwargs):
             self.operation = "upsert"
+            self.payload = payload
             writes.append(("upsert", payload, kwargs))
             return self
 
         def execute(self):
-            data = [] if self.operation == "update" else [{"id": 1}]
-            return SimpleNamespace(data=data)
+            if self.operation == "update":
+                return SimpleNamespace(data=[])
+            if self.operation == "upsert":
+                state.update(self.payload)
+                return SimpleNamespace(data=[])
+            return SimpleNamespace(data=[state.copy()] if state else [])
 
     class FakeSupabase:
         def table(self, table_name):
@@ -121,6 +158,95 @@ def test_record_scrape_success_returns_false_when_run_state_write_fails(monkeypa
         assert supabase_utils.record_scrape_success() is False
 
     assert "Failed to persist scrape success watermark: database unavailable" in caplog.text
+
+
+def test_record_scrape_success_returns_false_when_read_back_mismatches(monkeypatch, caplog):
+    class FakeQuery:
+        operation = None
+
+        def update(self, _payload):
+            self.operation = "update"
+            return self
+
+        def eq(self, _column, _value):
+            return self
+
+        def select(self, _columns):
+            if self.operation is None:
+                self.operation = "select"
+            return self
+
+        def limit(self, _value):
+            return self
+
+        def upsert(self, _payload, **_kwargs):
+            self.operation = "upsert"
+            return self
+
+        def execute(self):
+            if self.operation == "select":
+                return SimpleNamespace(data=[{
+                    "last_successful_scrape_at": "2026-08-26T10:32:33+00:00"
+                }])
+            return SimpleNamespace(data=[])
+
+    class FakeSupabase:
+        def table(self, table_name):
+            assert table_name == "scrape_run_state"
+            return FakeQuery()
+
+    monkeypatch.setattr(supabase_utils, "supabase", FakeSupabase())
+
+    with caplog.at_level(logging.ERROR):
+        assert supabase_utils.record_scrape_success() is False
+
+    assert "Scrape success watermark did not match after update and upsert" in caplog.text
+
+
+def test_record_scrape_success_returns_false_when_read_back_fails(monkeypatch, caplog):
+    writes = []
+
+    class FakeQuery:
+        operation = None
+
+        def update(self, _payload):
+            self.operation = "update"
+            writes.append("update")
+            return self
+
+        def eq(self, _column, _value):
+            return self
+
+        def select(self, _columns):
+            if self.operation is None:
+                self.operation = "select"
+            return self
+
+        def limit(self, _value):
+            return self
+
+        def upsert(self, _payload, **_kwargs):
+            self.operation = "upsert"
+            writes.append("upsert")
+            return self
+
+        def execute(self):
+            if self.operation == "select":
+                raise RuntimeError("read-back unavailable")
+            return SimpleNamespace(data=[])
+
+    class FakeSupabase:
+        def table(self, table_name):
+            assert table_name == "scrape_run_state"
+            return FakeQuery()
+
+    monkeypatch.setattr(supabase_utils, "supabase", FakeSupabase())
+
+    with caplog.at_level(logging.WARNING):
+        assert supabase_utils.record_scrape_success() is False
+
+    assert writes == ["update", "upsert"]
+    assert caplog.text.count("Failed to verify scrape success watermark") == 2
 
 
 def test_main_consumes_canonical_saver_id_lists_for_all_sources(monkeypatch, caplog):

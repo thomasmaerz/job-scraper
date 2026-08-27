@@ -646,30 +646,83 @@ def get_last_successful_scrape_at() -> Optional[str]:
     return rows[0].get("last_successful_scrape_at")
 
 
+def _request_scrape_run_state_representation(query: Any) -> Any:
+    """Request mutation rows when the installed PostgREST builder supports it."""
+    select = getattr(query, "select", None)
+    if not callable(select):
+        return query
+    try:
+        return select("id,last_successful_scrape_at")
+    except (AttributeError, TypeError, NotImplementedError):
+        # Older clients cannot chain select() onto mutation builders. Their
+        # successful execute() may legitimately return data=[], so the write is
+        # checked with a separate read-back instead.
+        return query
+
+
+def _scrape_run_state_matches(finished_at: str) -> bool:
+    """Confirm that the singleton row contains the exact timestamp written."""
+    try:
+        response = (
+            supabase.table("scrape_run_state")
+            .select("last_successful_scrape_at")
+            .eq("id", SCRAPE_RUN_STATE_ID)
+            .limit(1)
+            .execute()
+        )
+    except Exception as error:
+        logging.warning("Failed to verify scrape success watermark: %s", error)
+        return False
+
+    rows = response.data or []
+    if not rows:
+        return False
+
+    persisted_at = rows[0].get("last_successful_scrape_at")
+    if persisted_at == finished_at:
+        return True
+    try:
+        # PostgreSQL may omit insignificant fractional-second zeroes. Compare
+        # exact instants rather than requiring identical timestamp formatting.
+        return datetime.fromisoformat(persisted_at.replace("Z", "+00:00")) == (
+            datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def record_scrape_success() -> bool:
     """Persist the required top-level scraper watermark in scrape_run_state."""
     finished_at = datetime.now(timezone.utc).isoformat()
     payload = {"last_successful_scrape_at": finished_at}
 
     try:
-        response = (
+        query = (
             supabase.table("scrape_run_state")
             .update(payload)
             .eq("id", SCRAPE_RUN_STATE_ID)
-            .execute()
         )
-        if response.data:
+        _request_scrape_run_state_representation(query).execute()
+        if _scrape_run_state_matches(finished_at):
             return True
+    except Exception as error:
+        logging.warning("Failed to update scrape success watermark: %s", error)
 
+    try:
         # A fresh database may have the table but not its singleton row yet.
-        response = supabase.table("scrape_run_state").upsert(
+        query = supabase.table("scrape_run_state").upsert(
             {"id": SCRAPE_RUN_STATE_ID, **payload},
             on_conflict="id",
-        ).execute()
-        return bool(response.data)
+        )
+        _request_scrape_run_state_representation(query).execute()
+        if _scrape_run_state_matches(finished_at):
+            return True
     except Exception as error:
         logging.error("Failed to persist scrape success watermark: %s", error)
         return False
+
+    logging.error("Scrape success watermark did not match after update and upsert")
+    return False
 
 
 def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> dict[str, dict]:

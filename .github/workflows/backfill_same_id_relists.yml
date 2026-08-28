@@ -8,7 +8,7 @@ on:
         required: false
         default: "500"
         type: choice
-        options: ["100", "500", "1000"]
+        options: ["100", "500", "1000", "5000"]
       apply:
         description: "Persist reviewed lower-bound relist repairs"
         required: false
@@ -41,7 +41,7 @@ jobs:
         run: |
           limit="${{ inputs.limit }}"
           case "$limit" in
-            100|500|1000) ;;
+            100|500|1000|5000) ;;
             *) echo "Invalid limit: $limit" >&2; exit 2 ;;
           esac
           args=(--limit "$limit")

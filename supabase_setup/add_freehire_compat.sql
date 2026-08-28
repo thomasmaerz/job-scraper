@@ -194,13 +194,15 @@ END;
 $$;
 
 DROP FUNCTION IF EXISTS public.claim_freehire_compat_job(text, text, text);
+DROP FUNCTION IF EXISTS public.claim_freehire_compat_job(text, text, jsonb, text);
 DROP FUNCTION IF EXISTS public.persist_freehire_compat_result(text, text, text, jsonb);
 
 CREATE OR REPLACE FUNCTION public.claim_freehire_compat_job(
     p_job_id text,
     p_expected_input_hash text,
     p_expected_source_snapshot jsonb,
-    p_worker_id text
+    p_worker_id text,
+    p_replacement_before timestamptz DEFAULT NULL
 ) RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -220,6 +222,21 @@ BEGIN
           freehire_compat_status = 'pending'
           OR (freehire_compat_status = 'failed' AND COALESCE(freehire_compat_next_retry_at, '-infinity'::timestamptz) <= now())
           OR (freehire_compat_status = 'processing' AND COALESCE(freehire_compat_claimed_at, '-infinity'::timestamptz) < now() - interval '30 minutes')
+          OR (
+              freehire_compat_status = 'current'
+              AND p_replacement_before IS NOT NULL
+              AND COALESCE(freehire_compat_classified_at, '-infinity'::timestamptz) < p_replacement_before
+          )
+          OR (
+              freehire_compat_status = 'current'
+              AND (
+                  freehire_compat_input_hash IS NULL
+                  OR freehire_compat_model IS NULL
+                  OR freehire_category IS NULL
+                  OR freehire_compat_schema_version IS DISTINCT FROM 'freehire-compat-v1'
+                  OR freehire_compat_prompt_version IS DISTINCT FROM 'freehire-category-v1'
+              )
+          )
       )
       AND (freehire_compat_input_hash IS NULL OR freehire_compat_input_hash = p_expected_input_hash)
       AND p_expected_source_snapshot <@ to_jsonb(j);
@@ -336,10 +353,10 @@ WHERE provider = 'linkedin'
 
 REVOKE ALL ON public.freehire_jobs FROM PUBLIC, anon, authenticated;
 GRANT SELECT ON public.freehire_jobs TO service_role;
-REVOKE ALL ON FUNCTION public.claim_freehire_compat_job(text, text, jsonb, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.claim_freehire_compat_job(text, text, jsonb, text, timestamptz) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.persist_freehire_compat_result(text, text, jsonb, text, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.apply_freehire_compat_metadata(text, jsonb, jsonb) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.claim_freehire_compat_job(text, text, jsonb, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.claim_freehire_compat_job(text, text, jsonb, text, timestamptz) TO service_role;
 GRANT EXECUTE ON FUNCTION public.persist_freehire_compat_result(text, text, jsonb, text, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.apply_freehire_compat_metadata(text, jsonb, jsonb) TO service_role;
 

@@ -9,7 +9,7 @@ This project is a comprehensive suite of tools designed to automate and enhance 
   - Extracts text from PDF resumes using `pdfplumber`. ([resume_parser.py](resume_parser.py))
   - Utilizes Google Gemini AI to parse resume text into structured data ([parse_resume_with_ai.py](parse_resume_with_ai.py))
 - **Job Scoring**: Scores job descriptions against a parsed resume using AI to determine suitability. ([score_jobs.py](score_jobs.py))
-- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. Scheduled runs analyze unanalyzed jobs in any state (new or expired) up to `JOB_INSIGHTS_MAX_JOBS` per run, with aggregates split by archetype and provider; manual replacement backfill is available for one-time reanalysis of previously analyzed jobs. ([analyze_jobs.py](analyze_jobs.py))
+- **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. Hourly pipeline runs are incremental and process at most the environment-configurable `JOB_INSIGHTS_MAX_JOBS` (default `100`) per run, with aggregates split by archetype and provider; manual recovery supports backlog and one-time replacement passes. ([analyze_jobs.py](analyze_jobs.py))
 - **Universal LLM Support**: Supports 400+ model providers (Gemini, OpenAI, Anthropic, Ollama, Groq, etc.) via a unified abstraction layer. ([llm_client.py](llm_client.py))
 - **Job Management**:
   - Tracks the status of job applications.
@@ -132,14 +132,21 @@ This project is designed to run primarily through GitHub Actions. Follow these s
 
 Once the setup is complete and GitHub Actions are enabled, the workflows defined in [workflows](.github/workflows/) are scheduled to run automatically:
 
-- **`scrape_jobs.yml`**: Periodically scrapes new job postings from LinkedIn and CareersFuture based on your `config.py` settings and saves them to your Supabase database.
+- **`scrape_jobs.yml`**: At minute 5 of every hour, serially orchestrates separate, observable jobs: scrape, a bounded Freehire compatibility increment (hard limit `300`), a bounded job-insights increment, the production publication gate, and optional downstream dispatch. Hourly compatibility reads only the newest actionable pending/stale/retry-ready/expired-lease rows; explicit drain/replacement recovery retains complete keyset scanning. The gate reports total/current/pending/failed/processing/stale/published, validates publication through `freehire_jobs`, requires the scrape watermark, and does not block only because historical pending rows remain. Downstream dispatch stays disabled unless both `DOWNSTREAM_SYNC_REPOSITORY` and `DOWNSTREAM_SYNC_TOKEN` are configured.
 - **`score_jobs.yml`**: Periodically scores the newly scraped jobs and jobs with custom resumes against your parsed resume / custom resume and updates the scores in the database.
 - **`job_manager.yml`**: Periodically manages job statuses (e.g., marks old jobs as expired, checks if active jobs are still available).
-- **`analyze_jobs.yml`**: Runs `analyze_jobs.py` on a schedule or manually to extract recurring market keywords from unanalyzed jobs and update `keyword_insights`. Manual dispatch also supports a `drain_backlog` input to keep processing until no eligible unanalyzed jobs remain.
-- **`freehire_compat.yml`**: Frontfills pending or changed LinkedIn rows after scraping and every four hours using strict token-budgeted Freehire category batches. Manual dispatch supports bounded, draining, and replacement passes.
+- **`analyze_jobs.yml`**: Manual-only recovery for insight backlog draining or replacement analysis. Scheduled incremental analysis is owned exclusively by `scrape_jobs.yml`; hourly and manual analysis jobs share a dedicated non-cancelling concurrency group.
+- **`freehire_compat.yml`**: Manual-only bounded compatibility recovery with an isolated non-cancelling concurrency group (database claims make overlap with hourly compatibility safe). It defaults to a hard limit of `1000` and dry-run mode; enabling `apply` is explicit. Replacement runs require a stable `replacement_before` timestamp. Reuse that exact cutoff across capped reruns: `freehire_compat_classified_at` is the durable progress marker, so rows completed by earlier runs are skipped. Scheduled incremental compatibility is owned exclusively by `scrape_jobs.yml`.
+- **`backfill_same_id_relists.yml`**: Manual, dry-run-default same-ID repair. The default remains `500`; select `5000` to cover the full current dataset in one invocation.
 - **`hourly_resume_customization.yml`**: (If enabled and configured) May run tasks related to customizing resumes for specific jobs.
 
 You can monitor the execution of these actions in the "Actions" tab of your repository.
+
+All publication-pipeline and manual recovery runs share the `linkedin-freehire-pipeline` concurrency group, so they never mutate compatibility/insight state concurrently. The publication gate queries production after all pipeline jobs succeed and reports `current`, `pending`, `failed`, and `published` counts. Pending and failed historical rows are informational and do not block already-current rows: `public.freehire_jobs` remains the per-row publication contract.
+
+Set repository variable `JOB_INSIGHTS_MAX_JOBS` to tune the conservative hourly analysis cap; if unset, the workflow and `config.py` use `100`. The hourly job always keeps backlog draining and replacement analysis disabled, preserving incremental-only semantics.
+
+Downstream dispatch is disabled by default. To enable it, configure repository variable `DOWNSTREAM_SYNC_REPOSITORY` as `owner/repository` and secret `DOWNSTREAM_SYNC_TOKEN` with access to dispatch that repository. The pipeline then sends `repository_dispatch` event `job-scraper-publication-ready` with source repository, source SHA, run ID, and the scrape watermark when available. If either setting is absent, the workflow explicitly logs that dispatch is not configured and does not infer a target.
 
 ## Usage
 

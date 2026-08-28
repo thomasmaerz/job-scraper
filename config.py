@@ -229,7 +229,11 @@ FREEHIRE_CLASSIFY_RETRY_COOLDOWN_MAX_MINUTES = max(
 )
 
 # --- Job Insights Analysis ---
-JOB_INSIGHTS_MAX_JOBS = 700
+# Keep scheduled analysis bounded. Recovery workflows can opt into repeated
+# bounded passes without changing the hourly default.
+JOB_INSIGHTS_MAX_JOBS = max(
+    1, int(os.environ.get("JOB_INSIGHTS_MAX_JOBS", "100"))
+)
 JOB_INSIGHTS_BATCH_SIZE = 10
 JOB_INSIGHTS_SLEEP_SECONDS = 6
 JOB_INSIGHTS_MAX_RETRIES = 3

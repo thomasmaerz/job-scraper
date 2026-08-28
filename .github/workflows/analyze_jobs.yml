@@ -1,9 +1,6 @@
 name: Analyze Job Insights
 
 on:
-  schedule:
-    # Weekly on Monday at 06:00 UTC to control LLM usage.
-    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       archetype:
@@ -19,9 +16,16 @@ on:
         required: false
         default: "false"
 
+permissions:
+  contents: read
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: linkedin-job-insights-analysis
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository code

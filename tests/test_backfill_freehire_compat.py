@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
+
 import backfill_freehire_compat
 import freehire_compat
+import frontfill_freehire_compat
 
 
 class Query:
@@ -11,6 +14,18 @@ class Query:
         self.filters = []
         self.desc = False
         self.limit_value = None
+        self.orders = []
+
+    @property
+    def not_(self):
+        query = self
+
+        class Negated:
+            def is_(self, field, value):
+                query.filters.append(("not_is", field, value))
+                return query
+
+        return Negated()
 
     def select(self, _fields):
         return self
@@ -27,12 +42,18 @@ class Query:
         self.filters.append(("lte", field, value))
         return self
 
+    def or_(self, value):
+        self.db.or_filters.append(value)
+        return self
+
     def is_(self, field, value):
         self.filters.append(("is", field, value))
         return self
 
-    def order(self, _field, desc=False):
+    def order(self, field, desc=False, **_kwargs):
         self.desc = desc
+        self.orders.append((field, desc))
+        self.db.orders.append((field, desc))
         return self
 
     def limit(self, value):
@@ -67,6 +88,8 @@ class Query:
                 return False
             if op == "is" and row.get(field) is not value:
                 return False
+            if op == "not_is" and row.get(field) is value:
+                return False
             if op == "gt" and not row.get(field) > value:
                 return False
             if op == "lte" and not row.get(field) <= value:
@@ -78,6 +101,8 @@ class Db:
     def __init__(self, rows):
         self.rows = rows
         self.updates = 0
+        self.or_filters = []
+        self.orders = []
 
     def table(self, name):
         assert name == "jobs"
@@ -196,6 +221,7 @@ def test_latest_id_only_drift_updates_import_hash_without_llm():
         "is_remote": False,
         "freehire_remote_evidence": None,
         "freehire_compat_status": "current",
+        "freehire_compat_model": "fake/model",
         "freehire_compat_prompt_version": "freehire-category-v1",
         "freehire_compat_schema_version": "freehire-compat-v1",
     }
@@ -224,3 +250,96 @@ def test_dry_run_never_calls_llm_or_updates():
     assert result["llm_requests"] == 0
     assert client.calls == 0
     assert db.updates == 0
+
+
+def test_frontfill_query_is_bounded_eligible_and_newest_first():
+    db = Db([])
+
+    backfill_freehire_compat.fetch_frontfill_candidates(db, 300)
+
+    assert db.orders == [("last_seen_at", True), ("job_id", True)]
+    assert len(db.or_filters) == 1
+    eligibility = db.or_filters[0]
+    assert "freehire_compat_status.eq.pending" in eligibility
+    assert "freehire_compat_status.eq.failed" in eligibility
+    assert "freehire_compat_next_retry_at.lte." in eligibility
+    assert "freehire_compat_status.eq.processing" in eligibility
+    assert "freehire_compat_claimed_at.lt." in eligibility
+    assert "freehire_compat_status.eq.current" in eligibility
+
+
+def test_non_drain_hard_caps_at_300_without_complete_keyset_scan(monkeypatch):
+    rows = [
+        {
+            "job_id": str(index),
+            "provider": "linkedin",
+            "job_title": "TPM",
+            "description": "Delivery",
+            "freehire_compat_status": "pending",
+        }
+        for index in range(400)
+    ]
+    monkeypatch.setattr(
+        backfill_freehire_compat,
+        "fetch_frontfill_candidates",
+        lambda _db, limit: rows[:limit],
+    )
+    monkeypatch.setattr(
+        backfill_freehire_compat,
+        "fetch_candidates",
+        lambda *_args, **_kwargs: pytest.fail("non-drain must not run a complete keyset scan"),
+    )
+
+    result = backfill_freehire_compat.run(apply=False, limit=300, db=Db(rows))
+
+    assert result["scanned"] == 300
+    assert result["would_classify"] == 300
+
+
+def test_hourly_frontfill_rejects_limit_above_300(monkeypatch):
+    monkeypatch.setenv("FREEHIRE_CLASSIFY_LIMIT", "301")
+    with pytest.raises(ValueError, match="hourly hard cap of 300"):
+        frontfill_freehire_compat.classify_limit_from_env()
+
+
+def test_capped_replacement_requires_cutoff_and_resumes_by_classified_timestamp():
+    with pytest.raises(ValueError, match="requires replacement_before"):
+        backfill_freehire_compat.run(
+            apply=False,
+            limit=1000,
+            replacement_backfill=True,
+            db=Db([]),
+        )
+
+    row = {
+        "job_id": "1",
+        "provider": "linkedin",
+        "job_title": "TPM",
+        "description": "Delivery",
+        "freehire_category": "project_management",
+        "freehire_seniority": "senior",
+        "freehire_compat_status": "current",
+        "freehire_compat_model": "model",
+        "freehire_compat_prompt_version": "freehire-category-v1",
+        "freehire_compat_schema_version": "freehire-compat-v1",
+        "freehire_compat_classified_at": "2025-01-01T00:00:00+00:00",
+    }
+    row["freehire_compat_input_hash"] = freehire_compat.compute_classification_hash(row)
+    result = backfill_freehire_compat.run(
+        apply=False,
+        limit=1000,
+        replacement_backfill=True,
+        replacement_before="2025-02-01T00:00:00+00:00",
+        db=Db([row]),
+    )
+    assert result["would_classify"] == 1
+
+    row["freehire_compat_classified_at"] = "2025-02-01T00:00:00+00:00"
+    result = backfill_freehire_compat.run(
+        apply=False,
+        limit=1000,
+        replacement_backfill=True,
+        replacement_before="2025-02-01T00:00:00+00:00",
+        db=Db([row]),
+    )
+    assert result["would_classify"] == 0

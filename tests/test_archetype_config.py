@@ -1,3 +1,5 @@
+import importlib
+
 import config
 
 
@@ -25,3 +27,13 @@ def test_software_tpm_keeps_construction_filters():
     assert r"\bconstruction\b" in archetype["title_blocklist"]
     assert r"construction firm" in archetype["desc_blocklist"]
     assert r"\bProcore\b" in archetype["desc_blocklist"]
+
+
+def test_job_insights_max_jobs_is_environment_configurable(monkeypatch):
+    monkeypatch.setenv("JOB_INSIGHTS_MAX_JOBS", "37")
+    reloaded = importlib.reload(config)
+
+    assert reloaded.JOB_INSIGHTS_MAX_JOBS == 37
+
+    monkeypatch.delenv("JOB_INSIGHTS_MAX_JOBS")
+    importlib.reload(config)

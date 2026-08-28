@@ -1,9 +1,8 @@
-# .github/workflows/scrape_jobs.yml
-name: Daily Job Scraper
+name: Hourly Job Publication Pipeline
 
 on:
   schedule:
-    - cron: "0 10 * * *"
+    - cron: "5 * * * *"
   workflow_dispatch:
     inputs:
       lookback_hours:
@@ -11,40 +10,33 @@ on:
         required: false
         default: "48"
         type: choice
-        options:
-          - "24"
-          - "48"
-          - "72"
-          - "96"
-          - "168"
+        options: ["24", "48", "72", "96", "168"]
 
 concurrency:
   group: linkedin-freehire-pipeline
   cancel-in-progress: false
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
   scrape:
+    permissions:
+      actions: read
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Determine LinkedIn recovery window
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,14 +46,26 @@ jobs:
           echo "LINKEDIN_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" >> "$GITHUB_ENV"
           echo "LINKEDIN_LAST_SUCCESS_AT=${last_success_at}" >> "$GITHUB_ENV"
           echo "Requested lookback: ${REQUESTED_LOOKBACK_HOURS}h; last successful run: ${last_success_at:-unavailable}"
-
       - name: Run scraper script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python scraper.py
 
-      - name: Frontfill Freehire compatibility
+  freehire_compat:
+    needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Incrementally classify Freehire compatibility
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -70,5 +74,99 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FREEHIRE_DRAIN_BACKLOG: "false"
-          FREEHIRE_CLASSIFY_LIMIT: "100"
+          FREEHIRE_CLASSIFY_LIMIT: "300"
         run: python frontfill_freehire_compat.py
+
+  analyze_jobs:
+    needs: freehire_compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: linkedin-job-insights-analysis
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Incrementally analyze job insights
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || secrets.GEMINI_FIRST_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          JOB_INSIGHTS_ARCHETYPE: "software_tpm"
+          JOB_INSIGHTS_BACKFILL_ALL: "false"
+          JOB_INSIGHTS_REPLACEMENT_BACKFILL: "false"
+          JOB_INSIGHTS_MAX_JOBS: "100"
+        run: python analyze_jobs.py
+
+  publication_gate:
+    if: ${{ always() }}
+    needs: [scrape, freehire_compat, analyze_jobs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      scrape_watermark: ${{ steps.gate.outputs.scrape_watermark }}
+      published: ${{ steps.gate.outputs.published }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install focused gate dependencies
+        run: pip install python-dotenv supabase
+      - name: Verify pipeline and publication view
+        id: gate
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: >-
+          python publication_gate.py
+          --scrape-result "${{ needs.scrape.result }}"
+          --freehire-compat-result "${{ needs.freehire_compat.result }}"
+          --analyze-jobs-result "${{ needs.analyze_jobs.result }}"
+
+  downstream_dispatch:
+    needs: publication_gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch publication-ready event when configured
+        env:
+          DOWNSTREAM_SYNC_REPOSITORY: ${{ vars.DOWNSTREAM_SYNC_REPOSITORY }}
+          DOWNSTREAM_SYNC_TOKEN: ${{ secrets.DOWNSTREAM_SYNC_TOKEN }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SCRAPE_WATERMARK: ${{ needs.publication_gate.outputs.scrape_watermark }}
+        run: |
+          if [[ -z "$DOWNSTREAM_SYNC_REPOSITORY" || -z "$DOWNSTREAM_SYNC_TOKEN" ]]; then
+            echo "Downstream dispatch is not configured; set DOWNSTREAM_SYNC_REPOSITORY and DOWNSTREAM_SYNC_TOKEN to enable it."
+            exit 0
+          fi
+          if [[ ! "$DOWNSTREAM_SYNC_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid DOWNSTREAM_SYNC_REPOSITORY; expected owner/repository." >&2
+            exit 2
+          fi
+          payload="$(jq -n \
+            --arg event_type "job-scraper-publication-ready" \
+            --arg source_repository "$SOURCE_REPOSITORY" \
+            --arg sha "$SOURCE_SHA" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg scrape_watermark "$SCRAPE_WATERMARK" \
+            '{event_type: $event_type, client_payload: {source_repository: $source_repository, sha: $sha, run_id: $run_id, scrape_watermark: (if $scrape_watermark == "" then null else $scrape_watermark end)}}')"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --url "https://api.github.com/repos/${DOWNSTREAM_SYNC_REPOSITORY}/dispatches" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${DOWNSTREAM_SYNC_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --data "$payload"
+          echo "Dispatched job-scraper-publication-ready to configured downstream repository."

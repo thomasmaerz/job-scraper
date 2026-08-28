@@ -16,7 +16,9 @@ SELECT_FIELDS = (
     "freehire_category,freehire_seniority,is_remote,freehire_remote_evidence,"
     "freehire_compat_status,freehire_compat_input_hash,freehire_compat_import_hash,"
     "freehire_compat_model,freehire_compat_prompt_version,freehire_compat_schema_version,"
-    "freehire_compat_attempts,freehire_compat_claimed_at,freehire_compat_next_retry_at,"
+    "freehire_compat_confidence,freehire_compat_classified_at,freehire_compat_error,"
+    "freehire_compat_attempts,freehire_compat_claimed_at,freehire_compat_claimed_by,"
+    "freehire_compat_next_retry_at,"
     "last_checked,detail_metadata_checked_at,salary_text,salary_min,salary_max,salary_currency,"
     "applicant_count,applicant_count_text,applicant_count_type,recruiter_name,"
     "recruiter_profile_url,recruiter_identifier,original_job_id,seen_count,posting_wave_count,"
@@ -67,12 +69,52 @@ def fetch_candidates(
     return query.range(0, page_size - 1).execute().data or []
 
 
+def fetch_frontfill_candidates(db, limit: int, now: datetime | None = None) -> list[dict]:
+    """Fetch only a bounded, actionable newest-first hourly work set."""
+    now = now or datetime.now(timezone.utc)
+    retry_cutoff = now.isoformat()
+    lease_cutoff = (now - timedelta(minutes=30)).isoformat()
+    stale_current = ",".join((
+        "freehire_compat_input_hash.is.null",
+        "freehire_compat_import_hash.is.null",
+        "freehire_compat_model.is.null",
+        "freehire_category.is.null",
+        "freehire_compat_schema_version.is.null",
+        f"freehire_compat_schema_version.neq.{config.FREEHIRE_COMPAT_SCHEMA_VERSION}",
+        "freehire_compat_prompt_version.is.null",
+        f"freehire_compat_prompt_version.neq.{config.FREEHIRE_COMPAT_PROMPT_VERSION}",
+    ))
+    eligibility = ",".join((
+        "freehire_compat_status.eq.pending",
+        "and(freehire_compat_status.eq.failed,"
+        f"freehire_compat_attempts.lt.{config.FREEHIRE_CLASSIFY_MAX_DURABLE_ATTEMPTS},"
+        f"or(freehire_compat_next_retry_at.is.null,freehire_compat_next_retry_at.lte.{retry_cutoff}))",
+        "and(freehire_compat_status.eq.processing,"
+        f"or(freehire_compat_claimed_at.is.null,freehire_compat_claimed_at.lt.{lease_cutoff}))",
+        f"and(freehire_compat_status.eq.current,or({stale_current}))",
+    ))
+    return (
+        db.table(config.SUPABASE_TABLE_NAME)
+        .select(SELECT_FIELDS)
+        .eq("provider", "linkedin")
+        .not_.is_("description", None)
+        .or_(eligibility)
+        .order("last_seen_at", desc=True, nullsfirst=False)
+        .order("job_id", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
 def _valid_current(row: dict, input_hash: str) -> bool:
     return (
         row.get("freehire_compat_status") == "current"
         and row.get("freehire_compat_input_hash") == input_hash
         and row.get("freehire_compat_schema_version") == config.FREEHIRE_COMPAT_SCHEMA_VERSION
         and row.get("freehire_compat_prompt_version") == config.FREEHIRE_COMPAT_PROMPT_VERSION
+        and bool(row.get("freehire_compat_model"))
         and freehire_compat.normalize_category(row.get("freehire_category")) is not None
         and freehire_compat.normalize_seniority(row.get("freehire_seniority")) is not None
     )
@@ -91,13 +133,21 @@ def _expired_claim(row: dict) -> bool:
     return claimed_at < datetime.now(timezone.utc) - timedelta(minutes=30)
 
 
-def _claim(db, row: dict, worker_id: str) -> bool:
-    response = db.rpc("claim_freehire_compat_job", {
+def _claim(
+    db,
+    row: dict,
+    worker_id: str,
+    replacement_before: datetime | None = None,
+) -> bool:
+    params = {
         "p_job_id": str(row["job_id"]),
         "p_expected_input_hash": freehire_compat.compute_classification_hash(row),
         "p_expected_source_snapshot": freehire_compat.source_snapshot(row),
         "p_worker_id": worker_id,
-    }).execute()
+    }
+    if replacement_before is not None:
+        params["p_replacement_before"] = replacement_before.isoformat()
+    response = db.rpc("claim_freehire_compat_job", params).execute()
     return response.data is True or response.data == [True]
 
 
@@ -126,14 +176,31 @@ def _retry_ready(row: dict) -> bool:
     return retry_at <= datetime.now(timezone.utc)
 
 
+def _replacement_cutoff(value: str | datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("replacement_before must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
 def run(
     apply: bool = False,
     limit: int | None = None,
     drain_backlog: bool = False,
     replacement_backfill: bool = False,
+    replacement_before: str | datetime | None = None,
     db=None,
     client=None,
 ) -> dict:
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    replacement_cutoff = _replacement_cutoff(replacement_before)
+    if replacement_backfill and replacement_cutoff is None:
+        raise ValueError(
+            "replacement_backfill requires replacement_before so capped reruns resume safely"
+        )
     db = db or _get_db()
     if not apply:
         client = None
@@ -159,14 +226,17 @@ def run(
     }
     # --drain-backlog controls eligibility/sweep intent only. `limit` remains a
     # hard per-process ceiling so a recovery run cannot become unbounded.
-    upper_bound = get_upper_bound(db)
-    if upper_bound is None:
-        return counts
-
+    full_scan = drain_backlog or replacement_backfill
+    upper_bound = get_upper_bound(db) if full_scan else None
     last_job_id = None
     pending: list[dict] = []
     while True:
-        page = fetch_candidates(db, last_job_id=last_job_id, upper_bound=upper_bound)
+        if full_scan:
+            if upper_bound is None:
+                break
+            page = fetch_candidates(db, last_job_id=last_job_id, upper_bound=upper_bound)
+        else:
+            page = fetch_frontfill_candidates(db, limit)
         if not page:
             break
         for row in page:
@@ -177,7 +247,21 @@ def run(
             import_hash = freehire_compat.compute_import_hash(
                 {**row, "freehire_remote_evidence": evidence}, is_remote=is_remote
             )
-            current = _valid_current(row, input_hash) and not replacement_backfill
+            valid_current = _valid_current(row, input_hash)
+            classified_at = row.get("freehire_compat_classified_at")
+            replacement_eligible = False
+            if replacement_cutoff is not None and valid_current:
+                if not classified_at:
+                    replacement_eligible = True
+                else:
+                    try:
+                        replacement_eligible = (
+                            datetime.fromisoformat(str(classified_at).replace("Z", "+00:00"))
+                            < replacement_cutoff
+                        )
+                    except ValueError:
+                        replacement_eligible = True
+            current = valid_current and not replacement_eligible
             deterministic_current = (
                 row.get("is_remote") == is_remote
                 and row.get("freehire_remote_evidence") == evidence
@@ -208,6 +292,8 @@ def run(
             if len(pending) < limit:
                 pending.append(row)
                 counts["would_classify"] += 1
+        if not full_scan:
+            break
         last_job_id = str(page[-1]["job_id"])
         if len(page) < config.FREEHIRE_CLASSIFY_PAGE_SIZE:
             break
@@ -220,7 +306,10 @@ def run(
     for pending_batch in freehire_compat.pack_batches(pending, model=freehire_compat.model_name(client)):
         if request_budget <= 0:
             break
-        claimed = [row for row in pending_batch if _claim(db, row, worker_id)]
+        claimed = [
+            row for row in pending_batch
+            if _claim(db, row, worker_id, replacement_cutoff)
+        ]
         batch = []
         for claimed_row in claimed:
             fresh = (
@@ -300,12 +389,18 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=positive_int, default=int(os.getenv("FREEHIRE_CLASSIFY_LIMIT", config.FREEHIRE_CLASSIFY_LIMIT)))
     parser.add_argument("--drain-backlog", action="store_true", default=os.getenv("FREEHIRE_DRAIN_BACKLOG", "false").lower() == "true")
     parser.add_argument("--replacement-backfill", action="store_true", default=os.getenv("FREEHIRE_REPLACEMENT_BACKFILL", "false").lower() == "true")
+    parser.add_argument(
+        "--replacement-before",
+        default=os.getenv("FREEHIRE_REPLACEMENT_BEFORE"),
+        help="Stable ISO-8601 cutoff required for resumable replacement backfills",
+    )
     args = parser.parse_args(argv)
     result = run(
         apply=args.apply,
         limit=args.limit,
         drain_backlog=args.drain_backlog,
         replacement_backfill=args.replacement_backfill,
+        replacement_before=args.replacement_before,
     )
     logging.info("Freehire compatibility status=%s stats=%s", result_status(result), result)
     print(result)

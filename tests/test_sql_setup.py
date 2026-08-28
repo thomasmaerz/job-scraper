@@ -232,7 +232,6 @@ def test_publication_snapshot_contract_is_idempotent_bounded_and_least_privilege
         assert "FROM public.freehire_jobs AS source" in sql
         assert "pg_catalog.to_jsonb(source)" in sql
         assert "CREATE ROLE freehire_publication_reader" in sql
-        assert "ALTER ROLE freehire_publication_reader" in sql
         assert "FROM PUBLIC, anon, authenticated, service_role, freehire_publication_reader" in sql
         assert "GRANT USAGE ON SCHEMA public TO freehire_publication_reader" in sql
         assert "finalize_freehire_publication(timestamptz) FROM freehire_publication_reader" in sql

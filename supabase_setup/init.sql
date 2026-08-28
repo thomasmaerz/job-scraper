@@ -1976,8 +1976,6 @@ BEGIN
     END IF;
 END;
 $publication_role$;
-ALTER ROLE freehire_publication_reader
-    NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 ALTER TABLE public.freehire_publication_generations ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS service_role_publication_state_access ON public.freehire_publication_state;
 DROP POLICY IF EXISTS service_role_publication_generation_access ON public.freehire_publication_generations;

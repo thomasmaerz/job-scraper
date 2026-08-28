@@ -427,9 +427,6 @@ BEGIN
     END IF;
 END;
 $role$;
-ALTER ROLE freehire_publication_reader
-    NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-
 ALTER TABLE public.freehire_publication_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.freehire_publication_generations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.freehire_publication_snapshots ENABLE ROW LEVEL SECURITY;

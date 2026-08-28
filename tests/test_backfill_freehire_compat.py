@@ -303,6 +303,7 @@ def test_hourly_frontfill_rejects_limit_above_300(monkeypatch):
 
 
 def test_capped_replacement_requires_cutoff_and_resumes_by_classified_timestamp():
+    assert backfill_freehire_compat._replacement_cutoff("") is None
     with pytest.raises(ValueError, match="requires replacement_before"):
         backfill_freehire_compat.run(
             apply=False,

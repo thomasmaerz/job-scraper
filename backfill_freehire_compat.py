@@ -177,7 +177,7 @@ def _retry_ready(row: dict) -> bool:
 
 
 def _replacement_cutoff(value: str | datetime | None) -> datetime | None:
-    if value is None:
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:

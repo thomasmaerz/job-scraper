@@ -4,6 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _publication_function_body(sql, name, tag):
+    definitions = re.findall(
+        rf"CREATE OR REPLACE FUNCTION public\.{name}\b.*?AS \${tag}\$(.*?)\${tag}\$;",
+        sql,
+        re.DOTALL,
+    )
+    body = re.sub(r"--.*", "", definitions[-1])
+    return re.sub(r"\s+", "", body)
+
+
 def _jobs_columns(init_sql):
     create_table = re.search(
         r'CREATE TABLE IF NOT EXISTS "public"\."jobs" \((.*?)\n\);',
@@ -196,6 +206,74 @@ def test_same_id_repair_rpc_has_jsonb_cas_and_service_role_only_execute():
     assert 'supabase_utils.supabase.rpc("apply_same_id_relist_repair"' in backfill
     assert '.eq("listing_instances"' not in backfill
     assert "json.dumps" not in backfill
+
+
+def test_publication_snapshot_contract_is_idempotent_bounded_and_least_privilege():
+    migration = (ROOT / "supabase_setup" / "add_freehire_publication_snapshots.sql").read_text()
+    init = (ROOT / "supabase_setup" / "init.sql").read_text()
+
+    for sql in (migration, init):
+        assert "CREATE TABLE IF NOT EXISTS public.freehire_publication_state" in sql
+        assert "CREATE TABLE IF NOT EXISTS public.freehire_publication_generations" in sql
+        assert "CREATE TABLE IF NOT EXISTS public.freehire_publication_snapshots" in sql
+        assert "PRIMARY KEY (generation, canonical_job_id)" in sql
+        assert "import_hash text NOT NULL" in sql
+        assert "payload jsonb NOT NULL" in sql
+        assert "SECURITY DEFINER" in sql
+        assert "SET search_path = pg_catalog" in sql
+        assert "LOCK TABLE public.jobs IN SHARE MODE" in sql
+        assert "source_count = 0" in sql
+        assert "same-watermark publication generation % failed integrity validation" in sql
+        assert "p_source_scrape_watermark > authoritative_watermark" in sql
+        assert "p_source_scrape_watermark < authoritative_watermark" in sql
+        assert "LIMIT LEAST(p_page_size, 1000)" in sql
+        assert "ORDER BY retained.generation DESC" in sql
+        assert "LIMIT 3" in sql
+        assert "FROM public.freehire_jobs AS source" in sql
+        assert "pg_catalog.to_jsonb(source)" in sql
+        assert "CREATE ROLE freehire_publication_reader" in sql
+        assert "ALTER ROLE freehire_publication_reader" in sql
+        assert "FROM PUBLIC, anon, authenticated, service_role, freehire_publication_reader" in sql
+        assert "GRANT USAGE ON SCHEMA public TO freehire_publication_reader" in sql
+        assert "finalize_freehire_publication(timestamptz) FROM freehire_publication_reader" in sql
+        assert "get_freehire_publication_state() TO service_role" not in sql
+        assert "get_freehire_publication_page(bigint, text, integer) TO service_role" not in sql
+
+    assert "SET LOCAL lock_timeout = '10s'" in migration
+    assert "SET LOCAL statement_timeout = '5min'" in migration
+    assert "SET LOCAL idle_in_transaction_session_timeout = '6min'" in migration
+    assert init.index('CREATE OR REPLACE VIEW "public"."freehire_jobs"') < init.index(
+        "CREATE TABLE IF NOT EXISTS public.freehire_publication_state"
+    )
+
+
+def test_finalize_contract_is_transactional_idempotent_and_updates_state_after_copy():
+    sql = (ROOT / "supabase_setup" / "add_freehire_publication_snapshots.sql").read_text()
+    idempotency = "current_state.source_scrape_watermark = p_source_scrape_watermark"
+    copy = "INSERT INTO public.freehire_publication_snapshots"
+    completion = "INSERT INTO public.freehire_publication_generations"
+    update = "UPDATE public.freehire_publication_state AS state"
+
+    assert sql.index(idempotency) < sql.index(copy)
+    assert sql.index(copy) < sql.index(completion, sql.index(copy)) < sql.index(update)
+    assert "FOR UPDATE" in sql
+    assert "p_source_scrape_watermark IS NULL" in sql
+    assert "source scrape watermark cannot move backwards" in sql
+    assert "GET DIAGNOSTICS copied_count = ROW_COUNT" in sql
+
+
+def test_init_and_standalone_publication_rpc_definitions_are_exactly_aligned():
+    migration = (ROOT / "supabase_setup" / "add_freehire_publication_snapshots.sql").read_text()
+    init = (ROOT / "supabase_setup" / "init.sql").read_text()
+
+    for name in (
+        "finalize_freehire_publication",
+        "get_freehire_publication_state",
+        "get_freehire_publication_page",
+    ):
+        assert _publication_function_body(
+            migration, name, "function"
+        ) == _publication_function_body(init, name, "publication_hardened")
 
 
 def test_init_sql_adds_job_archetype_provenance_columns():

@@ -1,4 +1,4 @@
-"""Verify pipeline results and report the production publication contract."""
+"""Verify pipeline results and finalize an immutable publication generation."""
 
 import argparse
 import os
@@ -8,6 +8,7 @@ import config
 
 
 PIPELINE_JOBS = ("scrape", "freehire_compat", "analyze_jobs")
+PUBLICATION_SCHEMA_VERSION = "freehire-publication-v1"
 
 
 def _get_db():
@@ -102,10 +103,52 @@ def validate_publication_state(state: dict[str, int | str | None]) -> None:
         )
     if not state.get("scrape_watermark"):
         raise RuntimeError("Publication gate blocked: scrape watermark is absent")
-    if int(state.get("prior_publication") or 0) > 0 and published == 0:
+    if published == 0:
+        raise RuntimeError("Publication gate blocked: zero published rows")
+
+
+def finalize_publication(db, state: dict[str, int | str | None]) -> dict[str, int | str]:
+    watermark = state.get("scrape_watermark")
+    if not isinstance(watermark, str) or not watermark:
+        raise RuntimeError("Publication finalization requires a non-null scrape watermark")
+
+    response = db.rpc(
+        "finalize_freehire_publication",
+        {"p_source_scrape_watermark": watermark},
+    ).execute()
+    rows = response.data or []
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        raise RuntimeError("Publication finalization did not return exactly one state row")
+
+    publication = rows[0]
+    generation = publication.get("generation")
+    row_count = publication.get("row_count")
+    returned_watermark = publication.get("source_scrape_watermark")
+    published_at = publication.get("published_at")
+    schema_version = publication.get("schema_version")
+    if not isinstance(generation, int) or generation <= 0:
+        raise RuntimeError("Publication finalization returned an invalid generation")
+    if not isinstance(row_count, int) or row_count < 0:
+        raise RuntimeError("Publication finalization returned an invalid row count")
+    if returned_watermark != watermark:
         raise RuntimeError(
-            "Publication gate blocked: zero published rows after prior classification publication exists"
+            "Publication finalization returned a different scrape watermark "
+            f"({returned_watermark!r} != {watermark!r})"
         )
+    if not isinstance(published_at, str) or not published_at:
+        raise RuntimeError("Publication finalization returned an invalid publication time")
+    if schema_version != PUBLICATION_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Publication finalization returned an unsupported schema version "
+            f"({schema_version!r})"
+        )
+    return {
+        "generation": generation,
+        "published_at": published_at,
+        "source_scrape_watermark": returned_watermark,
+        "row_count": row_count,
+        "schema_version": schema_version,
+    }
 
 
 def write_github_outputs(state: dict[str, int | str | None], output_path: str | None) -> None:
@@ -132,14 +175,18 @@ def main() -> None:
         "analyze_jobs": args.analyze_jobs_result,
     }
     verify_pipeline_results(results)
-    state = query_publication_state()
+    db = _get_db()
+    state = query_publication_state(db)
     validate_publication_state(state)
+    state.update(finalize_publication(db, state))
     print(
         "Publication state: "
         f"total={state['total']} current={state['current']} pending={state['pending']} "
         f"failed={state['failed']} processing={state['processing']} stale={state['stale']} "
         f"published={state['published']} prior_publication={state['prior_publication']} "
-        f"scrape_watermark={state['scrape_watermark'] or 'unavailable'}"
+        f"scrape_watermark={state['scrape_watermark'] or 'unavailable'} "
+        f"generation={state['generation']} published_at={state['published_at']} "
+        f"schema_version={state['schema_version']} row_count={state['row_count']}"
     )
     write_github_outputs(state, os.getenv("GITHUB_OUTPUT"))
 

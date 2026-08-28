@@ -2,7 +2,8 @@ name: Hourly Job Publication Pipeline
 
 on:
   schedule:
-    - cron: "5 * * * *"
+    - cron: "5 0,9-21 * * *"
+      timezone: "America/New_York"
   workflow_dispatch:
     inputs:
       lookback_hours:
@@ -115,6 +116,10 @@ jobs:
     outputs:
       scrape_watermark: ${{ steps.gate.outputs.scrape_watermark }}
       published: ${{ steps.gate.outputs.published }}
+      generation: ${{ steps.gate.outputs.generation }}
+      published_at: ${{ steps.gate.outputs.published_at }}
+      row_count: ${{ steps.gate.outputs.row_count }}
+      schema_version: ${{ steps.gate.outputs.schema_version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -122,7 +127,7 @@ jobs:
           python-version: "3.11"
       - name: Install focused gate dependencies
         run: pip install python-dotenv supabase
-      - name: Verify pipeline and publication view
+      - name: Verify and finalize source publication
         id: gate
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -132,41 +137,3 @@ jobs:
           --scrape-result "${{ needs.scrape.result }}"
           --freehire-compat-result "${{ needs.freehire_compat.result }}"
           --analyze-jobs-result "${{ needs.analyze_jobs.result }}"
-
-  downstream_dispatch:
-    needs: publication_gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Dispatch publication-ready event when configured
-        env:
-          DOWNSTREAM_SYNC_REPOSITORY: ${{ vars.DOWNSTREAM_SYNC_REPOSITORY }}
-          DOWNSTREAM_SYNC_TOKEN: ${{ secrets.DOWNSTREAM_SYNC_TOKEN }}
-          SOURCE_REPOSITORY: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
-          SOURCE_RUN_ID: ${{ github.run_id }}
-          SCRAPE_WATERMARK: ${{ needs.publication_gate.outputs.scrape_watermark }}
-        run: |
-          if [[ -z "$DOWNSTREAM_SYNC_REPOSITORY" || -z "$DOWNSTREAM_SYNC_TOKEN" ]]; then
-            echo "Downstream dispatch is not configured; set DOWNSTREAM_SYNC_REPOSITORY and DOWNSTREAM_SYNC_TOKEN to enable it."
-            exit 0
-          fi
-          if [[ ! "$DOWNSTREAM_SYNC_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "Invalid DOWNSTREAM_SYNC_REPOSITORY; expected owner/repository." >&2
-            exit 2
-          fi
-          payload="$(jq -n \
-            --arg event_type "job-scraper-publication-ready" \
-            --arg source_repository "$SOURCE_REPOSITORY" \
-            --arg sha "$SOURCE_SHA" \
-            --arg run_id "$SOURCE_RUN_ID" \
-            --arg scrape_watermark "$SCRAPE_WATERMARK" \
-            '{event_type: $event_type, client_payload: {source_repository: $source_repository, sha: $sha, run_id: $run_id, scrape_watermark: (if $scrape_watermark == "" then null else $scrape_watermark end)}}')"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --url "https://api.github.com/repos/${DOWNSTREAM_SYNC_REPOSITORY}/dispatches" \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${DOWNSTREAM_SYNC_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --data "$payload"
-          echo "Dispatched job-scraper-publication-ready to configured downstream repository."

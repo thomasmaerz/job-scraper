@@ -57,6 +57,20 @@ class Db:
     def table(self, name):
         return Query(self, name)
 
+    def rpc(self, name, params):
+        assert name == "finalize_freehire_publication"
+        assert params == {"p_source_scrape_watermark": "2025-01-02T03:04:05+00:00"}
+        self.rpc_calls = getattr(self, "rpc_calls", []) + [(name, params)]
+        return SimpleNamespace(
+            execute=lambda: SimpleNamespace(data=[{
+                "generation": 7,
+                "published_at": "2025-01-02T03:10:00+00:00",
+                "source_scrape_watermark": "2025-01-02T03:04:05+00:00",
+                "row_count": 10,
+                "schema_version": "freehire-publication-v1",
+            }])
+        )
+
 
 def test_verify_pipeline_results_requires_every_dependency_success():
     publication_gate.verify_pipeline_results(
@@ -140,3 +154,44 @@ def test_validation_does_not_block_historical_pending_backlog():
         "prior_publication": 12,
         "scrape_watermark": "2025-01-02T03:04:05+00:00",
     })
+
+
+def test_finalize_publication_verifies_and_returns_snapshot_metadata():
+    db = Db()
+    publication = publication_gate.finalize_publication(db, {
+        "published": 10,
+        "scrape_watermark": "2025-01-02T03:04:05+00:00",
+    })
+
+    assert publication == {
+        "generation": 7,
+        "published_at": "2025-01-02T03:10:00+00:00",
+        "source_scrape_watermark": "2025-01-02T03:04:05+00:00",
+        "row_count": 10,
+        "schema_version": "freehire-publication-v1",
+    }
+
+
+def test_repeated_finalize_with_same_watermark_returns_same_generation():
+    db = Db()
+    state = {
+        "published": 10,
+        "scrape_watermark": "2025-01-02T03:04:05+00:00",
+    }
+
+    first = publication_gate.finalize_publication(db, state)
+    repeated = publication_gate.finalize_publication(db, state)
+
+    assert first == repeated
+    assert first["generation"] == 7
+    assert len(db.rpc_calls) == 2
+
+
+def test_finalize_publication_uses_transactional_rpc_count():
+    db = Db()
+    publication = publication_gate.finalize_publication(db, {
+        "published": 11,
+        "scrape_watermark": "2025-01-02T03:04:05+00:00",
+    })
+
+    assert publication["row_count"] == 10

@@ -132,7 +132,7 @@ This project is designed to run primarily through GitHub Actions. Follow these s
 
 Once the setup is complete and GitHub Actions are enabled, the workflows defined in [workflows](.github/workflows/) are scheduled to run automatically:
 
-- **`scrape_jobs.yml`**: At minute 5 of every hour, serially orchestrates separate, observable jobs: scrape, a bounded Freehire compatibility increment (hard limit `300`), a bounded job-insights increment, the production publication gate, and optional downstream dispatch. Hourly compatibility reads only the newest actionable pending/stale/retry-ready/expired-lease rows; explicit drain/replacement recovery retains complete keyset scanning. The gate reports total/current/pending/failed/processing/stale/published, validates publication through `freehire_jobs`, requires the scrape watermark, and does not block only because historical pending rows remain. Downstream dispatch stays disabled unless both `DOWNSTREAM_SYNC_REPOSITORY` and `DOWNSTREAM_SYNC_TOKEN` are configured.
+- **`scrape_jobs.yml`**: At 00:05 and hourly from 09:05 through 21:05 America/New_York, serially orchestrates scrape, a bounded Freehire compatibility increment (hard limit `300`), a bounded job-insights increment, and source publication finalization. The IANA timezone schedule preserves these Eastern wall-clock times across DST; 21:05 ET is 18:05 PT. Hourly compatibility reads only the newest actionable pending/stale/retry-ready/expired-lease rows; explicit drain/replacement recovery retains complete keyset scanning. The gate reports total/current/pending/failed/processing/stale/published, validates `freehire_jobs`, then transactionally publishes an immutable generation. Historical pending and failed rows remain informational and do not block current rows. The source pipeline ends after finalization and never contacts downstream.
 - **`score_jobs.yml`**: Periodically scores the newly scraped jobs and jobs with custom resumes against your parsed resume / custom resume and updates the scores in the database.
 - **`job_manager.yml`**: Periodically manages job statuses (e.g., marks old jobs as expired, checks if active jobs are still available).
 - **`analyze_jobs.yml`**: Manual-only recovery for insight backlog draining or replacement analysis. Scheduled incremental analysis is owned exclusively by `scrape_jobs.yml`; hourly and manual analysis jobs share a dedicated non-cancelling concurrency group.
@@ -142,11 +142,23 @@ Once the setup is complete and GitHub Actions are enabled, the workflows defined
 
 You can monitor the execution of these actions in the "Actions" tab of your repository.
 
-All publication-pipeline and manual recovery runs share the `linkedin-freehire-pipeline` concurrency group, so they never mutate compatibility/insight state concurrently. The publication gate queries production after all pipeline jobs succeed and reports `current`, `pending`, `failed`, and `published` counts. Pending and failed historical rows are informational and do not block already-current rows: `public.freehire_jobs` remains the per-row publication contract.
+All publication-pipeline and manual recovery runs share the `linkedin-freehire-pipeline` concurrency group, so they never mutate compatibility/insight state concurrently. The publication gate queries production after all pipeline jobs succeed and reports `current`, `pending`, `failed`, and `published` counts. Pending and failed historical rows are informational and do not block already-current rows: `public.freehire_jobs` remains the per-row input to publication snapshots.
 
 Set repository variable `JOB_INSIGHTS_MAX_JOBS` to tune the conservative hourly analysis cap; if unset, the workflow and `config.py` use `100`. The hourly job always keeps backlog draining and replacement analysis disabled, preserving incremental-only semantics.
 
-Downstream dispatch is disabled by default. To enable it, configure repository variable `DOWNSTREAM_SYNC_REPOSITORY` as `owner/repository` and secret `DOWNSTREAM_SYNC_TOKEN` with access to dispatch that repository. The pipeline then sends `repository_dispatch` event `job-scraper-publication-ready` with source repository, source SHA, run ID, and the scrape watermark when available. If either setting is absent, the workflow explicitly logs that dispatch is not configured and does not infer a target.
+### Pull-only downstream publication contract
+
+The source does not notify or contact downstream. `public.freehire_publication_state` identifies the latest completed generation with `generation`, `published_at`, `source_scrape_watermark`, `row_count`, and `schema_version`. `public.freehire_publication_snapshots` stores the complete immutable `freehire_jobs` row as `payload`, plus `canonical_job_id` and `import_hash`, keyed by `(generation, canonical_job_id)`. Exactly the latest three completed generations are retained. A page RPC transaction is safe during concurrent prune, but a generation is not guaranteed across an indefinitely slow sequence of page requests; finish promptly and restart from current state if it becomes unavailable.
+
+Downstream pull algorithm:
+
+1. Using a service-role credential, call `get_freehire_publication_state()` and save its generation and expected row count. Prefer a narrowly scoped proxy or custom database role, when available, instead of broadly exposing the Supabase service-role credential.
+2. Call `get_freehire_publication_page(generation, after_canonical_job_id, page_size)` repeatedly for that fixed generation. Start with a null cursor, use at most `1000`, and set the next cursor to the last returned `canonical_job_id`. Never switch generations during a pull.
+3. Upsert each payload by `canonical_job_id`; use `import_hash` to skip unchanged rows. Track every canonical ID seen in this generation.
+4. Only after all pages are received and the observed count equals state `row_count`, delete local rows absent from the completed generation.
+5. Atomically commit the local changes and downstream generation cursor at the end. On interruption, discard/retry the incomplete local transaction; never advance the cursor or perform absence deletion early.
+
+The state/page RPCs and backing tables are service-role-only. The page RPC uses keyset ordering by `canonical_job_id` and caps requests at `1000` rows.
 
 ## Usage
 
@@ -297,6 +309,20 @@ This fills only missing `salary_min`, `salary_max`, and `salary_currency`, prese
 - A last-seen listing ID is not used as a cursor because LinkedIn search ordering is not a durable total order and one ID cannot represent all configured queries.
 
 For one-off recovery, run the scraper workflow with `lookback_hours=96` or `168`. Normal scheduled runs return to the watermark-derived 48-hour minimum automatically.
+
+### Freehire publication snapshots
+
+The hourly source workflow finalizes an immutable, pull-only snapshot after all source jobs succeed. It does not contact or dispatch to a downstream system. `service_role` remains a source-side writer and is the only role allowed to execute `finalize_freehire_publication`; never distribute a `service_role` key downstream.
+
+The migration creates the dedicated `freehire_publication_reader` database role as `NOLOGIN`. Supabase API JWT issuance and role mapping are external to this repository. Operators must create a narrowly scoped JWT/database API role and map or grant it to `freehire_publication_reader`. That identity receives only `EXECUTE` on `get_freehire_publication_state()` and `get_freehire_publication_page(...)`; it receives no table privileges and cannot finalize. `anon` and `authenticated` remain denied.
+
+Consumers should:
+
+1. Read the current complete generation with `get_freehire_publication_state()`.
+2. Page that generation with `get_freehire_publication_page(...)`, using the last `canonical_job_id` as the keyset cursor and at most 1000 rows per request.
+3. Finish one generation promptly. Exactly the latest three complete generations are retained. Each page RPC transaction is safe against concurrent pruning, but a consumer spanning multiple page requests can fall behind retention. If the page RPC reports that a generation is unavailable, discard the partial import and restart from current state.
+
+Finalization serializes publishers and takes a bounded `SHARE` lock on `jobs`, so source validation and copying use one unchanged relational view in a single transaction. Empty generations are rejected. The RPC validates authoritative watermark direction, same-watermark integrity, schema/count metadata, and copied count before advancing state, then prunes only completed generations.
 
 ## Project Structure
 

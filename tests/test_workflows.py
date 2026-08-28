@@ -1,4 +1,6 @@
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -20,7 +22,10 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
     workflow = load_workflow("scrape_jobs.yml")
 
     assert workflow["name"] == "Hourly Job Publication Pipeline"
-    assert triggers(workflow)["schedule"] == [{"cron": "5 * * * *"}]
+    assert triggers(workflow)["schedule"] == [{
+        "cron": "5 0,9-21 * * *",
+        "timezone": "America/New_York",
+    }]
     assert triggers(workflow)["workflow_dispatch"]["inputs"]["lookback_hours"]["default"] == "48"
     assert workflow["concurrency"] == {
         "group": "linkedin-freehire-pipeline",
@@ -53,12 +58,10 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
         "freehire_compat",
         "analyze_jobs",
         "publication_gate",
-        "downstream_dispatch",
     ]
     assert jobs["freehire_compat"]["needs"] == "scrape"
     assert jobs["analyze_jobs"]["needs"] == "freehire_compat"
     assert jobs["publication_gate"]["needs"] == ["scrape", "freehire_compat", "analyze_jobs"]
-    assert jobs["downstream_dispatch"]["needs"] == "publication_gate"
     assert jobs["freehire_compat"]["timeout-minutes"] == 45
     assert jobs["analyze_jobs"]["timeout-minutes"] == 45
     assert jobs["analyze_jobs"]["concurrency"] == {
@@ -66,7 +69,6 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
         "cancel-in-progress": False,
     }
     assert jobs["publication_gate"]["timeout-minutes"] == 10
-    assert jobs["downstream_dispatch"]["timeout-minutes"] == 5
 
     compat_step = jobs["freehire_compat"]["steps"][-1]
     assert compat_step["env"]["FREEHIRE_CLASSIFY_LIMIT"] == "300"
@@ -91,24 +93,27 @@ def test_publication_gate_checks_results_and_production_contract():
     assert '--freehire-compat-result "${{ needs.freehire_compat.result }}"' in run
     assert '--analyze-jobs-result "${{ needs.analyze_jobs.result }}"' in run
     assert gate["outputs"]["scrape_watermark"] == "${{ steps.gate.outputs.scrape_watermark }}"
+    assert gate["outputs"]["generation"] == "${{ steps.gate.outputs.generation }}"
+    assert gate["outputs"]["schema_version"] == "${{ steps.gate.outputs.schema_version }}"
 
 
-def test_downstream_dispatch_is_configurable_and_does_not_guess_or_print_token():
+def test_source_pipeline_is_pull_only_and_ends_after_finalization():
     workflow = load_workflow("scrape_jobs.yml")
-    step = workflow["jobs"]["downstream_dispatch"]["steps"][0]
-    run = step["run"]
 
-    assert step["env"]["DOWNSTREAM_SYNC_REPOSITORY"] == "${{ vars.DOWNSTREAM_SYNC_REPOSITORY }}"
-    assert step["env"]["DOWNSTREAM_SYNC_TOKEN"] == "${{ secrets.DOWNSTREAM_SYNC_TOKEN }}"
-    assert "Downstream dispatch is not configured" in run
-    assert "job-scraper-publication-ready" in run
-    assert "https://api.github.com/repos/${DOWNSTREAM_SYNC_REPOSITORY}/dispatches" in run
-    assert "source_repository" in run
-    assert "SOURCE_SHA" in run
-    assert "SOURCE_RUN_ID" in run
-    assert "SCRAPE_WATERMARK" in run
-    assert "set -x" not in run
-    assert "echo $DOWNSTREAM_SYNC_TOKEN" not in run
+    assert list(workflow["jobs"])[-1] == "publication_gate"
+
+
+def test_timezone_schedule_preserves_wall_clock_hours_across_dst():
+    schedule = triggers(load_workflow("scrape_jobs.yml"))["schedule"][0]
+
+    assert schedule["timezone"] == "America/New_York"
+    assert schedule["cron"] == "5 0,9-21 * * *"
+    eastern = ZoneInfo(schedule["timezone"])
+    winter = datetime(2025, 1, 15, 21, 5, tzinfo=eastern)
+    summer = datetime(2025, 7, 15, 21, 5, tzinfo=eastern)
+    assert winter.utcoffset() != summer.utcoffset()
+    assert (winter.hour, winter.minute) == (21, 5)
+    assert (summer.hour, summer.minute) == (21, 5)
 
 
 def test_freehire_recovery_is_manual_bounded_and_dry_run_by_default():

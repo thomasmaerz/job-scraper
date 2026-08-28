@@ -14,6 +14,17 @@ def _publication_function_body(sql, name, tag):
     return re.sub(r"\s+", "", body)
 
 
+def _function_body(sql, name):
+    definition = re.search(
+        rf"CREATE OR REPLACE FUNCTION public\.{name}\b.*?AS \$(\w*)\$(.*?)\$\1\$;",
+        sql,
+        re.DOTALL,
+    )
+    assert definition, f"missing public.{name} definition"
+    body = re.sub(r"--.*", "", definition.group(2))
+    return re.sub(r"\s+", "", body)
+
+
 def _jobs_columns(init_sql):
     create_table = re.search(
         r'CREATE TABLE IF NOT EXISTS "public"\."jobs" \((.*?)\n\);',
@@ -144,6 +155,15 @@ def test_cleanup_sql_drops_job_keyword_insights_table():
     assert 'DROP TABLE IF EXISTS "public"."job_keyword_insights" CASCADE;' in sql
     assert 'DROP TABLE IF EXISTS "public"."keyword_insights" CASCADE;' in sql
     assert 'DROP TABLE IF EXISTS "public"."jobs" CASCADE;' in sql
+    assert (
+        'DROP FUNCTION IF EXISTS "public"."replace_historical_repost_plan"(jsonb) CASCADE;'
+        in sql
+    )
+    assert (
+        'DROP FUNCTION IF EXISTS "public"."replace_job_keyword_facts_and_refresh_aggregates"'
+        '(text[], text, jsonb) CASCADE;'
+    ) in sql
+    assert 'DROP FUNCTION IF EXISTS "public"."rebuild_keyword_insights_atomic"() CASCADE;' in sql
     assert 'DROP FUNCTION IF EXISTS "public"."update_last_updated_column"() CASCADE;' in sql
 
 
@@ -151,6 +171,158 @@ def test_add_job_insights_sql_is_self_contained_for_last_updated_trigger():
     sql = (ROOT / "supabase_setup" / "add_job_insights.sql").read_text()
 
     assert 'CREATE OR REPLACE FUNCTION "public"."update_last_updated_column"() RETURNS "trigger"' in sql
+
+
+def test_incremental_keyword_insights_rpc_is_bounded_atomic_and_service_role_only():
+    migration = (ROOT / "supabase_setup" / "add_incremental_keyword_insights_rpc.sql").read_text()
+    init = (ROOT / "supabase_setup" / "init.sql").read_text()
+
+    for sql in (migration, init):
+        assert "CREATE OR REPLACE FUNCTION public.rebuild_keyword_insights_atomic()" in sql
+        assert "CREATE OR REPLACE FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates(" in sql
+        assert "SECURITY DEFINER" in sql
+        assert "SET search_path = pg_catalog, public" in sql
+        assert "cardinality(p_job_ids) > 1000" in sql
+        assert "jsonb_array_length(p_facts) > 50000" in sql
+        assert sql.count("hashtextextended('keyword-insights-aggregate-global', 0)") >= 3
+        assert sql.index("SELECT public.rebuild_keyword_insights_atomic();") < sql.index(
+            "CREATE OR REPLACE FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates("
+        )
+        assert "DELETE FROM public.keyword_insights;" in sql
+        assert "GROUP BY archetype, COALESCE(provider, 'unknown'), keyword, category" in sql
+        assert "SET LOCAL statement_timeout = '15min';" in sql
+        assert "LOCK TABLE public.job_keyword_insights, public.keyword_insights" in sql
+        assert "IN ACCESS EXCLUSIVE MODE;" in sql
+        assert "GREATEST(0, count + (v_delta->>'delta')::integer)" in sql
+        assert "AND count = 0" in sql
+        assert (
+            "REVOKE ALL ON FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates"
+            "(text[], text, jsonb) FROM PUBLIC, anon, authenticated;"
+        ) in sql
+        assert (
+            "GRANT EXECUTE ON FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates"
+            "(text[], text, jsonb) TO service_role;"
+        ) in sql
+        assert (
+            "REVOKE ALL ON FUNCTION public.rebuild_keyword_insights_atomic()"
+            "\nFROM PUBLIC, anon, authenticated;"
+        ) in sql
+        assert "GRANT EXECUTE ON FUNCTION public.rebuild_keyword_insights_atomic() TO service_role;" in sql
+        assert "ALTER FUNCTION public.rebuild_keyword_insights_atomic() OWNER TO postgres;" in sql
+        normalized = re.sub(r'["\s]', "", sql).lower()
+        assert (
+            "revokeallprivilegesontablepublic.keyword_insights,"
+            "public.job_keyword_insightsfrompublic,anon,authenticated,service_role;"
+            in normalized
+        )
+        assert (
+            "grantselectontablepublic.keyword_insights,public.job_keyword_insights"
+            "toanon,authenticated,service_role;"
+            in normalized
+        )
+
+
+def test_historical_merge_serializes_keyword_fact_moves_with_aggregate_writers():
+    sql = (ROOT / "supabase_setup" / "merge_historical_reposts.sql").read_text()
+    body = _function_body(sql, "merge_historical_repost_plan")
+
+    assert body.index("hashtextextended('keyword-insights-aggregate-global',0)") < body.index(
+        "INSERTINTOpublic.job_keyword_insights"
+    )
+    assert body.index("INSERTINTOpublic.job_keyword_insights") < body.index(
+        "DELETEFROMpublic.keyword_insights"
+    )
+    assert body.index("DELETEFROMpublic.keyword_insights") < body.index(
+        "RETURNQUERYSELECTgroup_count,deleted_count"
+    )
+    assert "FROMpublic.job_keyword_insightsGROUPBYarchetype," in body
+
+
+def test_historical_merge_staging_and_job_mutations_are_race_safe():
+    sql = (ROOT / "supabase_setup" / "merge_historical_reposts.sql").read_text()
+    replace_body = _function_body(sql, "replace_historical_repost_plan")
+    merge_body = _function_body(sql, "merge_historical_repost_plan")
+    plan_lock = "hashtextextended('historical-repost-plan-global',0)"
+
+    assert plan_lock in replace_body
+    assert replace_body.index(plan_lock) < replace_body.index(
+        "DELETEFROMpublic.job_repost_merge_plan"
+    )
+    assert "jsonb_typeof(p_plan)<>'array'" in replace_body
+    assert "jsonb_array_length(p_plan)>50000" in replace_body
+    assert "HAVINGcount(*)>1" in replace_body
+    assert plan_lock in merge_body
+    assert merge_body.index(plan_lock) < merge_body.index("FORUPDATEOFjobs")
+    assert merge_body.index("FORUPDATEOFjobs") < merge_body.index(
+        "SELECTDISTINCTsurvivor_job_id"
+    )
+    assert "SELECTsource_job_idFROMpublic.job_repost_merge_planUNIONSELECTsurvivor_job_id" in merge_body
+    assert "ORDERBYjobs.job_idFORUPDATEOFjobs" in merge_body
+
+    assert "SECURITY DEFINER" in sql[sql.index(
+        "CREATE OR REPLACE FUNCTION public.replace_historical_repost_plan"
+    ):sql.index("CREATE OR REPLACE FUNCTION public.merge_historical_repost_plan")]
+    assert (
+        "REVOKE ALL ON FUNCTION public.replace_historical_repost_plan(jsonb) "
+        "FROM PUBLIC, anon, authenticated;"
+    ) in sql
+    assert (
+        "GRANT EXECUTE ON FUNCTION public.replace_historical_repost_plan(jsonb) "
+        "TO service_role;"
+    ) in sql
+    assert (
+        "REVOKE ALL ON TABLE public.job_repost_merge_plan "
+        "FROM PUBLIC, anon, authenticated, service_role;"
+    ) in sql
+
+
+def test_historical_merge_function_is_aligned_between_migration_and_init():
+    migration = (ROOT / "supabase_setup" / "merge_historical_reposts.sql").read_text()
+    init = (ROOT / "supabase_setup" / "init.sql").read_text()
+
+    assert _function_body(migration, "merge_historical_repost_plan") == _function_body(
+        init, "merge_historical_repost_plan"
+    )
+    assert _function_body(migration, "replace_historical_repost_plan") == _function_body(
+        init, "replace_historical_repost_plan"
+    )
+
+
+def test_keyword_insight_tables_are_select_only_for_api_roles_in_all_deploy_paths():
+    filenames = (
+        "init.sql",
+        "add_job_insights.sql",
+        "add_incremental_keyword_insights_rpc.sql",
+        "merge_historical_reposts.sql",
+    )
+
+    for filename in filenames:
+        sql = (ROOT / "supabase_setup" / filename).read_text()
+        normalized = re.sub(r'["\s]', "", sql).lower()
+        assert not re.search(
+            r"grantall(?:privileges)?ontablepublic\.(?:job_)?keyword_insights",
+            normalized,
+        ), filename
+        assert (
+            "revokeallprivilegesontablepublic.keyword_insights,"
+            "public.job_keyword_insightsfrompublic,anon,authenticated,service_role;"
+            in normalized
+        ), filename
+        assert (
+            "grantselectontablepublic.keyword_insights,public.job_keyword_insights"
+            "toanon,authenticated,service_role;"
+            in normalized
+        ), filename
+
+    all_sql = "\n".join(
+        path.read_text() for path in (ROOT / "supabase_setup").glob("*.sql")
+    )
+    assert not re.search(
+        r'GRANT\s+ALL(?:\s+PRIVILEGES)?\s+ON\s+(?:TABLE\s+)?'
+        r'(?:(?:"?public"?)\.)?"?(?:job_)?keyword_insights"?',
+        all_sql,
+        re.IGNORECASE,
+    )
 
 
 def test_init_sql_uses_if_not_exists_for_setup_indexes():
@@ -176,7 +348,7 @@ def test_relist_and_freehire_security_and_snapshot_guards():
     assert "p_expected_source_snapshot jsonb" in freehire
     assert "p_expected_source_snapshot <@ to_jsonb(j)" in freehire
     assert "BEFORE UPDATE ON public.jobs" in freehire
-    assert "TRUNCATE" not in merge
+    assert not re.search(r"\bTRUNCATE\s+(?:TABLE\s+)?public\.jobs\b", merge)
     assert "LOCK TABLE public.base_resume" not in init
     for required in (
         "calculate_listing_posting_waves",

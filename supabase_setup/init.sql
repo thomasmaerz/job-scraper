@@ -276,7 +276,10 @@ ALTER TABLE "public"."jobs"
 ALTER TABLE "public"."jobs"
     ADD COLUMN IF NOT EXISTS "search_query" text,
     ADD COLUMN IF NOT EXISTS "archetype" text,
-    ADD COLUMN IF NOT EXISTS "filter_profile" text;
+    ADD COLUMN IF NOT EXISTS "filter_profile" text,
+    ADD COLUMN IF NOT EXISTS "location_province_code" text,
+    ADD COLUMN IF NOT EXISTS "location_scope" text,
+    ADD COLUMN IF NOT EXISTS "location_metro" text;
 
 COMMENT ON COLUMN "public"."jobs"."is_filtered" IS 'True if this job was flagged by the post-scrape filter as irrelevant (wrong domain, non-PM role, etc). Excluded from LLM scoring.';
 COMMENT ON COLUMN "public"."jobs"."filter_reason" IS 'Which filter rule triggered the flag, e.g. "title:construction" or "desc:construction firm". Used for auditing and regex refinement.';
@@ -1039,6 +1042,177 @@ CREATE OR REPLACE TRIGGER "update_customized_resumes_last_updated" BEFORE UPDATE
 CREATE OR REPLACE TRIGGER "update_keyword_insights_last_updated" BEFORE UPDATE ON "public"."keyword_insights" FOR EACH ROW EXECUTE FUNCTION "public"."update_last_updated_column"();
 
 
+-- Exact service-role-only rebuild used by migrations and repair flows.
+CREATE OR REPLACE FUNCTION public.rebuild_keyword_insights_atomic()
+RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    rebuilt_count integer;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('keyword-insights-aggregate-global', 0)
+    );
+
+    DELETE FROM public.keyword_insights;
+    INSERT INTO public.keyword_insights (
+        archetype, provider, keyword, category, count, last_updated
+    )
+    SELECT
+        archetype, COALESCE(provider, 'unknown'), keyword, category,
+        count(*)::integer, now()
+    FROM public.job_keyword_insights
+    GROUP BY archetype, COALESCE(provider, 'unknown'), keyword, category;
+
+    GET DIAGNOSTICS rebuilt_count = ROW_COUNT;
+    RETURN rebuilt_count;
+END;
+$$;
+
+ALTER FUNCTION public.rebuild_keyword_insights_atomic() OWNER TO postgres;
+REVOKE ALL ON FUNCTION public.rebuild_keyword_insights_atomic()
+FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.rebuild_keyword_insights_atomic() TO service_role;
+
+-- Establish an exact baseline before making the incremental writer available.
+SELECT pg_advisory_xact_lock(hashtextextended('keyword-insights-aggregate-global', 0));
+LOCK TABLE public.job_keyword_insights, public.keyword_insights
+IN ACCESS EXCLUSIVE MODE;
+SELECT public.rebuild_keyword_insights_atomic();
+
+-- Bounded, idempotent replacement used by incremental job-insights analysis.
+CREATE OR REPLACE FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates(
+    p_job_ids text[], p_archetype text, p_facts jsonb
+) RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_delta jsonb;
+    v_deltas jsonb;
+    v_fact_count integer := 0;
+    v_job_id text;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('keyword-insights-aggregate-global', 0)
+    );
+
+    IF p_job_ids IS NULL OR cardinality(p_job_ids) = 0 THEN
+        IF p_facts IS NULL OR p_facts = '[]'::jsonb THEN RETURN 0; END IF;
+        RAISE EXCEPTION 'p_job_ids must not be empty';
+    END IF;
+    IF cardinality(p_job_ids) > 1000 THEN
+        RAISE EXCEPTION 'p_job_ids exceeds the 1000-job RPC limit';
+    END IF;
+    IF EXISTS (SELECT 1 FROM unnest(p_job_ids) AS id WHERE id IS NULL OR btrim(id) = '') THEN
+        RAISE EXCEPTION 'p_job_ids must contain only non-empty IDs';
+    END IF;
+    IF p_archetype IS NULL OR btrim(p_archetype) = '' THEN
+        RAISE EXCEPTION 'p_archetype must not be empty';
+    END IF;
+    IF p_facts IS NULL OR jsonb_typeof(p_facts) <> 'array' THEN
+        RAISE EXCEPTION 'p_facts must be a JSON array';
+    END IF;
+    IF jsonb_array_length(p_facts) > 50000 THEN
+        RAISE EXCEPTION 'p_facts exceeds the 50000-fact RPC limit';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM jsonb_array_elements(p_facts) AS e(fact)
+        WHERE jsonb_typeof(fact) <> 'object'
+           OR jsonb_typeof(fact->'job_id') IS DISTINCT FROM 'string'
+           OR jsonb_typeof(fact->'archetype') IS DISTINCT FROM 'string'
+           OR jsonb_typeof(fact->'keyword') IS DISTINCT FROM 'string'
+           OR jsonb_typeof(fact->'category') IS DISTINCT FROM 'string'
+           OR (fact ? 'provider' AND fact->'provider' <> 'null'::jsonb
+               AND jsonb_typeof(fact->'provider') IS DISTINCT FROM 'string')
+           OR NOT ((fact->>'job_id') = ANY (p_job_ids))
+           OR fact->>'archetype' IS DISTINCT FROM p_archetype
+           OR btrim(fact->>'keyword') = ''
+           OR fact->>'category' NOT IN ('skill', 'technology', 'certification', 'attribute')
+    ) THEN
+        RAISE EXCEPTION 'p_facts contains an invalid or out-of-scope fact';
+    END IF;
+
+    FOR v_job_id IN SELECT DISTINCT id FROM unnest(p_job_ids) AS id ORDER BY id LOOP
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended('job-keyword-facts:' || p_archetype || ':' || v_job_id, 0)
+        );
+    END LOOP;
+
+    WITH new_facts AS MATERIALIZED (
+        SELECT DISTINCT ON (fact->>'job_id', fact->>'archetype', fact->>'keyword', fact->>'category')
+            fact->>'job_id' AS job_id, fact->>'archetype' AS archetype,
+            fact->>'keyword' AS keyword, fact->>'category' AS category,
+            NULLIF(fact->>'provider', '') AS provider
+        FROM jsonb_array_elements(p_facts) WITH ORDINALITY AS e(fact, ordinal)
+        ORDER BY fact->>'job_id', fact->>'archetype', fact->>'keyword', fact->>'category', ordinal
+    ), contributions AS (
+        SELECT archetype, COALESCE(provider, 'unknown') AS provider, keyword, category,
+               -count(*)::integer AS delta
+        FROM public.job_keyword_insights
+        WHERE job_id = ANY (p_job_ids) AND archetype = p_archetype
+        GROUP BY archetype, COALESCE(provider, 'unknown'), keyword, category
+        UNION ALL
+        SELECT archetype, COALESCE(provider, 'unknown'), keyword, category,
+               count(*)::integer AS delta
+        FROM new_facts
+        GROUP BY archetype, COALESCE(provider, 'unknown'), keyword, category
+    )
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'archetype', archetype, 'provider', provider, 'keyword', keyword,
+        'category', category, 'delta', delta
+    ) ORDER BY archetype, provider, keyword, category), '[]'::jsonb)
+    INTO v_deltas
+    FROM (
+        SELECT archetype, provider, keyword, category, sum(delta)::integer AS delta
+        FROM contributions GROUP BY archetype, provider, keyword, category
+        HAVING sum(delta) <> 0
+    ) AS net;
+
+    DELETE FROM public.job_keyword_insights
+    WHERE job_id = ANY (p_job_ids) AND archetype = p_archetype;
+
+    INSERT INTO public.job_keyword_insights (job_id, archetype, keyword, category, provider)
+    SELECT job_id, archetype, keyword, category, provider
+    FROM (
+        SELECT DISTINCT ON (fact->>'job_id', fact->>'archetype', fact->>'keyword', fact->>'category')
+            fact->>'job_id' AS job_id, fact->>'archetype' AS archetype,
+            fact->>'keyword' AS keyword, fact->>'category' AS category,
+            NULLIF(fact->>'provider', '') AS provider
+        FROM jsonb_array_elements(p_facts) WITH ORDINALITY AS e(fact, ordinal)
+        ORDER BY fact->>'job_id', fact->>'archetype', fact->>'keyword', fact->>'category', ordinal
+    ) AS new_facts;
+    GET DIAGNOSTICS v_fact_count = ROW_COUNT;
+
+    FOR v_delta IN SELECT value FROM jsonb_array_elements(v_deltas) LOOP
+        IF (v_delta->>'delta')::integer > 0 THEN
+            INSERT INTO public.keyword_insights (archetype, provider, keyword, category, count)
+            VALUES (
+                v_delta->>'archetype', v_delta->>'provider', v_delta->>'keyword',
+                v_delta->>'category', (v_delta->>'delta')::integer
+            )
+            ON CONFLICT (archetype, provider, keyword, category) DO UPDATE
+            SET count = public.keyword_insights.count + EXCLUDED.count;
+        ELSE
+            UPDATE public.keyword_insights
+            SET count = GREATEST(0, count + (v_delta->>'delta')::integer)
+            WHERE archetype = v_delta->>'archetype' AND provider = v_delta->>'provider'
+              AND keyword = v_delta->>'keyword' AND category = v_delta->>'category';
+            DELETE FROM public.keyword_insights
+            WHERE archetype = v_delta->>'archetype' AND provider = v_delta->>'provider'
+              AND keyword = v_delta->>'keyword' AND category = v_delta->>'category'
+              AND count = 0;
+        END IF;
+    END LOOP;
+    RETURN v_fact_count;
+END;
+$$;
+ALTER FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates(text[], text, jsonb) OWNER TO postgres;
+REVOKE ALL ON FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates(text[], text, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.replace_job_keyword_facts_and_refresh_aggregates(text[], text, jsonb) TO service_role;
+
+
 
 DO $$ BEGIN
     IF NOT EXISTS (
@@ -1137,14 +1311,12 @@ GRANT ALL ON TABLE "public"."customized_resumes" TO "authenticated";
 GRANT ALL ON TABLE "public"."customized_resumes" TO "service_role";
 
 
-GRANT ALL ON TABLE "public"."keyword_insights" TO "anon";
-GRANT ALL ON TABLE "public"."keyword_insights" TO "authenticated";
-GRANT ALL ON TABLE "public"."keyword_insights" TO "service_role";
-
-
-GRANT ALL ON TABLE "public"."job_keyword_insights" TO "anon";
-GRANT ALL ON TABLE "public"."job_keyword_insights" TO "authenticated";
-GRANT ALL ON TABLE "public"."job_keyword_insights" TO "service_role";
+REVOKE ALL PRIVILEGES ON TABLE
+"public"."keyword_insights", "public"."job_keyword_insights"
+FROM PUBLIC, "anon", "authenticated", "service_role";
+GRANT SELECT ON TABLE
+"public"."keyword_insights", "public"."job_keyword_insights"
+TO "anon", "authenticated", "service_role";
 
 
 
@@ -1568,6 +1740,438 @@ $$;
 
 REVOKE ALL ON FUNCTION public.calculate_listing_posting_waves(jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.calculate_listing_posting_waves(jsonb) TO service_role;
+
+-- Historical repost consolidation schema and RPC. Keep this definition aligned
+-- with merge_historical_reposts.sql so fresh installs and standalone upgrades
+-- provide the same atomic keyword fact/aggregate behavior.
+CREATE TABLE IF NOT EXISTS public.job_listing_archive (
+    provider text NOT NULL,
+    source_job_id text NOT NULL,
+    canonical_job_id text NOT NULL REFERENCES public.jobs(job_id) ON DELETE CASCADE,
+    observed_at timestamptz,
+    source_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (provider, source_job_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.job_resume_links (
+    canonical_job_id text NOT NULL REFERENCES public.jobs(job_id) ON DELETE CASCADE,
+    customized_resume_id uuid NOT NULL,
+    source_job_id text,
+    PRIMARY KEY (canonical_job_id, customized_resume_id)
+);
+
+ALTER TABLE public.job_resume_links
+    DROP CONSTRAINT IF EXISTS job_resume_links_customized_resume_id_fkey;
+
+CREATE TABLE IF NOT EXISTS public.job_repost_merge_plan (
+    source_job_id text PRIMARY KEY,
+    survivor_job_id text NOT NULL,
+    match_method text NOT NULL,
+    match_similarity numeric,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (source_job_id <> survivor_job_id)
+);
+
+ALTER TABLE public.job_listing_archive ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.job_resume_links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.job_repost_merge_plan ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.replace_historical_repost_plan(p_plan jsonb)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    plan_count integer;
+BEGIN
+    -- Staging and merging must observe one complete plan at a time.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('historical-repost-plan-global', 0)
+    );
+
+    IF p_plan IS NULL OR jsonb_typeof(p_plan) <> 'array' THEN
+        RAISE EXCEPTION 'Historical repost merge plan must be a JSON array';
+    END IF;
+
+    IF jsonb_array_length(p_plan) > 50000 THEN
+        RAISE EXCEPTION 'Historical repost merge plan exceeds 50000 rows';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_plan) AS plan(item)
+        WHERE jsonb_typeof(item) <> 'object'
+           OR jsonb_typeof(item->'source_job_id') IS DISTINCT FROM 'string'
+           OR btrim(item->>'source_job_id') = ''
+           OR jsonb_typeof(item->'survivor_job_id') IS DISTINCT FROM 'string'
+           OR btrim(item->>'survivor_job_id') = ''
+           OR jsonb_typeof(item->'match_method') IS DISTINCT FROM 'string'
+           OR btrim(item->>'match_method') = ''
+           OR (
+               item ? 'match_similarity'
+               AND jsonb_typeof(item->'match_similarity') NOT IN ('number', 'null')
+           )
+           OR item->>'source_job_id' = item->>'survivor_job_id'
+    ) THEN
+        RAISE EXCEPTION 'Historical repost merge plan contains an invalid row';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_plan) AS plan(item)
+        GROUP BY item->>'source_job_id'
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'Historical repost merge plan contains duplicate source jobs';
+    END IF;
+
+    DELETE FROM public.job_repost_merge_plan;
+
+    INSERT INTO public.job_repost_merge_plan (
+        source_job_id,
+        survivor_job_id,
+        match_method,
+        match_similarity
+    )
+    SELECT
+        item->>'source_job_id',
+        item->>'survivor_job_id',
+        item->>'match_method',
+        (item->>'match_similarity')::numeric
+    FROM jsonb_array_elements(p_plan) AS plan(item);
+
+    GET DIAGNOSTICS plan_count = ROW_COUNT;
+    RETURN plan_count;
+END;
+$$;
+
+ALTER FUNCTION public.replace_historical_repost_plan(jsonb) OWNER TO postgres;
+REVOKE ALL ON FUNCTION public.replace_historical_repost_plan(jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.replace_historical_repost_plan(jsonb) TO service_role;
+REVOKE ALL ON TABLE public.job_repost_merge_plan FROM PUBLIC, anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.merge_historical_repost_plan()
+RETURNS TABLE(merged_groups integer, deleted_rows integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    survivor text;
+    group_count integer := 0;
+    deleted_count integer := 0;
+    affected integer;
+BEGIN
+    -- Serialize execution with atomic plan replacement.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('historical-repost-plan-global', 0)
+    );
+
+    -- Keyword facts are moved below; serialize that mutation with delta/rebuild RPCs.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('keyword-insights-aggregate-global', 0)
+    );
+
+    -- Lock every source and survivor in one deterministic order before reading
+    -- or deleting any merge inputs. Concurrent scraper updates then wait for
+    -- this transaction instead of updating a row that is about to be removed.
+    PERFORM jobs.job_id
+    FROM public.jobs AS jobs
+    WHERE jobs.job_id IN (
+        SELECT source_job_id
+        FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id
+        FROM public.job_repost_merge_plan
+    )
+    ORDER BY jobs.job_id
+    FOR UPDATE OF jobs;
+
+    IF EXISTS (
+        SELECT 1
+        FROM public.job_repost_merge_plan p
+        LEFT JOIN public.jobs source ON source.job_id = p.source_job_id
+        LEFT JOIN public.jobs target ON target.job_id = p.survivor_job_id
+        WHERE source.job_id IS NULL OR target.job_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Merge plan contains missing source or survivor jobs';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM public.job_repost_merge_plan p
+        JOIN public.job_repost_merge_plan nested ON nested.source_job_id = p.survivor_job_id
+    ) THEN
+        RAISE EXCEPTION 'Merge plan contains survivor chains';
+    END IF;
+
+    FOR survivor IN
+        SELECT DISTINCT survivor_job_id FROM public.job_repost_merge_plan ORDER BY survivor_job_id
+    LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM public.jobs source
+            JOIN public.jobs target ON target.job_id = survivor
+            WHERE source.job_id IN (
+                SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+            )
+              AND source.archetype IS DISTINCT FROM target.archetype
+        ) THEN
+            RAISE EXCEPTION 'Merge group % contains conflicting archetypes', survivor;
+        END IF;
+
+        INSERT INTO public.job_listing_archive (
+            provider, source_job_id, canonical_job_id, observed_at, source_snapshot
+        )
+        SELECT
+            j.provider,
+            j.job_id,
+            survivor,
+            COALESCE(j.last_seen_at, j.scraped_at),
+            to_jsonb(j)
+        FROM public.jobs j
+        WHERE j.job_id = survivor
+           OR j.job_id IN (
+               SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+           )
+        ON CONFLICT (provider, source_job_id) DO UPDATE SET
+            canonical_job_id = EXCLUDED.canonical_job_id,
+            observed_at = EXCLUDED.observed_at,
+            source_snapshot = EXCLUDED.source_snapshot;
+
+        INSERT INTO public.job_listing_archive (
+            provider, source_job_id, canonical_job_id, observed_at, source_snapshot
+        )
+        SELECT DISTINCT ON (j.provider, instance->>'job_id')
+            j.provider,
+            instance->>'job_id',
+            survivor,
+            COALESCE((instance->>'scraped_at')::timestamptz, j.last_seen_at, j.scraped_at),
+            instance
+        FROM public.jobs j
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(j.listing_instances, '[]'::jsonb)) instance
+        WHERE (j.job_id = survivor OR j.job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        ))
+          AND instance->>'job_id' IS NOT NULL
+        ORDER BY j.provider, instance->>'job_id', COALESCE((instance->>'scraped_at')::timestamptz, j.last_seen_at, j.scraped_at) DESC
+        ON CONFLICT (provider, source_job_id) DO UPDATE SET
+            canonical_job_id = EXCLUDED.canonical_job_id,
+            observed_at = GREATEST(public.job_listing_archive.observed_at, EXCLUDED.observed_at),
+            source_snapshot = public.job_listing_archive.source_snapshot || EXCLUDED.source_snapshot;
+
+        INSERT INTO public.job_resume_links (canonical_job_id, customized_resume_id, source_job_id)
+        SELECT survivor, j.customized_resume_id, j.job_id
+        FROM public.jobs j
+        WHERE j.customized_resume_id IS NOT NULL
+          AND (j.job_id = survivor OR j.job_id IN (
+              SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+          ))
+        ON CONFLICT (canonical_job_id, customized_resume_id) DO UPDATE SET
+            source_job_id = EXCLUDED.source_job_id;
+
+        INSERT INTO public.job_keyword_insights (
+            job_id, keyword, category, analyzed_at, archetype, provider
+        )
+        SELECT
+            survivor, keyword, category, max(analyzed_at), archetype,
+            (array_agg(provider ORDER BY analyzed_at DESC) FILTER (WHERE provider IS NOT NULL))[1]
+        FROM public.job_keyword_insights
+        WHERE job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        )
+        GROUP BY keyword, category, archetype
+        ON CONFLICT (job_id, archetype, keyword, category) DO UPDATE SET
+            analyzed_at = GREATEST(public.job_keyword_insights.analyzed_at, EXCLUDED.analyzed_at),
+            provider = COALESCE(EXCLUDED.provider, public.job_keyword_insights.provider);
+
+        DELETE FROM public.job_keyword_insights
+        WHERE job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        );
+
+        WITH members AS (
+            SELECT j.*
+            FROM public.jobs j
+            WHERE j.job_id = survivor OR j.job_id IN (
+                SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+            )
+        ), aggregate_values AS (
+            SELECT
+                (array_agg(company ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE company IS NOT NULL))[1] company,
+                (array_agg(job_title ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE job_title IS NOT NULL))[1] job_title,
+                (array_agg(level ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE level IS NOT NULL))[1] level,
+                (array_agg(location ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE location IS NOT NULL))[1] location,
+                (array_agg(description ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE description IS NOT NULL))[1] description,
+                (array_agg(status ORDER BY CASE status WHEN 'offer' THEN 4 WHEN 'interviewing' THEN 3 WHEN 'applied' THEN 2 ELSE 1 END DESC, COALESCE(application_date, scraped_at) DESC) FILTER (WHERE status IS NOT NULL))[1] status,
+                bool_or(is_active) is_active,
+                min(application_date) application_date,
+                max(resume_score) resume_score,
+                string_agg(DISTINCT notes, E'\n\n' ORDER BY notes) FILTER (WHERE notes IS NOT NULL AND btrim(notes) <> '') notes,
+                min(scraped_at) scraped_at,
+                max(last_checked) last_checked,
+                bool_or(is_interested) is_interested,
+                (array_agg(customized_resume_id ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE customized_resume_id IS NOT NULL))[1] customized_resume_id,
+                max(posted_at) posted_at,
+                bool_and(is_filtered) is_filtered,
+                (array_agg(filter_reason ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE filter_reason IS NOT NULL))[1] filter_reason,
+                bool_or(is_entry_level_filtered) is_entry_level_filtered,
+                max(insights_analyzed_at) insights_analyzed_at,
+                max(insights_reanalyzed_at) insights_reanalyzed_at,
+                (array_agg(search_query ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE search_query IS NOT NULL))[1] search_query,
+                (array_agg(archetype ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE archetype IS NOT NULL))[1] archetype,
+                (array_agg(filter_profile ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE filter_profile IS NOT NULL))[1] filter_profile,
+                (array_agg(canonical_key ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE canonical_key IS NOT NULL))[1] canonical_key,
+                (array_agg(resume_score_stage ORDER BY CASE resume_score_stage WHEN 'final' THEN 2 WHEN 'initial' THEN 1 ELSE 0 END DESC, COALESCE(last_seen_at, scraped_at) DESC))[1] resume_score_stage,
+                min(first_seen_at) first_seen_at,
+                max(last_seen_at) last_seen_at,
+                max(last_seen_posted_at) last_seen_posted_at,
+                (array_agg(posted_relative_text ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE posted_relative_text IS NOT NULL))[1] posted_relative_text,
+                (array_agg(applicant_count ORDER BY COALESCE(detail_metadata_checked_at, last_seen_at, scraped_at) DESC) FILTER (WHERE applicant_count IS NOT NULL))[1] applicant_count,
+                (array_agg(applicant_count_text ORDER BY COALESCE(detail_metadata_checked_at, last_seen_at, scraped_at) DESC) FILTER (WHERE applicant_count_text IS NOT NULL))[1] applicant_count_text,
+                (array_agg(applicant_count_type ORDER BY COALESCE(detail_metadata_checked_at, last_seen_at, scraped_at) DESC) FILTER (WHERE applicant_count_type IS NOT NULL))[1] applicant_count_type,
+                (array_agg(salary_text ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE salary_text IS NOT NULL))[1] salary_text,
+                (array_agg(salary_min ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE salary_min IS NOT NULL))[1] salary_min,
+                (array_agg(salary_max ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE salary_max IS NOT NULL))[1] salary_max,
+                (array_agg(salary_currency ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE salary_currency IS NOT NULL))[1] salary_currency,
+                (array_agg(recruiter_name ORDER BY COALESCE(detail_metadata_checked_at, last_seen_at, scraped_at) DESC) FILTER (WHERE recruiter_name IS NOT NULL))[1] recruiter_name,
+                (array_agg(recruiter_profile_url ORDER BY COALESCE(detail_metadata_checked_at, last_seen_at, scraped_at) DESC) FILTER (WHERE recruiter_profile_url IS NOT NULL))[1] recruiter_profile_url,
+                (array_agg(recruiter_identifier ORDER BY COALESCE(detail_metadata_checked_at, last_seen_at, scraped_at) DESC) FILTER (WHERE recruiter_identifier IS NOT NULL))[1] recruiter_identifier,
+                max(detail_metadata_checked_at) detail_metadata_checked_at,
+                (array_agg(location_province_code ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE location_province_code IS NOT NULL))[1] location_province_code,
+                (array_agg(location_scope ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE location_scope IS NOT NULL))[1] location_scope,
+                (array_agg(location_metro ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE location_metro IS NOT NULL))[1] location_metro
+            FROM members
+        ), listing_values AS (
+            SELECT
+                (array_agg(source_job_id ORDER BY observed_at, source_job_id))[1] original_job_id,
+                (array_agg(source_job_id ORDER BY observed_at DESC, source_job_id DESC))[1] latest_job_id,
+                count(*)::integer seen_count,
+                jsonb_agg(
+                    jsonb_strip_nulls(jsonb_build_object(
+                        'job_id', source_job_id,
+                        'scraped_at', COALESCE(source_snapshot->>'scraped_at', observed_at::text),
+                        'last_seen_at', COALESCE(source_snapshot->>'last_seen_at', source_snapshot->>'scraped_at', observed_at::text),
+                        'scrape_run_id', source_snapshot->>'scrape_run_id',
+                        'location', source_snapshot->>'location',
+                        'posted_at', source_snapshot->>'posted_at',
+                        'posted_relative_text', source_snapshot->>'posted_relative_text',
+                        'applicant_count', source_snapshot->'applicant_count',
+                        'applicant_count_text', source_snapshot->>'applicant_count_text',
+                        'applicant_count_type', source_snapshot->>'applicant_count_type',
+                        'salary_text', source_snapshot->>'salary_text',
+                        'salary_min', source_snapshot->'salary_min',
+                        'salary_max', source_snapshot->'salary_max',
+                        'salary_currency', source_snapshot->>'salary_currency',
+                        'recruiter_name', source_snapshot->>'recruiter_name',
+                        'recruiter_profile_url', source_snapshot->>'recruiter_profile_url',
+                        'recruiter_identifier', source_snapshot->>'recruiter_identifier',
+                        'detail_metadata_checked_at', source_snapshot->>'detail_metadata_checked_at'
+                    ))
+                    ORDER BY observed_at, source_job_id
+                ) raw_listing_instances
+            FROM public.job_listing_archive
+            WHERE canonical_job_id = survivor
+        ), listing_waves AS (
+            SELECT waves.*
+            FROM listing_values lv
+            CROSS JOIN LATERAL public.calculate_listing_posting_waves(lv.raw_listing_instances) waves
+        )
+        UPDATE public.jobs target SET
+            company = a.company,
+            job_title = a.job_title,
+            level = a.level,
+            location = a.location,
+            description = a.description,
+            status = a.status,
+            is_active = a.is_active,
+            application_date = a.application_date,
+            resume_score = a.resume_score,
+            notes = a.notes,
+            scraped_at = a.scraped_at,
+            last_checked = a.last_checked,
+            job_state = CASE WHEN a.is_active THEN 'new' ELSE target.job_state END,
+            is_interested = a.is_interested,
+            customized_resume_id = a.customized_resume_id,
+            posted_at = a.posted_at,
+            is_filtered = a.is_filtered,
+            filter_reason = CASE WHEN a.is_filtered THEN a.filter_reason ELSE NULL END,
+            is_entry_level_filtered = a.is_entry_level_filtered,
+            insights_analyzed_at = a.insights_analyzed_at,
+            insights_reanalyzed_at = a.insights_reanalyzed_at,
+            search_query = a.search_query,
+            archetype = a.archetype,
+            filter_profile = a.filter_profile,
+            canonical_key = a.canonical_key,
+            resume_score_stage = a.resume_score_stage,
+            original_job_id = l.original_job_id,
+            latest_job_id = l.latest_job_id,
+            first_seen_at = a.first_seen_at,
+            last_seen_at = a.last_seen_at,
+            last_seen_posted_at = a.last_seen_posted_at,
+            posted_relative_text = a.posted_relative_text,
+            applicant_count = a.applicant_count,
+            applicant_count_text = a.applicant_count_text,
+            applicant_count_type = a.applicant_count_type,
+            salary_text = a.salary_text,
+            salary_min = a.salary_min,
+            salary_max = a.salary_max,
+            salary_currency = a.salary_currency,
+            recruiter_name = a.recruiter_name,
+            recruiter_profile_url = a.recruiter_profile_url,
+            recruiter_identifier = a.recruiter_identifier,
+            seen_count = l.seen_count,
+            posting_wave_count = w.posting_wave_count,
+            repost_count = w.repost_count,
+            listing_instances = w.listing_instances,
+            detail_metadata_checked_at = a.detail_metadata_checked_at
+        FROM aggregate_values a, listing_values l, listing_waves w
+        WHERE target.job_id = survivor;
+
+        DELETE FROM public.jobs
+        WHERE job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        );
+        GET DIAGNOSTICS affected = ROW_COUNT;
+        deleted_count := deleted_count + affected;
+        group_count := group_count + 1;
+    END LOOP;
+
+    IF EXISTS (
+        SELECT 1
+        FROM public.job_listing_archive a
+        LEFT JOIN public.jobs j ON j.job_id = a.canonical_job_id
+        WHERE j.job_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Archived listing references a missing canonical job';
+    END IF;
+
+    -- Keep aggregate keyword counts transactionally consistent with the facts
+    -- moved above. The transaction-wide advisory lock acquired at entry is the
+    -- same lock used by all incremental keyword fact writers and rebuilds.
+    DELETE FROM public.keyword_insights;
+
+    INSERT INTO public.keyword_insights (
+        archetype, provider, keyword, category, count, last_updated
+    )
+    SELECT
+        archetype,
+        COALESCE(provider, 'unknown'),
+        keyword,
+        category,
+        count(*)::integer,
+        now()
+    FROM public.job_keyword_insights
+    GROUP BY archetype, COALESCE(provider, 'unknown'), keyword, category;
+
+    DELETE FROM public.job_repost_merge_plan;
+    RETURN QUERY SELECT group_count, deleted_count;
+END;
+$$;
+
+ALTER FUNCTION public.merge_historical_repost_plan() OWNER TO postgres;
+REVOKE ALL ON FUNCTION public.merge_historical_repost_plan() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.merge_historical_repost_plan() TO service_role;
 
 REVOKE ALL ON FUNCTION public.apply_linkedin_relist_projection(text, text, uuid, date, timestamptz, jsonb, jsonb, timestamptz, jsonb, text, text, text) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.apply_same_id_relist_repair(text, jsonb, timestamptz, jsonb) FROM PUBLIC, anon, authenticated;

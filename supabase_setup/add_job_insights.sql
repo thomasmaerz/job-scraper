@@ -6,6 +6,10 @@ BEGIN;
 SET LOCAL lock_timeout = '10s';
 SET LOCAL statement_timeout = '15min';
 
+-- Serialize legacy aggregate normalization with incremental/rebuild RPCs when
+-- this idempotent schema migration is rerun after those RPCs are installed.
+SELECT pg_advisory_xact_lock(hashtextextended('keyword-insights-aggregate-global', 0));
+
 ALTER TABLE "public"."jobs"
 ADD COLUMN IF NOT EXISTS "insights_analyzed_at" timestamp with time zone;
 
@@ -125,11 +129,11 @@ FOR EACH ROW EXECUTE FUNCTION "public"."update_last_updated_column"();
 ALTER TABLE "public"."keyword_insights" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."job_keyword_insights" ENABLE ROW LEVEL SECURITY;
 
-GRANT ALL ON TABLE "public"."keyword_insights" TO "anon";
-GRANT ALL ON TABLE "public"."keyword_insights" TO "authenticated";
-GRANT ALL ON TABLE "public"."keyword_insights" TO "service_role";
-GRANT ALL ON TABLE "public"."job_keyword_insights" TO "anon";
-GRANT ALL ON TABLE "public"."job_keyword_insights" TO "authenticated";
-GRANT ALL ON TABLE "public"."job_keyword_insights" TO "service_role";
+REVOKE ALL PRIVILEGES ON TABLE
+"public"."keyword_insights", "public"."job_keyword_insights"
+FROM PUBLIC, "anon", "authenticated", "service_role";
+GRANT SELECT ON TABLE
+"public"."keyword_insights", "public"."job_keyword_insights"
+TO "anon", "authenticated", "service_role";
 
 COMMIT;

@@ -6,8 +6,7 @@ import pytest
 import analyze_jobs
 
 
-@pytest.fixture
-def fake_db_with_fact_rows():
+def _legacy_fake_db_with_fact_rows():
     operations = []
 
     fact_rows = [
@@ -543,142 +542,53 @@ def test_aggregate_keywords_preserves_acronyms_and_uppercase_keywords():
     }
 
 
-def test_upsert_job_keyword_facts_dedupes_by_archetype_aware_identity():
-    inserted_rows = []
-
-    class FakeUpsertQuery:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def execute(self):
-            inserted_rows.extend(self.rows)
-            return SimpleNamespace(data=self.rows)
-
-    class FakeTable:
-        def upsert(self, rows, on_conflict, ignore_duplicates):
-            assert on_conflict == "job_id,archetype,keyword,category"
-            assert ignore_duplicates is True
-            return FakeUpsertQuery(rows)
-
-    class FakeDb:
-        def table(self, name):
-            assert name == "job_keyword_insights"
-            return FakeTable()
-
+def test_upsert_job_keyword_facts_rejects_fact_only_writes():
     facts = [
         {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
-        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
-        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "data_pm"},
     ]
-
-    inserted = analyze_jobs.upsert_job_keyword_facts(facts, db=FakeDb())
-
-    assert inserted == inserted_rows
-    assert inserted == [
-        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
-        {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "data_pm"},
-    ]
+    with pytest.raises(RuntimeError, match="use replace_job_keyword_facts"):
+        analyze_jobs.upsert_job_keyword_facts(facts)
 
 
-def test_replace_job_keyword_facts_replaces_existing_rows_for_job_ids():
+def test_replace_job_keyword_facts_calls_atomic_delta_rpc():
     calls = []
-    inserted_rows = []
-
-    class FakeDeleteQuery:
-        def __init__(self):
-            self.filters = []
-
-        def delete(self):
-            calls.append(("delete",))
-            return self
-
-        def eq(self, key, value):
-            self.filters.append((key, value))
-            calls.append(("eq", key, value))
-            return self
-
-        def execute(self):
-            calls.append(("delete_execute", tuple(self.filters)))
-            return SimpleNamespace(data=[])
-
-    class FakeUpsertQuery:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def execute(self):
-            inserted_rows.extend(self.rows)
-            calls.append(("upsert_execute",))
-            return SimpleNamespace(data=self.rows)
-
-    class FakeTable:
-        def delete(self):
-            return FakeDeleteQuery().delete()
-
-        def upsert(self, rows, on_conflict):
-            calls.append(("upsert", on_conflict, rows))
-            assert on_conflict == "job_id,archetype,keyword,category"
-            return FakeUpsertQuery(rows)
 
     class FakeDb:
-        def table(self, name):
-            assert name == "job_keyword_insights"
-            return FakeTable()
+        def rpc(self, name, params):
+            calls.append((name, params))
+            return self
+
+        def execute(self):
+            calls.append(("rpc_execute",))
+            return SimpleNamespace(data=2)
 
     facts = [
         {"job_id": "1", "keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
         {"job_id": "1", "keyword": "AWS", "category": "technology", "archetype": "software_tpm"},
     ]
 
-    inserted = analyze_jobs.replace_job_keyword_facts(["1"], facts, db=FakeDb())
+    inserted = analyze_jobs.replace_job_keyword_facts(["1"], facts, archetype="software_tpm", db=FakeDb())
 
-    assert calls[0] == ("delete",)
-    assert calls[1] == ("eq", "job_id", "1")
-    assert calls[2] == ("eq", "archetype", "software_tpm")
-    assert calls[3] == ("delete_execute", (("job_id", "1"), ("archetype", "software_tpm")))
-    assert calls[4] == ("upsert", "job_id,archetype,keyword,category", facts)
-    assert calls[5] == ("upsert_execute",)
-
-    assert inserted == inserted_rows
+    assert calls == [
+        (
+            "replace_job_keyword_facts_and_refresh_aggregates",
+            {"p_job_ids": ["1"], "p_archetype": "software_tpm", "p_facts": facts},
+        ),
+        ("rpc_execute",),
+    ]
     assert inserted == facts
 
 
-def test_replace_job_keyword_facts_only_deletes_matching_archetype_for_same_job_id():
-    delete_filters = []
-
-    class FakeDeleteQuery:
-        def __init__(self):
-            self.filters = []
-
-        def delete(self):
-            return self
-
-        def eq(self, key, value):
-            self.filters.append((key, value))
-            return self
-
-        def execute(self):
-            delete_filters.append(tuple(self.filters))
-            return SimpleNamespace(data=[])
-
-    class FakeUpsertQuery:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def execute(self):
-            return SimpleNamespace(data=self.rows)
-
-    class FakeTable:
-        def delete(self):
-            return FakeDeleteQuery().delete()
-
-        def upsert(self, rows, on_conflict):
-            assert on_conflict == "job_id,archetype,keyword,category"
-            return FakeUpsertQuery(rows)
+def test_replace_job_keyword_facts_infers_single_fact_archetype():
+    calls = []
 
     class FakeDb:
-        def table(self, name):
-            assert name == "job_keyword_insights"
-            return FakeTable()
+        def rpc(self, name, params):
+            calls.append((name, params))
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=2)
 
     facts = [
         {"job_id": "1", "keyword": "SQL", "category": "technology", "archetype": "software_tpm"},
@@ -687,46 +597,50 @@ def test_replace_job_keyword_facts_only_deletes_matching_archetype_for_same_job_
 
     analyze_jobs.replace_job_keyword_facts(["1"], facts, db=FakeDb())
 
-    assert delete_filters == [(("job_id", "1"), ("archetype", "software_tpm"))]
+    assert calls[0][1] == {
+        "p_job_ids": ["1"],
+        "p_archetype": "software_tpm",
+        "p_facts": facts,
+    }
 
 
-def test_replace_job_keyword_facts_deletes_only_matching_archetype_when_new_fact_set_is_empty():
-    delete_filters = []
+def test_replace_job_keyword_facts_sends_empty_replacement_to_rpc():
+    calls = []
 
-    class FakeDeleteQuery:
-        def __init__(self):
-            self.filters = []
-
-        def delete(self):
-            return self
-
-        def eq(self, key, value):
-            self.filters.append((key, value))
+    class FakeDb:
+        def rpc(self, name, params):
+            calls.append((name, params))
             return self
 
         def execute(self):
-            delete_filters.append(tuple(self.filters))
-            return SimpleNamespace(data=[])
-
-    class FakeTable:
-        def delete(self):
-            return FakeDeleteQuery().delete()
-
-        def upsert(self, rows, on_conflict):
-            raise AssertionError("upsert should not be called for empty facts")
-
-    class FakeDb:
-        def table(self, name):
-            assert name == "job_keyword_insights"
-            return FakeTable()
+            return SimpleNamespace(data=0)
 
     inserted = analyze_jobs.replace_job_keyword_facts(["1"], [], archetype="software_tpm", db=FakeDb())
 
     assert inserted == []
-    assert delete_filters == [(("job_id", "1"), ("archetype", "software_tpm"))]
+    assert calls == [
+        (
+            "replace_job_keyword_facts_and_refresh_aggregates",
+            {"p_job_ids": ["1"], "p_archetype": "software_tpm", "p_facts": []},
+        )
+    ]
 
 
-def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
+def test_replace_job_keyword_facts_rejects_out_of_scope_facts_before_rpc():
+    class FakeDb:
+        def rpc(self, name, params):
+            raise AssertionError("RPC must not be called")
+
+    with pytest.raises(ValueError, match="belong to p_job_ids"):
+        analyze_jobs.replace_job_keyword_facts(
+            ["1"],
+            [{"job_id": "2", "archetype": "software_tpm", "keyword": "SQL", "category": "technology"}],
+            archetype="software_tpm",
+            db=FakeDb(),
+        )
+
+
+def _legacy_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
     upserted = []
 
     class FactsSelectQuery:
@@ -801,7 +715,7 @@ def test_update_keyword_insights_aggregates_existing_counts_plus_new_facts():
     assert all(row["provider"] == "linkedin" for row in upserted)
 
 
-def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts():
+def _legacy_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts():
     upserted = []
 
     class KeywordInsightsSelectQuery:
@@ -883,7 +797,7 @@ def test_update_keyword_insights_repairs_missing_aggregate_from_persisted_facts(
     assert by_key[("PMP", "certification")]["count"] == 1
 
 
-def test_update_keyword_insights_recomputes_removed_keywords_to_zero():
+def _legacy_update_keyword_insights_recomputes_removed_keywords_to_zero():
     upserted = []
 
     class FactsSelectQuery:
@@ -944,7 +858,7 @@ def test_update_keyword_insights_recomputes_removed_keywords_to_zero():
     assert by_key[("Azure", "technology")]["count"] == 1
 
 
-def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
+def _legacy_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
     operations = []
 
     class FactsSelectQuery:
@@ -1052,8 +966,8 @@ def test_rebuild_keyword_insights_replaces_table_from_all_persisted_facts():
     )
 
 
-def test_rebuild_keyword_insights_keeps_archetypes_separate(fake_db_with_fact_rows):
-    fake_db, operations = fake_db_with_fact_rows
+def _legacy_rebuild_keyword_insights_keeps_archetypes_separate():
+    fake_db, operations = _legacy_fake_db_with_fact_rows()
 
     analyze_jobs.rebuild_keyword_insights(db=fake_db)
 
@@ -1082,7 +996,7 @@ def test_rebuild_keyword_insights_keeps_archetypes_separate(fake_db_with_fact_ro
     }
 
 
-def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeypatch):
+def _legacy_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeypatch):
     operations = []
 
     class FactsSelectQuery:
@@ -1186,6 +1100,26 @@ def test_rebuild_keyword_insights_does_not_delete_before_upsert_finishes(monkeyp
     ]
 
 
+def test_rebuild_keyword_insights_uses_atomic_service_role_rpc():
+    calls = []
+
+    class FakeRpc:
+        def execute(self):
+            calls.append(("execute",))
+            return SimpleNamespace(data=4)
+
+    class FakeDb:
+        def rpc(self, name):
+            calls.append(("rpc", name))
+            return FakeRpc()
+
+        def table(self, name):
+            raise AssertionError(f"direct aggregate access is forbidden: {name}")
+
+    assert analyze_jobs.rebuild_keyword_insights(db=FakeDb()) == 4
+    assert calls == [("rpc", "rebuild_keyword_insights_atomic"), ("execute",)]
+
+
 def test_build_job_keyword_facts_uses_job_keyed_results_not_cross_product():
     batch = [
         {
@@ -1239,7 +1173,6 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
         {"2": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]},
     ]
     fact_calls = []
-    rebuild_calls = []
     marked = []
     monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
     monkeypatch.setattr(
@@ -1254,7 +1187,11 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
         return facts
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace_facts)
-    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: rebuild_calls.append(True))
+    monkeypatch.setattr(
+        analyze_jobs,
+        "rebuild_keyword_insights",
+        lambda db=None: pytest.fail("full rebuild must not run in the incremental pipeline"),
+    )
     monkeypatch.setattr(
         analyze_jobs,
         "mark_jobs_analyzed",
@@ -1265,11 +1202,10 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
 
     assert processed == 2
     assert len(fact_calls) == 2
-    assert rebuild_calls == [True, True]
     assert marked == [["1"], ["2"]]
 
 
-def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(monkeypatch):
+def test_run_retries_idempotent_fact_replacement_after_crash_before_mark(monkeypatch):
     fetch_batches = [
         [{"job_id": "1", "job_title": "A", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}],
         [{"job_id": "1", "job_title": "A", "description": "Needs SQL", "archetype": "software_tpm", "provider": "greenhouse"}],
@@ -1277,7 +1213,6 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
     ]
     extracted = {"1": [analyze_jobs.KeywordItem(keyword="SQL", category="technology")]}
     replace_calls = []
-    rebuild_calls = []
     mark_calls = []
     failed_once = {"value": False}
 
@@ -1300,17 +1235,18 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
         replace_calls.append((job_ids, facts))
         return facts
 
-    def fake_rebuild(db=None):
-        rebuild_calls.append(True)
+    def fake_mark(job_ids, db=None, replacement_backfill=False):
         if not failed_once["value"]:
             failed_once["value"] = True
             raise RuntimeError("crash after replace")
-
-    def fake_mark(job_ids, db=None, replacement_backfill=False):
         mark_calls.append(job_ids)
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
-    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", fake_rebuild)
+    monkeypatch.setattr(
+        analyze_jobs,
+        "rebuild_keyword_insights",
+        lambda db=None: pytest.fail("full rebuild must not run in the incremental pipeline"),
+    )
     monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
 
     try:
@@ -1318,13 +1254,12 @@ def test_run_rebuilds_aggregates_after_retry_when_previous_keyword_was_removed(m
     except RuntimeError as exc:
         assert str(exc) == "crash after replace"
     else:
-        raise AssertionError("Expected simulated crash on first rebuild")
+        raise AssertionError("Expected simulated crash before analyzed marker")
 
     processed = analyze_jobs.run(backfill_all=True)
 
     assert processed == 1
     assert len(replace_calls) == 2
-    assert len(rebuild_calls) == 2
     assert mark_calls == [["1"]]
 
 
@@ -1373,22 +1308,22 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
         calls.append(("replace", job_ids, facts))
         return facts
 
-    def fake_rebuild(db=None):
-        calls.append(("rebuild",))
-
     def fake_mark(job_ids, db=None, replacement_backfill=False):
         calls.append(("mark", job_ids))
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
-    monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", fake_rebuild)
+    monkeypatch.setattr(
+        analyze_jobs,
+        "rebuild_keyword_insights",
+        lambda db=None: pytest.fail("full rebuild must not run in the incremental pipeline"),
+    )
     monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
 
     processed = analyze_jobs.run(backfill_all=False)
 
     assert processed == 1
     assert calls[0][0] == "replace"
-    assert calls[1][0] == "rebuild"
-    assert calls[2] == ("mark", ["1"])
+    assert calls[1] == ("mark", ["1"])
 
 
 def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):

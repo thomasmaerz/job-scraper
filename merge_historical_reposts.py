@@ -4,7 +4,6 @@ import argparse
 from collections import defaultdict
 
 import config
-import analyze_jobs
 import supabase_utils
 
 
@@ -125,11 +124,10 @@ def run(apply: bool) -> dict:
     }
     if not apply or not plan:
         return summary
-    supabase_utils.supabase.table("job_repost_merge_plan").delete().neq("source_job_id", "").execute()
-    for start in range(0, len(plan), 200):
-        supabase_utils.supabase.table("job_repost_merge_plan").insert(plan[start:start + 200]).execute()
+    supabase_utils.supabase.rpc(
+        "replace_historical_repost_plan", {"p_plan": plan}
+    ).execute()
     summary["merge_result"] = supabase_utils.supabase.rpc("merge_historical_repost_plan").execute().data
-    analyze_jobs.rebuild_keyword_insights(db=supabase_utils.supabase)
     return summary
 
 

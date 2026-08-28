@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import merge_historical_reposts
 
 
@@ -43,3 +45,56 @@ def test_historical_and_live_matching_are_equivalent_for_same_location():
 
     assert len(plan) == 1
     assert live_match == rows[0]
+
+
+def test_apply_flow_stages_and_merges_through_serialized_rpcs(monkeypatch):
+    rpc_calls = []
+
+    class Query:
+        def execute(self):
+            return SimpleNamespace(data=[])
+
+    class FakeDb:
+        def table(self, name):
+            raise AssertionError(f"plan staging must use an RPC, not table {name}")
+
+        def rpc(self, name, params=None):
+            rpc_calls.append((name, params))
+            return Query()
+
+    plan = [{"source_job_id": "old", "survivor_job_id": "new", "match_method": "exact_fingerprint", "match_similarity": None}]
+    monkeypatch.setattr(merge_historical_reposts, "fetch_jobs", lambda: [])
+    monkeypatch.setattr(merge_historical_reposts, "build_merge_plan", lambda rows: plan)
+    monkeypatch.setattr(merge_historical_reposts.supabase_utils, "supabase", FakeDb())
+
+    merge_historical_reposts.run(apply=True)
+
+    assert rpc_calls == [
+        ("replace_historical_repost_plan", {"p_plan": plan}),
+        ("merge_historical_repost_plan", None),
+    ]
+
+
+def test_dry_run_does_not_stage_or_merge(monkeypatch):
+    class FakeDb:
+        def rpc(self, name, params=None):
+            raise AssertionError(f"dry run must not call {name}")
+
+    plan = [
+        {
+            "source_job_id": "old",
+            "survivor_job_id": "new",
+            "match_method": "exact_fingerprint",
+            "match_similarity": None,
+        }
+    ]
+    monkeypatch.setattr(merge_historical_reposts, "fetch_jobs", lambda: [])
+    monkeypatch.setattr(merge_historical_reposts, "build_merge_plan", lambda rows: plan)
+    monkeypatch.setattr(merge_historical_reposts.supabase_utils, "supabase", FakeDb())
+
+    assert merge_historical_reposts.run(apply=False) == {
+        "groups": 1,
+        "redundant_rows": 1,
+        "exact": 1,
+        "fuzzy": 0,
+    }

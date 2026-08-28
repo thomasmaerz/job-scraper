@@ -198,81 +198,56 @@ def build_job_keyword_facts(batch: list, extracted_keywords: dict[str, list[Keyw
 
 
 def upsert_job_keyword_facts(facts: list[dict], db=None) -> list[dict]:
+    """Reject unsafe fact-only writes that would bypass aggregate maintenance."""
     if not facts:
         return []
-
-    db = db or _get_db()
-    deduped = []
-    seen = set()
-    for fact in facts:
-        key = (fact["job_id"], fact.get("archetype"), fact["keyword"], fact["category"])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(fact)
-
-    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
-    inserted = []
-    for start in range(0, len(deduped), batch_size):
-        batch = deduped[start : start + batch_size]
-        response = (
-            db.table("job_keyword_insights")
-            .upsert(batch, on_conflict="job_id,archetype,keyword,category", ignore_duplicates=True)
-            .execute()
-        )
-        inserted.extend(response.data or [])
-
-    return inserted
+    raise RuntimeError(
+        "direct job keyword fact upserts are disabled; use replace_job_keyword_facts"
+    )
 
 
 def replace_job_keyword_facts(job_ids: list[str], facts: list[dict], archetype: str | None = None, db=None) -> list[dict]:
+    """Atomically replace facts and apply their aggregate contribution delta."""
     db = db or _get_db()
 
-    delete_keys = []
-    seen_delete_keys = set()
-    for fact in facts:
-        key = (fact["job_id"], fact.get("archetype"))
-        if key in seen_delete_keys:
-            continue
-        seen_delete_keys.add(key)
-        delete_keys.append(key)
-
-    fact_job_ids = {fact["job_id"] for fact in facts}
-    for job_id in job_ids:
-        if job_id in fact_job_ids:
-            continue
-        delete_query = db.table("job_keyword_insights").delete().eq("job_id", job_id)
-        if archetype is not None:
-            delete_query = delete_query.eq("archetype", archetype)
-        delete_query.execute()
-
-    for job_id, archetype in delete_keys:
-        db.table("job_keyword_insights").delete().eq("job_id", job_id).eq("archetype", archetype).execute()
-
-    if not facts:
+    normalized_job_ids = list(dict.fromkeys(str(job_id) for job_id in job_ids))
+    if not normalized_job_ids:
         return []
 
+    fact_archetypes = {fact.get("archetype") for fact in facts}
+    if archetype is None:
+        if len(fact_archetypes) != 1:
+            raise ValueError("archetype is required when replacing an empty or mixed-archetype fact set")
+        archetype = next(iter(fact_archetypes))
+    if not archetype:
+        raise ValueError("archetype must be non-empty")
+    if any(fact.get("archetype") != archetype for fact in facts):
+        raise ValueError("all replacement facts must match archetype")
+
+    allowed_job_ids = set(normalized_job_ids)
     deduped = []
     seen = set()
     for fact in facts:
-        key = (fact["job_id"], fact.get("archetype"), fact["keyword"], fact["category"])
+        normalized = dict(fact)
+        normalized["job_id"] = str(fact["job_id"])
+        if normalized["job_id"] not in allowed_job_ids:
+            raise ValueError("replacement facts must belong to p_job_ids")
+        normalized["archetype"] = archetype
+        key = (normalized["job_id"], archetype, normalized["keyword"], normalized["category"])
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(fact)
+        deduped.append(normalized)
 
-    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
-    inserted = []
-    for start in range(0, len(deduped), batch_size):
-        batch = deduped[start : start + batch_size]
-        response = (
-            db.table("job_keyword_insights")
-            .upsert(batch, on_conflict="job_id,archetype,keyword,category")
-            .execute()
-        )
-        inserted.extend(response.data or [])
-
-    return inserted
+    db.rpc(
+        "replace_job_keyword_facts_and_refresh_aggregates",
+        {
+            "p_job_ids": normalized_job_ids,
+            "p_archetype": archetype,
+            "p_facts": deduped,
+        },
+    ).execute()
+    return deduped
 
 
 def _normalize_provider(provider) -> str:
@@ -280,115 +255,16 @@ def _normalize_provider(provider) -> str:
 
 
 def update_keyword_insights_from_facts(source_facts: list[dict], db=None, affected_keys=None):
+    """Compatibility entry point; aggregate repair uses the locked rebuild RPC."""
     if not source_facts and not affected_keys:
-        return
-
-    db = db or _get_db()
-    timestamp = datetime.now(timezone.utc).isoformat()
-    affected_keys = affected_keys or {
-        (fact.get("archetype"), _normalize_provider(fact.get("provider")), fact["keyword"], fact["category"])
-        for fact in source_facts
-    }
-    counts = defaultdict(int)
-    offset = 0
-    page_size = config.JOB_INSIGHTS_DB_PAGE_SIZE
-    while True:
-        rows = (
-            db.table("job_keyword_insights")
-            .select("job_id, keyword, category, archetype, provider")
-            .range(offset, offset + page_size - 1)
-            .execute()
-            .data
-            or []
-        )
-        if not rows:
-            break
-        for row in rows:
-            key = (row.get("archetype"), _normalize_provider(row.get("provider")), row["keyword"], row["category"])
-            if key in affected_keys:
-                counts[key] += 1
-        offset += page_size
-
-    rows = [
-        {
-            "archetype": archetype,
-            "provider": provider,
-            "keyword": keyword,
-            "category": category,
-            "count": counts[(archetype, provider, keyword, category)],
-            "last_updated": timestamp,
-        }
-        for (archetype, provider, keyword, category) in affected_keys
-    ]
-
-    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start : start + batch_size]
-        db.table("keyword_insights").upsert(batch, on_conflict="archetype,provider,keyword,category").execute()
+        return None
+    return rebuild_keyword_insights(db=db)
 
 
 def rebuild_keyword_insights(db=None):
+    """Atomically rebuild aggregate counts from all persisted keyword facts."""
     db = db or _get_db()
-    timestamp = datetime.now(timezone.utc).isoformat()
-    counts = defaultdict(int)
-    offset = 0
-    page_size = config.JOB_INSIGHTS_DB_PAGE_SIZE
-
-    while True:
-        rows = (
-            db.table("job_keyword_insights")
-            .select("keyword, category, archetype, provider")
-            .range(offset, offset + page_size - 1)
-            .execute()
-            .data
-            or []
-        )
-        if not rows:
-            break
-
-        for row in rows:
-            counts[(row.get("archetype"), _normalize_provider(row.get("provider")), row["keyword"], row["category"])] += 1
-        offset += page_size
-
-    rebuilt_rows = [
-        {
-            "archetype": archetype,
-            "provider": provider,
-            "keyword": keyword,
-            "category": category,
-            "count": count,
-            "last_updated": timestamp,
-        }
-        for (archetype, provider, keyword, category), count in counts.items()
-    ]
-
-    batch_size = config.JOB_INSIGHTS_UPSERT_BATCH_SIZE
-    for start in range(0, len(rebuilt_rows), batch_size):
-        batch = rebuilt_rows[start : start + batch_size]
-        db.table("keyword_insights").upsert(batch, on_conflict="archetype,provider,keyword,category").execute()
-
-    rebuilt_keys = set(counts.keys())
-    existing_keys = set()
-    offset = 0
-    while True:
-        rows = (
-            db.table("keyword_insights")
-            .select("keyword, category, archetype, provider")
-            .range(offset, offset + page_size - 1)
-            .execute()
-            .data
-            or []
-        )
-        if not rows:
-            break
-
-        for row in rows:
-            existing_keys.add((row.get("archetype"), _normalize_provider(row.get("provider")), row["keyword"], row["category"]))
-        offset += page_size
-
-    stale_keys = existing_keys - rebuilt_keys
-    for archetype, provider, keyword, category in stale_keys:
-        db.table("keyword_insights").delete().eq("keyword", keyword).eq("category", category).eq("archetype", archetype).eq("provider", provider).execute()
+    return db.rpc("rebuild_keyword_insights_atomic").execute().data
 
 
 def mark_jobs_analyzed(job_ids: list, db=None, replacement_backfill: bool = False):
@@ -428,7 +304,6 @@ def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, r
             facts = build_job_keyword_facts(batch, extracted)
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
             replace_job_keyword_facts(analyzed_job_ids, facts, archetype=archetype, db=db)
-            rebuild_keyword_insights(db=db)
             mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill)
             processed_jobs += len(analyzed_job_ids)
 

@@ -27,6 +27,8 @@ DROP TABLE IF EXISTS "public"."customized_resumes" CASCADE;
 DROP TABLE IF EXISTS "public"."base_resume" CASCADE;
 
 -- Step 3: Drop job-scraper functions
+DROP FUNCTION IF EXISTS "public"."replace_job_keyword_facts_and_refresh_aggregates"(text[], text, jsonb) CASCADE;
+DROP FUNCTION IF EXISTS "public"."rebuild_keyword_insights_atomic"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."get_applied_jobs_sorted"(integer, integer) CASCADE;
 DROP FUNCTION IF EXISTS "public"."get_applied_jobs_sorted"(integer, integer, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."get_applied_jobs_sorted"(integer, integer, text, text, text) CASCADE;
@@ -37,6 +39,7 @@ DROP FUNCTION IF EXISTS "public"."get_top_scored_jobs_custom_sort"(integer, inte
 DROP FUNCTION IF EXISTS "public"."get_top_scored_jobs_custom_sort"(integer, integer, text, integer, integer, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."update_last_updated_column"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."update_base_resume_updated_at_column"() CASCADE;
+DROP FUNCTION IF EXISTS "public"."replace_historical_repost_plan"(jsonb) CASCADE;
 DROP FUNCTION IF EXISTS "public"."merge_historical_repost_plan"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."calculate_listing_posting_waves"(jsonb) CASCADE;
 DROP FUNCTION IF EXISTS "public"."prevent_listing_observation_mutation"() CASCADE;

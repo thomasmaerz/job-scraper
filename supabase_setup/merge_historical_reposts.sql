@@ -15,7 +15,10 @@ ALTER TABLE public.jobs
     ADD COLUMN IF NOT EXISTS resume_score_stage text NOT NULL DEFAULT 'initial',
     ADD COLUMN IF NOT EXISTS search_query text,
     ADD COLUMN IF NOT EXISTS archetype text,
-    ADD COLUMN IF NOT EXISTS filter_profile text;
+    ADD COLUMN IF NOT EXISTS filter_profile text,
+    ADD COLUMN IF NOT EXISTS location_province_code text,
+    ADD COLUMN IF NOT EXISTS location_scope text,
+    ADD COLUMN IF NOT EXISTS location_metro text;
 
 CREATE OR REPLACE FUNCTION public.calculate_listing_posting_waves(instances jsonb)
 RETURNS TABLE(listing_instances jsonb, posting_wave_count integer, repost_count integer)
@@ -200,6 +203,81 @@ ALTER TABLE public.job_listing_archive ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.job_resume_links ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.job_repost_merge_plan ENABLE ROW LEVEL SECURITY;
 
+CREATE OR REPLACE FUNCTION public.replace_historical_repost_plan(p_plan jsonb)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    plan_count integer;
+BEGIN
+    -- Staging and merging must observe one complete plan at a time.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('historical-repost-plan-global', 0)
+    );
+
+    IF p_plan IS NULL OR jsonb_typeof(p_plan) <> 'array' THEN
+        RAISE EXCEPTION 'Historical repost merge plan must be a JSON array';
+    END IF;
+
+    IF jsonb_array_length(p_plan) > 50000 THEN
+        RAISE EXCEPTION 'Historical repost merge plan exceeds 50000 rows';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_plan) AS plan(item)
+        WHERE jsonb_typeof(item) <> 'object'
+           OR jsonb_typeof(item->'source_job_id') IS DISTINCT FROM 'string'
+           OR btrim(item->>'source_job_id') = ''
+           OR jsonb_typeof(item->'survivor_job_id') IS DISTINCT FROM 'string'
+           OR btrim(item->>'survivor_job_id') = ''
+           OR jsonb_typeof(item->'match_method') IS DISTINCT FROM 'string'
+           OR btrim(item->>'match_method') = ''
+           OR (
+               item ? 'match_similarity'
+               AND jsonb_typeof(item->'match_similarity') NOT IN ('number', 'null')
+           )
+           OR item->>'source_job_id' = item->>'survivor_job_id'
+    ) THEN
+        RAISE EXCEPTION 'Historical repost merge plan contains an invalid row';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_plan) AS plan(item)
+        GROUP BY item->>'source_job_id'
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'Historical repost merge plan contains duplicate source jobs';
+    END IF;
+
+    DELETE FROM public.job_repost_merge_plan;
+
+    INSERT INTO public.job_repost_merge_plan (
+        source_job_id,
+        survivor_job_id,
+        match_method,
+        match_similarity
+    )
+    SELECT
+        item->>'source_job_id',
+        item->>'survivor_job_id',
+        item->>'match_method',
+        (item->>'match_similarity')::numeric
+    FROM jsonb_array_elements(p_plan) AS plan(item);
+
+    GET DIAGNOSTICS plan_count = ROW_COUNT;
+    RETURN plan_count;
+END;
+$$;
+
+ALTER FUNCTION public.replace_historical_repost_plan(jsonb) OWNER TO postgres;
+REVOKE ALL ON FUNCTION public.replace_historical_repost_plan(jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.replace_historical_repost_plan(jsonb) TO service_role;
+REVOKE ALL ON TABLE public.job_repost_merge_plan FROM PUBLIC, anon, authenticated, service_role;
+
 CREATE OR REPLACE FUNCTION public.merge_historical_repost_plan()
 RETURNS TABLE(merged_groups integer, deleted_rows integer)
 LANGUAGE plpgsql
@@ -212,6 +290,31 @@ DECLARE
     deleted_count integer := 0;
     affected integer;
 BEGIN
+    -- Serialize execution with atomic plan replacement.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('historical-repost-plan-global', 0)
+    );
+
+    -- Keyword facts are moved below; serialize that mutation with delta/rebuild RPCs.
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('keyword-insights-aggregate-global', 0)
+    );
+
+    -- Lock every source and survivor in one deterministic order before reading
+    -- or deleting any merge inputs. Concurrent scraper updates then wait for
+    -- this transaction instead of updating a row that is about to be removed.
+    PERFORM jobs.job_id
+    FROM public.jobs AS jobs
+    WHERE jobs.job_id IN (
+        SELECT source_job_id
+        FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id
+        FROM public.job_repost_merge_plan
+    )
+    ORDER BY jobs.job_id
+    FOR UPDATE OF jobs;
+
     IF EXISTS (
         SELECT 1
         FROM public.job_repost_merge_plan p
@@ -470,12 +573,39 @@ BEGIN
         RAISE EXCEPTION 'Archived listing references a missing canonical job';
     END IF;
 
+    -- Keep aggregate keyword counts transactionally consistent with the facts
+    -- moved above. The transaction-wide advisory lock acquired at entry is the
+    -- same lock used by all incremental keyword fact writers and rebuilds.
+    DELETE FROM public.keyword_insights;
+
+    INSERT INTO public.keyword_insights (
+        archetype, provider, keyword, category, count, last_updated
+    )
+    SELECT
+        archetype,
+        COALESCE(provider, 'unknown'),
+        keyword,
+        category,
+        count(*)::integer,
+        now()
+    FROM public.job_keyword_insights
+    GROUP BY archetype, COALESCE(provider, 'unknown'), keyword, category;
+
     DELETE FROM public.job_repost_merge_plan;
     RETURN QUERY SELECT group_count, deleted_count;
 END;
 $$;
 
+ALTER FUNCTION public.merge_historical_repost_plan() OWNER TO postgres;
 REVOKE ALL ON FUNCTION public.merge_historical_repost_plan() FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.merge_historical_repost_plan() TO service_role;
+
+-- SECURITY DEFINER RPCs are the only supported mutation paths. ALL also
+-- removes stale TRUNCATE, REFERENCES, and TRIGGER grants from deployments that
+-- previously granted full table access.
+REVOKE ALL PRIVILEGES ON TABLE public.keyword_insights, public.job_keyword_insights
+FROM PUBLIC, anon, authenticated, service_role;
+GRANT SELECT ON TABLE public.keyword_insights, public.job_keyword_insights
+TO anon, authenticated, service_role;
 
 COMMIT;

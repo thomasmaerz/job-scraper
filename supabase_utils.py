@@ -10,6 +10,7 @@ import string
 import unicodedata
 import html
 from collections.abc import Mapping, Sequence
+from difflib import SequenceMatcher
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
 import freehire_compat
@@ -115,6 +116,33 @@ def build_canonical_key(provider: str, company: str, title: str, location: str) 
     ])
 
 
+def combine_listing_locations(listing_instances: list[dict], fallback: str | None = None) -> str | None:
+    """Return stable display/search text containing every observed location."""
+    by_normalized = {}
+    fallback_values = re.split(r"\s*;\s*", fallback or "")
+    for value in [*fallback_values, *(instance.get("location") for instance in listing_instances)]:
+        normalized = normalize_location(value)
+        if normalized and normalized not in by_normalized:
+            by_normalized[normalized] = _collapse_spaces(value)
+    if not by_normalized:
+        return None
+    return "; ".join(by_normalized[key] for key in sorted(by_normalized))
+
+
+def normalized_listing_locations(row: dict) -> set[str]:
+    values = {
+        normalize_location(instance.get("location"))
+        for instance in (row.get("listing_instances") or [])
+        if isinstance(instance, dict)
+    }
+    values.update(
+        normalize_location(value)
+        for value in re.split(r"\s*;\s*", row.get("location") or "")
+    )
+    values.discard("")
+    return values
+
+
 def _normalize_description_for_fingerprint(description: str) -> str:
     value = unicodedata.normalize("NFKD", description or "").lower()
     value = value.replace("’", "").replace("‘", "")
@@ -158,6 +186,73 @@ def description_similarity(left: str, right: str) -> float:
     if not left_tokens or not right_tokens:
         return 0.0
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def has_matching_body_hash(left: dict, right: dict) -> bool:
+    """Require the same sufficiently long normalized description body hash."""
+    left_fp = left.get("description_fingerprint") or make_description_fingerprint(left.get("description"))
+    right_fp = right.get("description_fingerprint") or make_description_fingerprint(right.get("description"))
+    return bool(left_fp and left_fp == right_fp)
+
+
+def extract_explicit_description_title(description: str) -> str | None:
+    match = re.search(
+        r"(?:^|\n)\s*(?:\*\*)?job\s+title\s*:\s*([^\n*]+)",
+        description or "",
+        flags=re.IGNORECASE,
+    )
+    return _collapse_spaces(match.group(1)) if match else None
+
+
+TITLE_FUZZY_NOISE_TOKENS = {
+    "canada", "remote", "hybrid", "onsite", "on", "site", "en", "fr",
+}
+
+
+def normalize_title_for_similarity(title: str) -> str:
+    value = normalize_title(title)
+    value = re.sub(r"\bpm\b", "project manager", value)
+    tokens = [token for token in value.split() if token not in TITLE_FUZZY_NOISE_TOKENS]
+    return " ".join(tokens)
+
+
+def title_similarity(left: str, right: str) -> float:
+    left_value = normalize_title_for_similarity(left)
+    right_value = normalize_title_for_similarity(right)
+    if not left_value or not right_value:
+        return 0.0
+    left_tokens = set(left_value.split())
+    right_tokens = set(right_value.split())
+    token_overlap = len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
+    sequence = SequenceMatcher(None, left_value, right_value).ratio()
+    return max(token_overlap, sequence)
+
+
+def is_high_confidence_repost_match(left: dict, right: dict) -> tuple[bool, str | None, float]:
+    """Allow fuzzy matching only within one role/location; otherwise require identity."""
+    if normalize_company(left.get("company")) != normalize_company(right.get("company")):
+        return False, None, 0.0
+
+    same_role = normalize_role_title(left.get("job_title")) == normalize_role_title(right.get("job_title"))
+    same_title = normalize_title(left.get("job_title")) == normalize_title(right.get("job_title"))
+    left_locations = normalized_listing_locations(left)
+    right_locations = normalized_listing_locations(right)
+    if not left_locations or not right_locations:
+        return False, None, 0.0
+    same_location = bool(left_locations & right_locations)
+    similarity = description_similarity(left.get("description"), right.get("description"))
+    if has_matching_body_hash(left, right):
+        fuzzy_title = title_similarity(left.get("job_title"), right.get("job_title"))
+        title_threshold = getattr(config, "REPOST_TITLE_SIMILARITY_THRESHOLD", 0.70)
+        if not same_title and fuzzy_title < title_threshold:
+            return False, None, similarity
+        method = "exact_fingerprint" if same_title and same_location else "body_hash_fuzzy_title"
+        return True, method, similarity
+
+    threshold = getattr(config, "REPOST_DESCRIPTION_SIMILARITY_THRESHOLD", 0.90)
+    if same_role and same_location and similarity >= threshold:
+        return True, "fuzzy_description", similarity
+    return False, None, similarity
 
 
 def _date_part(value: Any) -> str | None:
@@ -407,6 +502,10 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
         "posting_wave_count": posting_wave_count,
         "repost_count": repost_count,
         "listing_instances": listing_instances,
+        "location": combine_listing_locations(
+            listing_instances,
+            f"{existing.get('location') or ''}; {new_job.get('location') or ''}",
+        ),
         "detail_metadata_checked_at": new_job.get("detail_metadata_checked_at") or existing.get("detail_metadata_checked_at"),
         "same_id_relist_count": int(existing.get("same_id_relist_count") or 0) + int(accepted_same_id_relist),
     }
@@ -465,28 +564,14 @@ def find_canonical_match(job: dict, existing_rows: list[dict]) -> dict | None:
 
     matching_bucket = [
         row for row in ordered_rows
-        if target_location
-        and normalize_company(row.get("company")) == target_company
-        and normalize_role_title(row.get("job_title")) == target_title
-        and bool(normalize_location(row.get("location")))
-        and normalize_location(row.get("location")) == target_location
+        if normalize_company(row.get("company")) == target_company
     ]
     if len(matching_bucket) > 200:
         return None
 
     for row in matching_bucket:
-        same_company = normalize_company(row.get("company")) == target_company
-        same_title = normalize_role_title(row.get("job_title")) == target_title
-        same_fp = target_fp and row.get("description_fingerprint") == target_fp
-        if same_company and same_title and same_fp:
-            return row
-
-    for row in matching_bucket:
-        same_company = normalize_company(row.get("company")) == target_company
-        same_title = normalize_role_title(row.get("job_title")) == target_title
-        similarity = description_similarity(job.get("description"), row.get("description"))
-        threshold = getattr(config, "REPOST_DESCRIPTION_SIMILARITY_THRESHOLD", 0.90)
-        if same_company and same_title and similarity >= threshold:
+        matched, _, _ = is_high_confidence_repost_match(job, row)
+        if matched:
             return row
 
     return None

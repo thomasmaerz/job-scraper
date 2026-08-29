@@ -156,23 +156,6 @@ def test_parse_keyword_response_validates_structured_json():
     }
 
 
-def test_parse_keyword_response_accepts_top_level_job_list():
-    raw = json.dumps(
-        [
-            {
-                "job_id": "job-1",
-                "keywords": [{"keyword": "Azure", "category": "technology"}],
-            }
-        ]
-    )
-
-    parsed = analyze_jobs.parse_keyword_response(raw)
-
-    assert parsed == {
-        "job-1": [analyze_jobs.KeywordItem(keyword="Azure", category="technology")]
-    }
-
-
 def test_extract_keywords_from_batch_uses_llm_client_response_format():
     calls = []
 
@@ -420,51 +403,6 @@ def test_extract_keywords_from_batch_raises_if_any_job_id_missing_from_response(
         assert "Missing keyword results for job_ids: 2" in str(exc)
     else:
         raise AssertionError("Expected ValueError for omitted job_id")
-
-
-def test_extract_keywords_from_batch_retries_only_missing_jobs(monkeypatch):
-    calls = []
-
-    class FakeClient:
-        def generate_content(self, **kwargs):
-            calls.append(kwargs)
-            if len(calls) == 1:
-                return json.dumps(
-                    {
-                        "jobs": [
-                            {
-                                "job_id": "1",
-                                "keywords": [{"keyword": "Python", "category": "technology"}],
-                            }
-                        ]
-                    }
-                )
-            return json.dumps(
-                [
-                    {
-                        "job_id": "2",
-                        "keywords": [{"keyword": "SQL", "category": "technology"}],
-                    }
-                ]
-            )
-
-    monkeypatch.setattr(analyze_jobs.config, "JOB_INSIGHTS_SLEEP_SECONDS", 0)
-    batch = [
-        {"job_id": "1", "job_title": "A", "description": "Needs Python"},
-        {"job_id": "2", "job_title": "B", "description": "Needs SQL"},
-    ]
-
-    result = analyze_jobs.extract_keywords_from_batch(
-        batch,
-        client=FakeClient(),
-        max_retries=2,
-    )
-
-    assert set(result) == {"1", "2"}
-    assert "Job ID: 1" in calls[0]["prompt"]
-    assert "Job ID: 2" in calls[0]["prompt"]
-    assert "Job ID: 1" not in calls[1]["prompt"]
-    assert "Job ID: 2" in calls[1]["prompt"]
 
 
 def test_mark_jobs_analyzed_updates_timestamp_for_ids():

@@ -68,6 +68,63 @@ def test_normalize_location_collapses_formatting_noise():
     assert supabase_utils.normalize_location(" Toronto , Ontario  , Canada ") == "toronto ontario canada"
 
 
+def test_combine_listing_locations_preserves_every_location_stably():
+    instances = [
+        {"location": "Toronto, Ontario, Canada"},
+        {"location": "Calgary, Alberta, Canada"},
+        {"location": " Toronto, Ontario, Canada "},
+    ]
+
+    assert supabase_utils.combine_listing_locations(instances) == (
+        "Calgary, Alberta, Canada; Toronto, Ontario, Canada"
+    )
+
+
+def test_fuzzy_match_uses_any_previously_folded_location():
+    common = " ".join(f"delivery token{index}" for index in range(100))
+    existing = {
+        "job_id": "1",
+        "company": "Acme",
+        "job_title": "Project Manager",
+        "location": "Calgary, Alberta, Canada; Toronto, Ontario, Canada",
+        "listing_instances": [{"job_id": "1", "location": "Toronto, Ontario, Canada"}],
+        "description": common + " original",
+    }
+    incoming = {
+        "job_id": "2",
+        "company": "Acme",
+        "job_title": "Project Manager",
+        "location": "Toronto, Ontario, Canada",
+        "description": common + " updated",
+    }
+
+    assert supabase_utils.find_canonical_match(incoming, [existing]) is existing
+
+
+def test_live_matching_folds_exact_cross_location_variants():
+    description = "**Job Title: Senior Project Manager**\n\n" + " ".join(f"delivery token{index}" for index in range(100))
+    existing = {"job_id": "1", "company": "Acme", "job_title": "Senior Project Manager - Toronto", "location": "Toronto", "description": description, "description_fingerprint": supabase_utils.make_description_fingerprint(description)}
+    incoming = {"job_id": "2", "company": "Acme", "job_title": "Senior Project Manager - Calgary", "location": "Calgary", "description": description}
+
+    assert supabase_utils.find_canonical_match(incoming, [existing]) is existing
+
+
+def test_live_matching_rejects_fuzzy_cross_location_variants():
+    common = " ".join(f"delivery token{index}" for index in range(100))
+    existing = {"job_id": "1", "company": "Acme", "job_title": "Program Manager", "location": "Toronto", "description": common + " corporate"}
+    incoming = {"job_id": "2", "company": "Acme", "job_title": "Program Manager - Engineering", "location": "Calgary", "description": common + " engineering"}
+
+    assert supabase_utils.find_canonical_match(incoming, [existing]) is None
+
+
+def test_live_matching_accepts_same_body_hash_with_formatting_differences():
+    common = " ".join(f"delivery token{index}" for index in range(100))
+    existing = {"job_id": "1", "company": "Acme", "job_title": "Senior Project Manager", "location": "Toronto", "description": common + " — delivery", "description_fingerprint": supabase_utils.make_description_fingerprint(common + " — delivery")}
+    incoming = {"job_id": "2", "company": "Acme", "job_title": "Sr Project Manager - Remote", "location": "Toronto", "description": common + " - delivery"}
+
+    assert supabase_utils.find_canonical_match(incoming, [existing]) is existing
+
+
 def test_build_canonical_key_uses_normalized_parts():
     key = supabase_utils.build_canonical_key(
         provider="linkedin",

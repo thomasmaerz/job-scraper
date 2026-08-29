@@ -10,8 +10,50 @@ import supabase_utils
 SELECT_FIELDS = (
     "job_id,company,job_title,description,description_fingerprint,scraped_at,last_seen_at,"
     "status,application_date,notes,customized_resume_id,is_interested,insights_analyzed_at,"
-    "applicant_count,salary_text,recruiter_name,level,location"
+    "applicant_count,salary_text,recruiter_name,level,location,listing_instances"
 )
+
+
+def distinct_locations(row: dict) -> set[str]:
+    locations = {supabase_utils.normalize_location(row.get("location"))}
+    locations.update(
+        supabase_utils.normalize_location(instance.get("location"))
+        for instance in (row.get("listing_instances") or [])
+        if isinstance(instance, dict)
+    )
+    locations.discard("")
+    return locations
+
+
+def audit_merge_plan(rows: list[dict], plan: list[dict]) -> dict:
+    by_id = {str(row["job_id"]): row for row in rows}
+    grouped = defaultdict(set)
+    method_counts = defaultdict(int)
+    for item in plan:
+        grouped[str(item["survivor_job_id"])].add(str(item["source_job_id"]))
+        method_counts[str(item["match_method"])] += 1
+
+    groups = []
+    missing_ids = set()
+    for survivor_id, source_ids in sorted(grouped.items()):
+        member_ids = {survivor_id, *source_ids}
+        missing_ids.update(member_ids - by_id.keys())
+        source_locations = set()
+        for member_id in member_ids & by_id.keys():
+            source_locations.update(distinct_locations(by_id[member_id]))
+        groups.append({
+            "survivor_job_id": survivor_id,
+            "source_job_ids": sorted(source_ids),
+            "source_locations": sorted(source_locations),
+        })
+
+    return {
+        "groups": groups,
+        "group_count": len(groups),
+        "source_count": len(plan),
+        "method_counts": dict(sorted(method_counts.items())),
+        "missing_job_ids": sorted(missing_ids),
+    }
 
 
 def fetch_jobs(page_size: int = 1000) -> list[dict]:
@@ -47,14 +89,16 @@ def _completeness(row: dict) -> int:
 
 
 def _survivor_key(row: dict) -> tuple:
-    protected = sum(
-        (
-            row.get("status") in {"applied", "interviewing", "offer"},
-            row.get("application_date") is not None,
-            bool(row.get("notes")),
-            row.get("customized_resume_id") is not None,
-            row.get("is_interested") is True,
-        )
+    workflow_rank = {
+        "offer": 4,
+        "interviewing": 3,
+        "applied": 2,
+    }.get(row.get("status"), 1 if row.get("application_date") is not None else 0)
+    protected = (
+        workflow_rank,
+        row.get("customized_resume_id") is not None,
+        bool(row.get("notes")),
+        row.get("is_interested") is True,
     )
     observed_at = row.get("last_seen_at") or row.get("scraped_at") or ""
     return protected, _completeness(row), observed_at, str(row["job_id"])
@@ -63,16 +107,11 @@ def _survivor_key(row: dict) -> tuple:
 def build_merge_plan(rows: list[dict]) -> list[dict]:
     buckets = defaultdict(list)
     for row in rows:
-        key = (
-            supabase_utils.normalize_company(row.get("company")),
-            supabase_utils.normalize_role_title(row.get("job_title")),
-            supabase_utils.normalize_location(row.get("location")),
-        )
-        if all(key):
-            buckets[key].append(row)
+        company = supabase_utils.normalize_company(row.get("company"))
+        if company:
+            buckets[company].append(row)
 
     plan = []
-    threshold = getattr(config, "REPOST_DESCRIPTION_SIMILARITY_THRESHOLD", 0.90)
     for bucket in buckets.values():
         if len(bucket) < 2 or len(bucket) > 200:
             continue
@@ -83,16 +122,10 @@ def build_merge_plan(rows: list[dict]) -> list[dict]:
             remaining = []
             methods = {}
             for candidate in unclaimed:
-                exact = (
-                    canonical.get("description_fingerprint")
-                    and canonical.get("description_fingerprint") == candidate.get("description_fingerprint")
-                )
-                similarity = supabase_utils.description_similarity(
-                    canonical.get("description"), candidate.get("description")
-                )
-                if exact or similarity >= threshold:
+                matched, method, similarity = supabase_utils.is_high_confidence_repost_match(canonical, candidate)
+                if matched:
                     cluster.append(candidate)
-                    methods[candidate["job_id"]] = ("exact_fingerprint" if exact else "fuzzy_description", similarity)
+                    methods[candidate["job_id"]] = (method, similarity)
                 else:
                     remaining.append(candidate)
             unclaimed = remaining
@@ -102,7 +135,11 @@ def build_merge_plan(rows: list[dict]) -> list[dict]:
             for source in cluster:
                 if source["job_id"] == survivor["job_id"]:
                     continue
-                method, similarity = methods.get(source["job_id"], ("cluster_member", None))
+                method, similarity = methods.get(source["job_id"], (None, None))
+                if method is None:
+                    matched, method, similarity = supabase_utils.is_high_confidence_repost_match(source, survivor)
+                    if not matched:
+                        continue
                 plan.append(
                     {
                         "source_job_id": source["job_id"],
@@ -114,25 +151,40 @@ def build_merge_plan(rows: list[dict]) -> list[dict]:
     return plan
 
 
-def run(apply: bool) -> dict:
-    plan = build_merge_plan(fetch_jobs())
+def run(apply: bool, body_hash_only: bool = True) -> dict:
+    jobs = fetch_jobs()
+    plan = build_merge_plan(jobs)
+    if body_hash_only:
+        plan = [
+            row for row in plan
+            if row["match_method"] in {"exact_fingerprint", "body_hash_fuzzy_title"}
+        ]
     summary = {
         "groups": len({row["survivor_job_id"] for row in plan}),
         "redundant_rows": len(plan),
         "exact": sum(row["match_method"] == "exact_fingerprint" for row in plan),
+        "body_hash_fuzzy_title": sum(row["match_method"] == "body_hash_fuzzy_title" for row in plan),
         "fuzzy": sum(row["match_method"] == "fuzzy_description" for row in plan),
+        "audit": audit_merge_plan(jobs, plan),
     }
     if not apply or not plan:
         return summary
-    supabase_utils.supabase.rpc(
+    all_exact = all(row["match_method"] in {"exact_fingerprint", "body_hash_fuzzy_title"} for row in plan)
+    if not all_exact or summary["audit"]["missing_job_ids"]:
+        raise ValueError("Refusing to apply a merge plan that is not exact and complete")
+    summary["staged_rows"] = supabase_utils.supabase.rpc(
         "replace_historical_repost_plan", {"p_plan": plan}
-    ).execute()
+    ).execute().data
     summary["merge_result"] = supabase_utils.supabase.rpc("merge_historical_repost_plan").execute().data
+    import analyze_jobs
+
+    analyze_jobs.rebuild_keyword_insights(db=supabase_utils.supabase)
     return summary
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--include-fuzzy", action="store_true")
     args = parser.parse_args()
-    print(run(apply=args.apply))
+    print(run(apply=args.apply, body_hash_only=not args.include_fuzzy))

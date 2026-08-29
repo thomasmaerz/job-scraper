@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import time
@@ -64,10 +63,7 @@ def _normalize_category(category: str) -> str:
 
 
 def parse_keyword_response(raw_response: str) -> dict[str, list[KeywordItem]]:
-    payload = json.loads(raw_response)
-    if isinstance(payload, list):
-        payload = {"jobs": payload}
-    parsed = JobKeywordResultList.model_validate(payload)
+    parsed = JobKeywordResultList.model_validate_json(raw_response)
     return {job.job_id: job.keywords for job in parsed.jobs}
 
 
@@ -102,49 +98,36 @@ def fetch_unanalyzed_jobs(
 def extract_keywords_from_batch(batch, client=None, max_retries=None) -> dict[str, list[KeywordItem]]:
     client = client or job_insights_client
     max_retries = config.JOB_INSIGHTS_MAX_RETRIES if max_retries is None else max_retries
-    expected_jobs = {
-        str(job["job_id"]): job
-        for job in batch
-        if job.get("job_id") is not None
-    }
-    pending_jobs = expected_jobs.copy()
-    extracted = {}
+
+    prompt_lines = [
+        "Extract keywords for each job posting individually.",
+        "Return only structured JSON.",
+    ]
+    for job in batch:
+        prompt_lines.append(f"Job ID: {job.get('job_id', '')}")
+        prompt_lines.append(f"Title: {job.get('job_title', '')}")
+        prompt_lines.append(f"Description: {job.get('description', '')}")
+        prompt_lines.append("")
+
+    prompt = "\n".join(prompt_lines)
 
     last_error = None
     for attempt in range(max_retries):
         try:
-            prompt_lines = [
-                "Extract keywords for each job posting individually.",
-                "Return only structured JSON.",
-            ]
-            for job in pending_jobs.values():
-                prompt_lines.append(f"Job ID: {job.get('job_id', '')}")
-                prompt_lines.append(f"Title: {job.get('job_title', '')}")
-                prompt_lines.append(f"Description: {job.get('description', '')}")
-                prompt_lines.append("")
-
             raw_response = client.generate_content(
-                prompt="\n".join(prompt_lines),
+                prompt=prompt,
                 system_prompt=SYSTEM_PROMPT,
                 reasoning_effort="low",
                 response_format=JobKeywordResultList,
             )
             parsed = parse_keyword_response(raw_response)
-            extracted.update(
-                (job_id, keywords)
-                for job_id, keywords in parsed.items()
-                if job_id in expected_jobs
-            )
-            pending_jobs = {
-                job_id: job
-                for job_id, job in expected_jobs.items()
-                if job_id not in extracted
-            }
-            if pending_jobs:
+            expected_job_ids = {str(job.get("job_id")) for job in batch if job.get("job_id") is not None}
+            missing_job_ids = sorted(job_id for job_id in expected_job_ids if job_id not in parsed)
+            if missing_job_ids:
                 raise ValueError(
-                    f"Missing keyword results for job_ids: {', '.join(sorted(pending_jobs))}"
+                    f"Missing keyword results for job_ids: {', '.join(missing_job_ids)}"
                 )
-            return extracted
+            return parsed
         except Exception as exc:
             last_error = exc
             logger.warning("Keyword extraction failed on attempt %s: %s", attempt + 1, exc)

@@ -176,9 +176,6 @@ def run(apply: bool, body_hash_only: bool = True) -> dict:
         "replace_historical_repost_plan", {"p_plan": plan}
     ).execute().data
     summary["merge_result"] = supabase_utils.supabase.rpc("merge_historical_repost_plan").execute().data
-    import analyze_jobs
-
-    analyze_jobs.rebuild_keyword_insights(db=supabase_utils.supabase)
     return summary
 
 

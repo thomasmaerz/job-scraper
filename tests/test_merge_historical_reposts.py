@@ -164,7 +164,7 @@ def test_apply_flow_stages_and_merges_through_serialized_rpcs(monkeypatch):
             return Query()
 
     plan = [{"source_job_id": "old", "survivor_job_id": "new", "match_method": "exact_fingerprint", "match_similarity": None}]
-    monkeypatch.setattr(merge_historical_reposts, "fetch_jobs", lambda: [])
+    monkeypatch.setattr(merge_historical_reposts, "fetch_jobs", lambda: [{"job_id": "old"}, {"job_id": "new"}])
     monkeypatch.setattr(merge_historical_reposts, "build_merge_plan", lambda rows: plan)
     monkeypatch.setattr(merge_historical_reposts.supabase_utils, "supabase", FakeDb())
 
@@ -197,5 +197,17 @@ def test_dry_run_does_not_stage_or_merge(monkeypatch):
         "groups": 1,
         "redundant_rows": 1,
         "exact": 1,
+        "body_hash_fuzzy_title": 0,
         "fuzzy": 0,
+        "audit": {
+            "groups": [{
+                "survivor_job_id": "new",
+                "source_job_ids": ["old"],
+                "source_locations": [],
+            }],
+            "group_count": 1,
+            "source_count": 1,
+            "method_counts": {"exact_fingerprint": 1},
+            "missing_job_ids": ["new", "old"],
+        },
     }

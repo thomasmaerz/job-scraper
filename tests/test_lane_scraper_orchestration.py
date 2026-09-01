@@ -178,6 +178,25 @@ def test_configured_run_restores_process_global_dedup_setting(monkeypatch):
 
     scraper._run_database_configured_linkedin(config, [])
 
+
+def test_production_query_function_serializes_shared_supabase_client(monkeypatch):
+    payload = rpc_payload(locations=["canada"])
+    payload["settings"]["concurrent_queries"] = 3
+    config = parse_scrape_configuration(payload)
+    monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
+    calls = []
+    fake_process = lambda **kwargs: calls.append(kwargs) or []
+    fake_process.__module__ = scraper.__name__
+    monkeypatch.setattr(scraper, "process_linkedin_query", fake_process)
+    monkeypatch.setattr(
+        scraper,
+        "ThreadPoolExecutor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("shared Supabase client must serialize")),
+    )
+
+    scraper._run_database_configured_linkedin(config, [])
+    assert calls
+
     assert scraper.config.ENABLE_REPOST_DEDUP is True
 
 

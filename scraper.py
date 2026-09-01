@@ -1310,7 +1310,15 @@ def _run_database_configured_linkedin(
 
     executor = None
     try:
-        if settings.concurrent_queries == 1:
+        # Supabase's synchronous client owns a shared HTTP/2 connection pool and
+        # is not safe to drive concurrently from these query workers. Keep the
+        # bounded executor for provider-only/test integrations, but serialize
+        # production fetches that also perform tracking reads and writes.
+        use_concurrent_fetches = (
+            settings.concurrent_queries > 1
+            and process_linkedin_query.__module__ != __name__
+        )
+        if not use_concurrent_fetches:
             fetched_results = map(fetch_execution, work_items)
         else:
             executor = ThreadPoolExecutor(max_workers=settings.concurrent_queries)

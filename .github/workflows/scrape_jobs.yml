@@ -26,7 +26,9 @@ jobs:
       actions: read
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Multi-lane searches are intentionally serialized around the synchronous
+    # Supabase client; allow the configured query set to finish cleanly.
+    timeout-minutes: 120
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4

@@ -29,6 +29,12 @@ def test_downstream_workflows_default_to_enabled_lanes_with_optional_override():
     assert hourly_step["env"]["JOB_INSIGHTS_ARCHETYPE"] == ""
 
 
+def test_scrape_workflow_allows_multi_lane_serial_runtime():
+    hourly = load_workflow("scrape_jobs.yml")
+
+    assert hourly["jobs"]["scrape"]["timeout-minutes"] == 120
+
+
 def test_scoring_and_resume_workflows_have_defense_in_depth_concurrency_groups():
     score = load_workflow("score_jobs.yml")
     resume = load_workflow("hourly_resume_customization.yml")
@@ -63,7 +69,7 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
         "actions": "read",
         "contents": "read",
     }
-    assert workflow["jobs"]["scrape"]["timeout-minutes"] == 30
+    assert workflow["jobs"]["scrape"]["timeout-minutes"] == 120
 
     recovery_step = next(
         step

@@ -12,6 +12,15 @@ on:
         required: false
         default: "25"
         type: number
+      archetype:
+        description: "Optional single canonical lane; blank processes all enabled lanes"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: lane-scoring
+  cancel-in-progress: false
 
 jobs:
   score:
@@ -41,5 +50,5 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           JOBS_TO_SCORE_PER_RUN: ${{ inputs.jobs_per_run || '25' }}
+          JOB_SCORE_ARCHETYPE: ${{ inputs.archetype || '' }}
         run: python score_jobs.py # Execute the job scoring script
-

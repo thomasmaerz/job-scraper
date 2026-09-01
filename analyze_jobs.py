@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 import config
 from llm_client import job_insights_client
+from lane_catalog import canonical_lane_slug
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,20 @@ def fetch_unanalyzed_jobs(
     replacement_backfill: bool = False,
 ) -> list:
     db = db or _get_db()
+    if limit is None:
+        limit = config.JOB_INSIGHTS_MAX_JOBS
+    try:
+        membership_response = db.rpc("get_lane_jobs_for_analysis", {
+            "p_archetype": canonical_lane_slug(archetype),
+            "p_limit": limit,
+            "p_backfill_all": backfill_all,
+            "p_replacement_backfill": replacement_backfill,
+        }).execute()
+        return membership_response.data or []
+    except AttributeError:
+        pass
+
+    # Compatibility fallback for older local database fakes only.
     query = (
         db.table(config.SUPABASE_TABLE_NAME)
         .select("job_id, job_title, description, archetype, provider")
@@ -250,21 +265,22 @@ def rebuild_keyword_insights(db=None):
     return db.rpc("rebuild_keyword_insights_atomic").execute().data
 
 
-def mark_jobs_analyzed(job_ids: list, db=None, replacement_backfill: bool = False):
+def mark_jobs_analyzed(job_ids: list, db=None, replacement_backfill: bool = False, archetype: str = config.DEFAULT_ARCHETYPE):
     if not job_ids:
         return
 
     db = db or _get_db()
     timestamp = datetime.now(timezone.utc).isoformat()
-    payload = {"insights_analyzed_at": timestamp}
+    payload = {"analyzed_at": timestamp, "updated_at": timestamp}
     if replacement_backfill:
         payload["insights_reanalyzed_at"] = timestamp
 
-    db.table(config.SUPABASE_TABLE_NAME).update(payload).in_("job_id", job_ids).execute()
+    db.table("job_archetype_memberships").update(payload).in_("job_id", job_ids).eq("archetype", canonical_lane_slug(archetype)).execute()
 
 
-def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, replacement_backfill: bool = False):
-    db = _get_db()
+def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, replacement_backfill: bool = False, db=None):
+    archetype = canonical_lane_slug(archetype)
+    db = db or _get_db()
     processed_jobs = 0
 
     while True:
@@ -287,7 +303,7 @@ def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, r
             facts = build_job_keyword_facts(batch, extracted)
             analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
             replace_job_keyword_facts(analyzed_job_ids, facts, archetype=archetype, db=db)
-            mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill)
+            mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill, archetype=archetype)
             processed_jobs += len(analyzed_job_ids)
 
         if not backfill_all and not replacement_backfill:
@@ -296,8 +312,16 @@ def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, r
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run(
-        archetype=os.getenv("JOB_INSIGHTS_ARCHETYPE", config.DEFAULT_ARCHETYPE),
-        backfill_all=os.getenv("JOB_INSIGHTS_BACKFILL_ALL", "false").lower() == "true",
-        replacement_backfill=os.getenv("JOB_INSIGHTS_REPLACEMENT_BACKFILL", "false").lower() == "true",
+    from downstream_orchestration import run_enabled_lanes
+
+    shared_db = _get_db()
+    run_enabled_lanes(
+        lambda lane: run(
+            archetype=lane,
+            backfill_all=os.getenv("JOB_INSIGHTS_BACKFILL_ALL", "false").lower() == "true",
+            replacement_backfill=os.getenv("JOB_INSIGHTS_REPLACEMENT_BACKFILL", "false").lower() == "true",
+            db=shared_db,
+        ),
+        db=shared_db,
+        override=os.getenv("JOB_INSIGHTS_ARCHETYPE"),
     )

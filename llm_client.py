@@ -276,9 +276,17 @@ class LLMClient:
                     logger.error(f"LLM API error (non-retryable) on model {current_model if 'current_model' in locals() else model}: {e}")
                     raise
 
-        # All retries exhausted
+        # All retries exhausted. Preserve the final provider error in logs so
+        # scheduled jobs expose whether the pool failed on quota, transport,
+        # authentication, or another provider condition.
         failed_model = current_model if 'current_model' in locals() else model
-        logger.error(f"All {max_attempts} attempts failed for model {failed_model}")
+        logger.error(
+            "All %s attempts failed; final model=%s; error=%s: %s",
+            max_attempts,
+            failed_model,
+            type(last_exception).__name__,
+            last_exception,
+        )
         raise last_exception
 
 

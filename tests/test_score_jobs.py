@@ -35,6 +35,43 @@ def test_get_resume_score_uses_job_scoring_client_without_reasoning(monkeypatch)
     assert "temperature" not in calls[0]
 
 
+def test_scheduled_scoring_skips_successfully_when_db_setting_is_false(monkeypatch):
+    import scheduled_scoring
+    configuration = SimpleNamespace(settings=SimpleNamespace(score_jobs=False))
+    monkeypatch.setattr(scheduled_scoring, "load_scrape_configuration", lambda db: configuration)
+
+    worker = lambda _lane: (_ for _ in ()).throw(AssertionError("must not score"))
+    assert scheduled_scoring.run_configured_scoring(worker, db=object()) == {
+        "status": "skipped_score_jobs_disabled"
+    }
+
+
+def test_scheduled_scoring_loads_db_setting_before_lane_orchestration(monkeypatch):
+    import scheduled_scoring
+    calls = []
+    configuration = SimpleNamespace(settings=SimpleNamespace(score_jobs=True))
+    monkeypatch.setattr(
+        scheduled_scoring,
+        "load_scrape_configuration",
+        lambda db: calls.append(("load", db)) or configuration,
+    )
+    monkeypatch.setattr(
+        scheduled_scoring,
+        "run_enabled_lanes",
+        lambda worker, **kwargs: calls.append(("run", kwargs)) or {"ok": True},
+    )
+    db = object()
+
+    assert scheduled_scoring.run_configured_scoring(
+        lambda _lane: None,
+        db=db, archetype_override="network_infrastructure"
+    ) == {"ok": True}
+    assert calls == [
+        ("load", db),
+        ("run", {"db": db, "override": "network_infrastructure"}),
+    ]
+
+
 def test_get_top_scored_jobs_to_apply_excludes_filtered_jobs(monkeypatch):
     class FakeQuery:
         def __init__(self):
@@ -90,3 +127,38 @@ def test_get_top_scored_jobs_to_apply_excludes_filtered_jobs(monkeypatch):
     assert ("is_", "resume_score", None) in db.query.calls
     assert ("order", "resume_score", True) in db.query.calls
     assert ("limit", 10) in db.query.calls
+
+
+def test_update_job_score_isolated_to_membership_lane(monkeypatch):
+    calls = []
+    class Query:
+        def update(self, payload): calls.append(("update", payload)); return self
+        def eq(self, key, value): calls.append(("eq", key, value)); return self
+        def execute(self): return SimpleNamespace(data=[{}])
+    class Db:
+        def table(self, name): calls.append(("table", name)); return Query()
+    monkeypatch.setattr(supabase_utils, "supabase", Db())
+
+    assert supabase_utils.update_job_score("job-1", 88, archetype="data_pm") is True
+    assert ("table", "job_archetype_memberships") in calls
+    assert ("eq", "job_id", "job-1") in calls
+    assert ("eq", "archetype", "data_pm") in calls
+    assert not any(call == ("table", supabase_utils.config.SUPABASE_TABLE_NAME) for call in calls)
+
+
+def test_scores_for_same_job_do_not_overwrite_another_lane(monkeypatch):
+    scores = {}
+    class Query:
+        def __init__(self): self.payload = None; self.job = None; self.lane = None
+        def update(self, payload): self.payload = payload; return self
+        def eq(self, key, value):
+            if key == "job_id": self.job = value
+            if key == "archetype": self.lane = value
+            return self
+        def execute(self): scores[(self.job, self.lane)] = self.payload["match_score"]; return SimpleNamespace(data=[{}])
+    class Db:
+        def table(self, name): assert name == "job_archetype_memberships"; return Query()
+    monkeypatch.setattr(supabase_utils, "supabase", Db())
+    supabase_utils.update_job_score("job-1", 91, archetype="data_pm")
+    supabase_utils.update_job_score("job-1", 64, archetype="network_infrastructure")
+    assert scores == {("job-1", "data_pm"): 91, ("job-1", "network_infrastructure"): 64}

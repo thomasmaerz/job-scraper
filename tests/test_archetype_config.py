@@ -16,6 +16,10 @@ def test_software_tpm_archetype_contains_all_current_linkedin_queries():
     ]
 
 
+def test_software_tpm_is_explicit_technology_delivery_compatibility_alias():
+    assert config.ARCHETYPE_CONFIGS["software_tpm"] is config.ARCHETYPE_CONFIGS["technology_delivery"]
+
+
 def test_software_tpm_desc_blocklist_does_not_include_aerospace_defense_rule():
     patterns = config.ARCHETYPE_CONFIGS["software_tpm"]["desc_blocklist"]
     assert r"aerospace.*defense|defense.*aerospace" not in patterns

@@ -1,14 +1,17 @@
 # Job Scraper & Application Assistant
 
-This project is a comprehensive suite of tools designed to automate and enhance the job searching process, primarily focusing on LinkedIn. It scrapes job postings, parses resumes, scores job suitability against a candidate's resume, analyzes job market keywords, manages job application statuses, and can even generate custom PDF resumes. The system leverages AI through a unified LLM client and Supabase for data storage.
+Turn a broad LinkedIn search into a structured, lane-aware job pipeline. The scraper discovers and canonicalizes listings, preserves repost history and query provenance, filters and scores each career lane independently, extracts market insights, and generates customized resumes without losing cross-lane matches.
 
 ## Features
 
 - **Job Scraping**: Automatically scrapes job postings. ([scraper.py](scraper.py))
+- **Configurable Career Lanes**: Search queries, Canada/USA/EEA coverage, filters, lookback, and scrape limits are managed in Supabase through the companion web app.
+- **Cross-Lane Deduplication**: One canonical job can retain multiple independent lane memberships, query matches, filter results, scores, insights, and resumes.
 - **Resume Parsing**:
   - Extracts text from PDF resumes using `pdfplumber`. ([resume_parser.py](resume_parser.py))
   - Utilizes Google Gemini AI to parse resume text into structured data ([parse_resume_with_ai.py](parse_resume_with_ai.py))
 - **Job Scoring**: Scores job descriptions against a parsed resume using AI to determine suitability. ([score_jobs.py](score_jobs.py))
+  Scheduled multi-lane scoring reads `scrape_settings.score_jobs` from the database before checking lane worker prerequisites and exits successfully with `skipped_score_jobs_disabled` when false. There is no workflow/environment bypass for that switch. The only supported bypass is the clearly named single-lane recovery API `score_jobs.run_manual_scoring_ignoring_score_jobs_setting("<canonical_lane>")`; it requires an explicit lane and must not be used by schedulers.
 - **Job Market Insights**: Extracts recurring keywords from unanalyzed jobs into per-job facts in `job_keyword_insights` and aggregate totals in `keyword_insights` using `analyze_jobs.py` for downstream reporting and trend analysis. Hourly pipeline runs are incremental and process at most the environment-configurable `JOB_INSIGHTS_MAX_JOBS` (default `100`) per run, with aggregates split by archetype and provider; manual recovery supports backlog and one-time replacement passes. ([analyze_jobs.py](analyze_jobs.py))
 - **Universal LLM Support**: Supports 400+ model providers (Gemini, OpenAI, Anthropic, Ollama, Groq, etc.) via a unified abstraction layer. ([llm_client.py](llm_client.py))
 - **Job Management**:
@@ -47,18 +50,19 @@ This project is a comprehensive suite of tools designed to automate and enhance 
 - **Text Conversion**: `html2text`
 - **CI/CD**: GitHub Actions
 
-## Setup and Installation
+## Getting Started
 
-This project is designed to run primarily through GitHub Actions. Follow these steps to set it up for your own use:
+The production path is GitHub Actions + Supabase. Local execution uses the same database configuration by default.
 
 1.  **Fork the Repository:**
     - Click the "Fork" button at the top right of this page to create a copy of this repository in your own GitHub account.
 
-2.  **Create a Supabase Project:**
+2.  **Create and migrate a Supabase project:**
     - Go to [Supabase](https://supabase.com/) and create a new project.
     - Once your project is created, navigate to the "SQL Editor" section.
     - Open the `supabase_setup/init.sql` file from this repository, copy its content, and run it in your Supabase SQL Editor. This will set up the necessary tables (like `jobs`, `customized_resumes`, `keyword_insights`, `job_keyword_insights`, and `base_resume`) and storage buckets (`resumes`, `personalized_resumes`).
-    - If you already have an existing Supabase project using an older schema, run `supabase_setup/add_job_insights.sql` once in the Supabase SQL Editor to add `jobs.insights_analyzed_at`, `jobs.insights_reanalyzed_at`, `keyword_insights`, and `job_keyword_insights`.
+    - Apply the migrations in the companion `job-scraper-web/supabase/migrations` directory. The configurable-lane migration adds the lane registry, search configuration, job memberships, resume profiles, protected RPCs, and the explicit `software_tpm` → `technology_delivery` compatibility alias.
+    - For an older schema, apply outstanding migrations in order rather than editing production tables manually.
     - Scheduled `Analyze Job Insights` runs only process new unanalyzed jobs. Use the manual `replacement_backfill` workflow input only when you explicitly want a one-time reanalysis of previously analyzed jobs.
 
 3.  **Obtain API Keys for Your LLM Provider:**
@@ -77,7 +81,35 @@ This project is designed to run primarily through GitHub Actions. Follow these s
 
     - > **Note:** Other non-sensitive variables like `LLM_MODEL`, `LLM_MAX_RPM`, and `JOBS_TO_SCORE_PER_RUN` are now hardcoded in `config.py` as safe defaults. You only need to set them as GitHub Variables if you want to override the `config.py` defaults (though this is no longer the recommended approach).
 
-5.  **Upload Your Resume to Supabase Storage:**
+5.  **Configure career lanes in the web app:**
+    - Start `job-scraper-web`, establish an administrator session, and open `/config`.
+    - Review the six lanes: `technology_delivery`, `systems_platform_ops`, `network_infrastructure`, `datacenter_operations`, `ai_workflow_automation`, and `building_controls`.
+    - Enable the desired precision and recall queries, choose Canada, USA, EEA, or any combination per lane, and set lookback and scrape limits.
+    - Save the configuration. The next scraper run reads that revision through the service-role-only `get_scraper_configuration()` RPC.
+
+6.  **Run the pipeline:**
+    - Trigger `Scrape Jobs` manually or wait for its schedule.
+    - Scoring, insights, and resume workers process every enabled lane when their archetype input is blank. Supply a canonical lane slug for a targeted recovery run.
+    - Resume-dependent workers skip lanes without an enabled `archetype_resume_profiles` row; scraping remains enabled.
+
+### Configuration source
+
+Database configuration is authoritative by default:
+
+```bash
+SCRAPE_CONFIG_SOURCE=db python scraper.py
+```
+
+For development or recovery, supply a complete validated configuration document. Overrides replace rather than merge with database configuration:
+
+```bash
+SCRAPE_CONFIG_SOURCE=file SCRAPE_CONFIG_FILE=./scrape-config.json python scraper.py
+SCRAPE_CONFIG_SOURCE=env SCRAPE_CONFIG_JSON='{"version":1,...}' python scraper.py
+```
+
+Keep `SUPABASE_SERVICE_ROLE_KEY` in environment secrets. Never place it in a configuration document or browser-exposed variable.
+
+7.  **Upload Your Resume to Supabase Storage:**
     - In your Supabase project dashboard, navigate to **Storage** in the left sidebar.
     - Find the **`resumes`** bucket (created by the `init.sql` script in step 2).
     - Click on the bucket, then click **"Upload files"** and upload your resume. **The file must be named `resume.pdf`**.
@@ -178,7 +210,7 @@ The individual Python scripts can still be run locally for development or testin
 
 ### Freehire compatibility contract
 
-Apply `supabase_setup/add_freehire_compat.sql` before enabling the frontfill. `public.freehire_jobs` is the service-role-only publication contract. It keeps canonical `job_id` as downstream identity, exposes `COALESCE(latest_job_id, job_id)` as `live_listing_id`, preserves source timestamps and metadata sidecars, and excludes candidate workflow/resume fields. Only LinkedIn rows with `freehire_compat_status='current'` and a pinned category are published; pending, processing, and failed rows are excluded. The current-status view is a persisted hash/version contract: consumers must not republish independently from raw `public.jobs`, and should compare `freehire_compat_import_hash` during complete keyset sweeps.
+Apply `supabase_setup/add_freehire_compat.sql` before enabling incremental classification. `public.freehire_jobs` is the service-role-only publication contract. It keeps canonical `job_id` as downstream identity, exposes `COALESCE(latest_job_id, job_id)` as `live_listing_id`, preserves source timestamps and metadata sidecars, and excludes candidate workflow/resume fields. Only LinkedIn rows with `freehire_compat_status='current'` and a pinned category are published; pending, processing, and failed rows are excluded. The current-status view is a persisted hash/version contract: consumers must not republish independently from raw `public.jobs`, and should compare `freehire_compat_import_hash` during complete keyset sweeps.
 
 `is_remote` is true only for standalone visible-text `remote`; it is never inferred. `freehire_compat_input_hash` binds classification to canonical normalized title, visible description, location, LinkedIn level, canonical `job_id`, and schema/taxonomy version. `freehire_compat_import_hash` tracks every published source/projection, classification, deterministic remote, live-ID, and effective timestamp field. Claims and writes compare the expected database source snapshot, and workers reread the claimed row before classification. `backfill_freehire_compat.py` performs a complete bounded keyset sweep and defaults to dry-run; use `--apply` only after reviewing counts.
 
@@ -340,7 +372,7 @@ Finalization serializes publishers and takes a bounded `SHARE` lock on `jobs`, s
 ├── analyze_jobs.py              # Extracts recurring keyword insights from new jobs
 ├── backfill_freehire_compat.py   # Dry-run-default compatibility sweep and classifier
 ├── freehire_compat.py            # Shared deterministic and LLM compatibility contract
-├── frontfill_freehire_compat.py  # Continuous pending-row compatibility worker
+├── incremental_freehire_compat.py # Incremental pending-row compatibility worker
 ├── .gitignore                  # Specifies intentionally untracked files that Git should ignore
 ├── README.md                   # This file
 ├── config.py                   # Configuration settings (API keys, search parameters)

@@ -1,4 +1,4 @@
-"""Backfill and frontfill the Freehire compatibility contract. Dry-run by default."""
+"""Backfill and incrementally maintain the Freehire compatibility contract. Dry-run by default."""
 
 import argparse
 import logging
@@ -69,7 +69,7 @@ def fetch_candidates(
     return query.range(0, page_size - 1).execute().data or []
 
 
-def fetch_frontfill_candidates(db, limit: int, now: datetime | None = None) -> list[dict]:
+def fetch_incremental_candidates(db, limit: int, now: datetime | None = None) -> list[dict]:
     """Fetch only a bounded, actionable newest-first hourly work set."""
     now = now or datetime.now(timezone.utc)
     retry_cutoff = now.isoformat()
@@ -236,7 +236,7 @@ def run(
                 break
             page = fetch_candidates(db, last_job_id=last_job_id, upper_bound=upper_bound)
         else:
-            page = fetch_frontfill_candidates(db, limit)
+            page = fetch_incremental_candidates(db, limit)
         if not page:
             break
         for row in page:

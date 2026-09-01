@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from lane_catalog import LANE_CATALOG
 
 load_dotenv()
 
@@ -52,7 +53,7 @@ CAREERS_FUTURE_SEARCH_EMPLOYMENT_TYPES = []
 # All regex patterns are case-insensitive. Edit lists here to tune without touching code.
 
 ARCHETYPE_CONFIGS = {
-    "software_tpm": {
+    "technology_delivery": {
         "provider": "linkedin",
         "location": LINKEDIN_LOCATION,
         "filter_profile": "software_tpm_v1",
@@ -117,6 +118,34 @@ ARCHETYPE_CONFIGS = {
         ],
     }
 }
+
+# Canonical lane context is always known locally so filtering fails only for
+# truly unknown archetypes. Database configuration controls which lanes and
+# queries execute; it does not redefine lane meaning.
+for _lane_slug, _lane_context in LANE_CATALOG.items():
+    ARCHETYPE_CONFIGS.setdefault(_lane_slug, {
+        "provider": "linkedin",
+        "location": LINKEDIN_LOCATION,
+        "filter_profile": f"{_lane_slug}_v1",
+        "search_queries": [],
+        "definition": _lane_context["definition"],
+        "route_when": _lane_context["route_when"],
+        "title_context": list(_lane_context["precision_queries"]),
+        "description_context": [
+            *_lane_context["positive_signals"],
+            *_lane_context["exclude_signals"],
+        ],
+        "positive_signals": list(_lane_context["positive_signals"]),
+        "exclude_signals": list(_lane_context["exclude_signals"]),
+        "company_blocklist": [],
+        "title_blocklist": [],
+        "title_entry_level_blocklist": [],
+        "desc_blocklist": [],
+    })
+
+# Explicit compatibility alias. Keep object identity so legacy software_tpm
+# callers receive exactly the technology_delivery search/filter behavior.
+ARCHETYPE_CONFIGS["software_tpm"] = ARCHETYPE_CONFIGS["technology_delivery"]
 
 DEFAULT_ARCHETYPE = "software_tpm"
 

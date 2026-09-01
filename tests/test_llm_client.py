@@ -134,6 +134,38 @@ def test_generate_content_omits_temperature_when_not_provided(monkeypatch):
     assert "temperature" not in calls[0]
 
 
+def test_generate_content_logs_final_provider_error_after_pool_exhaustion(monkeypatch, caplog):
+    calls = []
+
+    class RateLimitError(Exception):
+        pass
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        raise RateLimitError(f"429 exhausted on {kwargs['model']}")
+
+    monkeypatch.setattr(llm_client.litellm, "completion", fake_completion)
+    monkeypatch.setattr(llm_client.time, "sleep", lambda *_args, **_kwargs: None)
+
+    client = llm_client.LLMClient(
+        model="gemini",
+        api_key="test-key",
+        max_rpm=100,
+        max_retries=0,
+        retry_base_delay=0,
+        daily_budget=0,
+        request_delay=0,
+        model_chain=["gemini/first", "gemini/second"],
+    )
+
+    with pytest.raises(RateLimitError, match="429 exhausted on gemini/second"):
+        client.generate_content(prompt="hello")
+
+    assert [call["model"] for call in calls] == ["gemini/first", "gemini/second"]
+    assert "All 2 attempts failed; final model=gemini/second" in caplog.text
+    assert "RateLimitError: 429 exhausted on gemini/second" in caplog.text
+
+
 def test_job_scoring_model_chain_prefers_flash_lite_then_gemma_31b():
     import config
 

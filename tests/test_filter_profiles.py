@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import supabase_utils
+import pytest
 
 
 def test_get_filter_profile_returns_software_tpm_profile_for_current_jobs():
@@ -9,6 +10,11 @@ def test_get_filter_profile_returns_software_tpm_profile_for_current_jobs():
     assert profile["filter_profile"] == "software_tpm_v1"
     assert r"construction firm" in profile["desc_blocklist"]
     assert r"aerospace.*defense|defense.*aerospace" not in profile["desc_blocklist"]
+
+
+def test_get_filter_profile_fails_loudly_for_unknown_archetype():
+    with pytest.raises(ValueError, match="Unknown archetype/filter profile 'not_real'"):
+        supabase_utils.get_filter_profile("not_real")
 
 
 def test_match_filter_reason_uses_archetype_specific_construction_rules():
@@ -23,6 +29,68 @@ def test_match_filter_reason_uses_archetype_specific_construction_rules():
 
     assert reason == r"desc:\bProcore\b"
     assert entry_level is False
+
+
+def test_lane_include_terms_are_or_routing_signals_and_excludes_win():
+    profile = {
+        "company_blocklist": [], "title_entry_level_blocklist": [],
+        "title_blocklist": [r"sales"], "desc_blocklist": [r"construction"],
+        "title_include": [r"program manager", r"project manager"],
+        "description_include": [r"cloud", r"infrastructure"],
+    }
+    included = supabase_utils.evaluate_lane_filter(
+        {"job_title": "Technical Program Manager", "description": "Delivery role"},
+        archetype="technology_delivery", runtime_profile=profile,
+    )
+    review = supabase_utils.evaluate_lane_filter(
+        {"job_title": "Operations Lead", "description": "General operations"},
+        archetype="technology_delivery", runtime_profile=profile,
+    )
+    excluded = supabase_utils.evaluate_lane_filter(
+        {"job_title": "Technical Program Manager", "description": "Construction delivery"},
+        archetype="technology_delivery", runtime_profile=profile,
+    )
+    assert included["filter_status"] == "included"
+    assert review == {"filter_status": "review", "is_filtered": False, "filter_reason": "include:no_route_signal", "is_entry_level_filtered": False}
+    assert excluded["filter_status"] == "filtered"
+
+
+def test_persist_lane_filter_state_keys_update_by_job_and_lane(monkeypatch):
+    calls = []
+    class Query:
+        def update(self, payload): calls.append(("update", payload)); return self
+        def eq(self, key, value): calls.append(("eq", key, value)); return self
+        def execute(self): return SimpleNamespace(data=[{}])
+    class Db:
+        def table(self, name): calls.append(("table", name)); return Query()
+    supabase_utils.persist_lane_filter_state(
+        "job-1", "data_pm", {"job_title": "Data Product Manager", "description": "SQL"},
+        runtime_profile={"company_blocklist": [], "title_entry_level_blocklist": [], "title_blocklist": [], "desc_blocklist": []},
+        db=Db(),
+    )
+    assert ("table", "job_archetype_memberships") in calls
+    assert ("eq", "job_id", "job-1") in calls
+    assert ("eq", "archetype", "data_pm") in calls
+
+
+def test_filter_updates_for_same_job_do_not_cross_lane():
+    states = {}
+    class Query:
+        def __init__(self): self.payload = None; self.job = None; self.lane = None
+        def update(self, payload): self.payload = payload; return self
+        def eq(self, key, value):
+            if key == "job_id": self.job = value
+            if key == "archetype": self.lane = value
+            return self
+        def execute(self): states[(self.job, self.lane)] = self.payload; return SimpleNamespace(data=[{}])
+    class Db:
+        def table(self, name): assert name == "job_archetype_memberships"; return Query()
+    base = {"company_blocklist": [], "title_entry_level_blocklist": [], "title_blocklist": [], "desc_blocklist": []}
+    supabase_utils.persist_lane_filter_state("job-1", "data_pm", {"job_title": "Data PM"}, runtime_profile=base, db=Db())
+    excluded = {**base, "title_blocklist": ["network"]}
+    supabase_utils.persist_lane_filter_state("job-1", "network_infrastructure", {"job_title": "Network PM"}, runtime_profile=excluded, db=Db())
+    assert states[("job-1", "data_pm")]["is_filtered"] is False
+    assert states[("job-1", "network_infrastructure")]["is_filtered"] is True
 
 
 class FakeQuery:

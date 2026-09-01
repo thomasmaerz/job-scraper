@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import scraper
 import supabase_utils
+from scrape_configuration import parse_scrape_configuration
+from test_scrape_configuration import rpc_payload
 
 
 def test_get_last_successful_scrape_at_reads_existing_run_state(monkeypatch):
@@ -492,6 +494,7 @@ def test_main_consumes_canonical_saver_id_lists_for_all_sources(monkeypatch, cap
         {"job_id": "careers-future-source-id", "provider": "careers_future"}
     ]
     linkedin_save_calls = []
+    linkedin_process_calls = []
     generic_save_calls = []
     success_calls = []
 
@@ -521,8 +524,16 @@ def test_main_consumes_canonical_saver_id_lists_for_all_sources(monkeypatch, cap
     )
     monkeypatch.setattr(
         scraper,
+        "load_scrape_configuration",
+        lambda db: parse_scrape_configuration(rpc_payload()),
+    )
+    monkeypatch.setattr(
+        scraper,
         "process_linkedin_query",
-        lambda **kwargs: linkedin_jobs,
+        lambda **kwargs: (
+            linkedin_process_calls.append(kwargs)
+            or (linkedin_jobs if len(linkedin_process_calls) == 1 else [])
+        ),
     )
     monkeypatch.setattr(
         scraper,
@@ -531,8 +542,17 @@ def test_main_consumes_canonical_saver_id_lists_for_all_sources(monkeypatch, cap
     )
     monkeypatch.setattr(
         scraper.supabase_utils,
-        "save_linkedin_jobs_canonicalized",
-        lambda jobs: linkedin_save_calls.append(jobs) or ["linkedin-canonical-id"],
+        "save_linkedin_jobs_canonicalized_with_mapping",
+        lambda jobs: linkedin_save_calls.append(jobs) or scraper.supabase_utils.CanonicalSaveResult(
+            canonical_ids=["linkedin-canonical-id"],
+            canonical_by_source={"linkedin-id": "linkedin-canonical-id"},
+            canonical_ids_by_input=["linkedin-canonical-id"],
+        ),
+    )
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "persist_lane_filter_state",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         scraper.supabase_utils,

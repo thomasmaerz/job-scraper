@@ -151,6 +151,11 @@ def test_process_linkedin_query_output_flows_through_linkedin_and_generic_savers
         "save_job_to_supabase",
         lambda job: saved.append(job) or job["job_id"],
     )
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "upsert_job_archetype_membership",
+        lambda _job_id, _job: None,
+    )
 
     jobs = scraper.process_linkedin_query("TPM", "Canada")
     linkedin_saved_job_ids = scraper.supabase_utils.save_linkedin_jobs_canonicalized(jobs)

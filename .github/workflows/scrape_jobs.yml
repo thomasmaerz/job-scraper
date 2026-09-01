@@ -76,7 +76,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FREEHIRE_DRAIN_BACKLOG: "false"
           FREEHIRE_CLASSIFY_LIMIT: "300"
-        run: python frontfill_freehire_compat.py
+        run: python incremental_freehire_compat.py
 
   analyze_jobs:
     needs: freehire_compat
@@ -102,7 +102,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          JOB_INSIGHTS_ARCHETYPE: "software_tpm"
+          JOB_INSIGHTS_ARCHETYPE: ""
           JOB_INSIGHTS_BACKFILL_ALL: "false"
           JOB_INSIGHTS_REPLACEMENT_BACKFILL: "false"
           JOB_INSIGHTS_MAX_JOBS: "100"

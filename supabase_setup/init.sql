@@ -1920,6 +1920,25 @@ BEGIN
             RAISE EXCEPTION 'Merge group % contains conflicting archetypes', survivor;
         END IF;
 
+        IF EXISTS (
+            SELECT 1
+            FROM public.jobs source
+            JOIN public.jobs target ON target.job_id = survivor
+            JOIN public.job_repost_merge_plan plan
+              ON plan.source_job_id = source.job_id
+             AND plan.survivor_job_id = survivor
+            WHERE plan.match_method = 'body_hash_fuzzy_title'
+              AND (
+                  source.provider IS DISTINCT FROM target.provider
+                  OR source.company IS NULL
+                  OR target.company IS NULL
+                  OR source.description_fingerprint IS NULL
+                  OR source.description_fingerprint IS DISTINCT FROM target.description_fingerprint
+              )
+        ) THEN
+            RAISE EXCEPTION 'Merge group % failed exact description identity validation', survivor;
+        END IF;
+
         INSERT INTO public.job_listing_archive (
             provider, source_job_id, canonical_job_id, observed_at, source_snapshot
         )
@@ -2001,7 +2020,7 @@ BEGIN
                 (array_agg(company ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE company IS NOT NULL))[1] company,
                 (array_agg(job_title ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE job_title IS NOT NULL))[1] job_title,
                 (array_agg(level ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE level IS NOT NULL))[1] level,
-                (array_agg(location ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE location IS NOT NULL))[1] location,
+                string_agg(DISTINCT btrim(location), '; ' ORDER BY btrim(location)) FILTER (WHERE btrim(COALESCE(location, '')) <> '') location,
                 (array_agg(description ORDER BY COALESCE(last_seen_at, scraped_at) DESC) FILTER (WHERE description IS NOT NULL))[1] description,
                 (array_agg(status ORDER BY CASE status WHEN 'offer' THEN 4 WHEN 'interviewing' THEN 3 WHEN 'applied' THEN 2 ELSE 1 END DESC, COALESCE(application_date, scraped_at) DESC) FILTER (WHERE status IS NOT NULL))[1] status,
                 bool_or(is_active) is_active,

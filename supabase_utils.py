@@ -9,11 +9,42 @@ import re # Import re for filter pattern matching
 import string
 import unicodedata
 import html
+import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
 import freehire_compat
+from lane_catalog import LANE_ALIASES, canonical_lane_slug
+
+
+# jobs.location_scope is generated from jobs.location. Configured search
+# geography belongs only in transient/query provenance.
+TRANSIENT_JOB_FIELDS = frozenset({
+    "query_scope",
+    "search_location_scope",
+    "geography_id",
+    "lane",
+    "search_query_id",
+    "search_query_type",
+    "search_query_language",
+})
+GENERATED_JOB_FIELDS = frozenset({
+    "location_province_code",
+    "location_scope",
+    "location_metro",
+    "listing_location_province_codes",
+    "listing_location_scopes",
+})
+
+
+def _canonical_job_write_payload(job: Mapping[str, Any]) -> dict:
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in TRANSIENT_JOB_FIELDS and key not in GENERATED_JOB_FIELDS
+    }
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -399,7 +430,7 @@ def prepare_canonical_insert_payload(job: dict) -> dict:
     )
     now_iso = datetime.now(timezone.utc).isoformat()
     job_id = normalize_job_identifier(job.get("job_id"))
-    payload = dict(job)
+    payload = _canonical_job_write_payload(job)
     payload["job_id"] = job_id
     payload["canonical_key"] = canonical_key
     payload["original_job_id"] = str(job_id) if job_id is not None else None
@@ -485,6 +516,9 @@ def prepare_repost_update_payload(existing: dict, new_job: dict) -> dict:
     payload = {
         "job_id": existing["job_id"],
         "latest_job_id": new_job_id if new_job_id is not None else existing.get("latest_job_id"),
+        "search_query": new_job.get("search_query") or existing.get("search_query"),
+        "archetype": new_job.get("archetype") or existing.get("archetype"),
+        "filter_profile": new_job.get("filter_profile") or existing.get("filter_profile"),
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
         "last_seen_posted_at": new_job.get("posted_at") if new_job.get("posted_at") is not None else existing.get("last_seen_posted_at"),
         "posted_relative_text": new_job.get("posted_relative_text") if new_job.get("posted_relative_text") is not None else existing.get("posted_relative_text"),
@@ -590,6 +624,7 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
                 "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
                 "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
                 "is_active, job_state, same_id_relist_count, provider, level, "
+                "search_query, archetype, filter_profile, location_scope, "
                 "freehire_category, freehire_seniority, is_remote, freehire_remote_evidence, "
                 "freehire_compat_status, freehire_compat_input_hash, freehire_compat_import_hash"
             )
@@ -604,16 +639,119 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
         offset += page_size
 
 
-def save_jobs_canonicalized(jobs_data: list) -> list[str]:
-    """Save jobs against canonical records and return their canonical IDs."""
+def _membership_provenance(job: dict, archetype: str) -> dict:
+    query_scope = job.get("query_scope")
+    if isinstance(query_scope, str):
+        try:
+            query_scope = json.loads(query_scope)
+        except (TypeError, json.JSONDecodeError):
+            query_scope = {"raw": query_scope}
+    if not isinstance(query_scope, dict):
+        query_scope = {}
+    query_scope = {
+        **query_scope,
+        "lane": archetype,
+        "query_id": job.get("search_query_id") or query_scope.get("query_id"),
+        "query_type": job.get("search_query_type") or query_scope.get("query_kind"),
+        "query": job.get("search_query") or query_scope.get("search_query"),
+        "language": job.get("search_query_language") or query_scope.get("language"),
+        "location_scope": (
+            query_scope.get("location_scope")
+            or job.get("search_location_scope")
+            or query_scope.get("search_location_scope")
+        ),
+        "geography_id": job.get("geography_id") or query_scope.get("geography_id"),
+    }
+    return {key: value for key, value in query_scope.items() if value is not None}
+
+
+def _membership_archetypes(job: dict) -> list[str]:
+    raw_archetype = job.get("lane") or job.get("archetype")
+    if raw_archetype:
+        archetype = canonical_lane_slug(raw_archetype)
+        if archetype not in config.ARCHETYPE_CONFIGS:
+            raise ValueError(f"Unknown membership archetype '{raw_archetype}'")
+        return [archetype]
+    # Migration compatibility: preserve legacy lane representation even when a
+    # historical caller omitted explicit provenance.
+    if job.get("provider") == "linkedin":
+        return [canonical_lane_slug(config.DEFAULT_ARCHETYPE)]
+    return []
+
+
+def _upsert_single_job_archetype_membership(
+    canonical_job_id: str,
+    archetype: str,
+    job: dict,
+) -> None:
+    provenance = _membership_provenance(job, archetype)
+    rpc_args = {
+        "p_job_id": canonical_job_id,
+        "p_archetype": archetype,
+        "p_query_scope": provenance,
+        "p_query_id": provenance.get("query_id"),
+        "p_query": provenance.get("query"),
+        "p_query_type": provenance.get("query_type"),
+        "p_language": provenance.get("language"),
+        "p_location_scope": provenance.get("location_scope"),
+        "p_geography_id": provenance.get("geography_id"),
+    }
+    observed_at = _valid_membership_observed_at(job, provenance)
+    if observed_at is not None:
+        rpc_args["p_first_matched_at"] = observed_at
+        rpc_args["p_last_matched_at"] = observed_at
+    supabase.rpc("record_job_archetype_membership", rpc_args).execute()
+
+
+def _valid_membership_observed_at(job: dict, provenance: dict) -> str | None:
+    """Return a valid source observation timestamp; otherwise use RPC defaults."""
+    for value in (
+        job.get("membership_observed_at"),
+        job.get("observed_at"),
+        provenance.get("observed_at"),
+        job.get("detail_metadata_checked_at"),
+        job.get("scraped_at"),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            continue
+        return parsed.isoformat()
+    return None
+
+
+def upsert_job_archetype_membership(canonical_job_id: str, job: dict) -> None:
+    """Union scrape provenance into every canonical job/lane membership row."""
+    for archetype in _membership_archetypes(job):
+        _upsert_single_job_archetype_membership(canonical_job_id, archetype, job)
+
+
+@dataclass(frozen=True)
+class CanonicalSaveResult:
+    """Canonical persistence result without implying that IDs preserve input order."""
+
+    canonical_ids: list[str]
+    canonical_by_source: dict[str, str]
+    canonical_ids_by_input: list[str | None]
+
+
+def save_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult:
+    """Save jobs and retain the canonical ID for every source input position."""
     candidates_cache = {}
     saved_job_ids: set[str] = set()
+    canonical_by_source: dict[str, str] = {}
+    canonical_ids_by_input: list[str | None] = []
     scrape_run_id = datetime.now(timezone.utc).isoformat()
     for raw_job in jobs_data:
         job = dict(raw_job)
         job_id = normalize_job_identifier(job.get("job_id"))
         if job_id is None:
             logging.warning("Skipping job with missing or non-scalar job_id: %r", job.get("job_id"))
+            canonical_ids_by_input.append(None)
             continue
         job["job_id"] = job_id
         job.setdefault("scrape_run_id", scrape_run_id)
@@ -622,6 +760,9 @@ def save_jobs_canonicalized(jobs_data: list) -> list[str]:
             saved_job_id = normalize_job_identifier(result)
             if saved_job_id is not None:
                 saved_job_ids.add(saved_job_id)
+                canonical_by_source[job_id] = saved_job_id
+                upsert_job_archetype_membership(saved_job_id, job)
+            canonical_ids_by_input.append(saved_job_id)
             continue
 
         cache_key = job.get("provider")
@@ -668,6 +809,9 @@ def save_jobs_canonicalized(jobs_data: list) -> list[str]:
             matched_job_id = normalize_job_identifier(match.get("job_id"))
             if matched_job_id is not None:
                 saved_job_ids.add(matched_job_id)
+                canonical_by_source[job_id] = matched_job_id
+                upsert_job_archetype_membership(matched_job_id, job)
+            canonical_ids_by_input.append(matched_job_id)
             match.update(payload)
         else:
             payload = prepare_canonical_insert_payload(job)
@@ -675,15 +819,32 @@ def save_jobs_canonicalized(jobs_data: list) -> list[str]:
             saved_job_id = normalize_job_identifier(result)
             if saved_job_id is not None:
                 saved_job_ids.add(saved_job_id)
+                canonical_by_source[job_id] = saved_job_id
+                upsert_job_archetype_membership(saved_job_id, job)
+            canonical_ids_by_input.append(saved_job_id)
             candidates.append(payload)
             if job.get("provider") == "linkedin" and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True):
                 save_listing_content_version(job, canonical_job_id=payload["job_id"])
-    return sorted(saved_job_ids)
+    return CanonicalSaveResult(
+        canonical_ids=sorted(saved_job_ids),
+        canonical_by_source=canonical_by_source,
+        canonical_ids_by_input=canonical_ids_by_input,
+    )
+
+
+def save_jobs_canonicalized(jobs_data: list) -> list[str]:
+    """Save jobs and return sorted, deduplicated canonical IDs."""
+    return save_jobs_canonicalized_with_mapping(jobs_data).canonical_ids
 
 
 def save_linkedin_jobs_canonicalized(jobs_data: list) -> list[str]:
     """Save LinkedIn jobs and return the same list[str] canonical-ID contract."""
     return save_jobs_canonicalized(jobs_data)
+
+
+def save_linkedin_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult:
+    """Save LinkedIn jobs with exact source/input-to-canonical correspondence."""
+    return save_jobs_canonicalized_with_mapping(jobs_data)
 
 # --- Supabase Functions ---
 def start_ingestion_run(
@@ -1190,6 +1351,45 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
     return existing_ids, existing_company_title_keys
 
 
+def get_canonical_job_ids_for_sources(source_job_ids: list[str]) -> dict[str, str]:
+    """Resolve every already-known source/listing ID to its canonical jobs.job_id."""
+    wanted = {str(source_id) for source_id in source_job_ids if source_id is not None}
+    if not wanted:
+        return {}
+    resolved: dict[str, str] = {}
+    offset = 0
+    while True:
+        response = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select("job_id,latest_job_id,listing_instances")
+            .eq("provider", "linkedin")
+            .range(offset, offset + 999)
+            .execute()
+        )
+        page = response.data or []
+        for row in page:
+            canonical_id = normalize_job_identifier(row.get("job_id"))
+            if canonical_id is None:
+                continue
+            identifiers = {
+                identifier for identifier in (
+                    canonical_id,
+                    normalize_job_identifier(row.get("latest_job_id")),
+                ) if identifier is not None
+            }
+            identifiers.update(
+                identifier
+                for instance in (row.get("listing_instances") or [])
+                if isinstance(instance, Mapping)
+                and (identifier := normalize_job_identifier(instance.get("job_id"))) is not None
+            )
+            for identifier in wanted.intersection(identifiers):
+                resolved[identifier] = canonical_id
+        if len(page) < 1000 or wanted.issubset(resolved):
+            return resolved
+        offset += len(page)
+
+
 def get_incomplete_linkedin_metadata_ids(job_ids: list[str]) -> set[str]:
     if not job_ids:
         return set()
@@ -1210,35 +1410,65 @@ def get_incomplete_linkedin_metadata_ids(job_ids: list[str]) -> set[str]:
 
 def get_filter_profile(archetype: str | None) -> dict:
     resolved = archetype or config.DEFAULT_ARCHETYPE
-    profile = config.ARCHETYPE_CONFIGS.get(resolved)
+    canonical = canonical_lane_slug(resolved)
+    # software_tpm is the only compatibility alias. Prefer an active canonical
+    # runtime profile so DB-configured filtering remains authoritative.
+    profile = config.ARCHETYPE_CONFIGS.get(canonical) if resolved in LANE_ALIASES else None
+    profile = profile or config.ARCHETYPE_CONFIGS.get(resolved)
     if profile is None:
-        return config.ARCHETYPE_CONFIGS[config.DEFAULT_ARCHETYPE]
+        raise ValueError(
+            f"Unknown archetype/filter profile '{resolved}'. "
+            "Expected a configured canonical lane or the software_tpm alias."
+        )
     return profile
 
 
-def match_filter_reason(job: dict) -> tuple[str | None, bool]:
+def evaluate_lane_filter(job: dict, archetype: str | None = None, runtime_profile: dict | None = None) -> dict:
+    """Evaluate one lane. Excludes filter; include terms are OR routing signals."""
     title = job.get("job_title") or ""
     company = job.get("company") or ""
     desc = job.get("description") or ""
-    profile = get_filter_profile(job.get("archetype"))
+    profile = runtime_profile or get_filter_profile(archetype or job.get("lane") or job.get("archetype"))
 
     for raw_pattern in profile["company_blocklist"]:
         if re.compile(raw_pattern, re.IGNORECASE).search(company):
-            return f"company:{raw_pattern}", False
+            return {"filter_status": "filtered", "is_filtered": True, "filter_reason": f"company:{raw_pattern}", "is_entry_level_filtered": False}
 
     for raw_pattern in profile["title_entry_level_blocklist"]:
         if re.compile(raw_pattern, re.IGNORECASE).search(title):
-            return f"title_entry_level:{raw_pattern}", True
+            return {"filter_status": "filtered", "is_filtered": True, "filter_reason": f"title_entry_level:{raw_pattern}", "is_entry_level_filtered": True}
 
     for raw_pattern in profile["title_blocklist"]:
         if re.compile(raw_pattern, re.IGNORECASE).search(title):
-            return f"title:{raw_pattern}", False
+            return {"filter_status": "filtered", "is_filtered": True, "filter_reason": f"title:{raw_pattern}", "is_entry_level_filtered": False}
 
     for raw_pattern in profile["desc_blocklist"]:
         if re.compile(raw_pattern, re.IGNORECASE).search(desc):
-            return f"desc:{raw_pattern}", False
+            return {"filter_status": "filtered", "is_filtered": True, "filter_reason": f"desc:{raw_pattern}", "is_entry_level_filtered": False}
 
-    return None, False
+    title_includes = profile.get("title_include", profile.get("title_context", []))
+    desc_includes = profile.get("description_include", profile.get("description_context", []))
+    include_signals = [(title, pattern) for pattern in title_includes] + [(desc, pattern) for pattern in desc_includes]
+    # A lane may provide many context tokens. They are alternatives, not an
+    # implicit AND. Missing positives routes to review and does not filter.
+    if include_signals and not any(re.compile(pattern, re.IGNORECASE).search(value) for value, pattern in include_signals):
+        return {"filter_status": "review", "is_filtered": False, "filter_reason": "include:no_route_signal", "is_entry_level_filtered": False}
+    return {"filter_status": "included", "is_filtered": False, "filter_reason": None, "is_entry_level_filtered": False}
+
+
+def match_filter_reason(job: dict, archetype: str | None = None, runtime_profile: dict | None = None) -> tuple[str | None, bool]:
+    result = evaluate_lane_filter(job, archetype=archetype, runtime_profile=runtime_profile)
+    return (result["filter_reason"] if result["is_filtered"] else None, result["is_entry_level_filtered"])
+
+
+def persist_lane_filter_state(job_id: str, archetype: str, job: dict, runtime_profile: dict | None = None, db=None) -> dict:
+    db = db or supabase
+    lane = canonical_lane_slug(archetype)
+    result = evaluate_lane_filter(job, archetype=lane, runtime_profile=runtime_profile)
+    payload = {key: result[key] for key in ("filter_status", "is_filtered", "filter_reason")}
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    db.table("job_archetype_memberships").update(payload).eq("job_id", str(job_id)).eq("archetype", lane).execute()
+    return result
 
 def save_job_to_supabase(job_data: dict) -> str | None:
     """Save one job and return only its stable scalar identifier."""
@@ -1260,6 +1490,10 @@ def save_jobs_to_supabase(jobs_data: list) -> list[str]:
     if not jobs_data:
         print("No job data provided to save/update.")
         return []
+
+    # Enforce generated-column safety at the final generic write boundary too,
+    # including callers that bypass canonical payload preparation.
+    jobs_data = [_canonical_job_write_payload(job) for job in jobs_data]
 
     # Ensure job_id is present and potentially convert to the correct type if needed
     # (Assuming job_id in jobs_data is already the correct string type for your 'text' column)
@@ -1487,7 +1721,10 @@ def clear_removed_aerospace_defense_filter(archetype: str = "software_tpm") -> i
     return len(response.data or [])
 
 
-def get_jobs_to_score(limit: int) -> list:
+def get_jobs_to_score(
+    limit: int, archetype: str | None = None, worker_id: str | None = None,
+    lease_seconds: int = 900,
+) -> list:
     """
     Fetches jobs from the Supabase 'jobs' table that need scoring.
     Filters by is_active = true, resume_score = null, and is_filtered = false.
@@ -1500,15 +1737,22 @@ def get_jobs_to_score(limit: int) -> list:
 
     try:
         logging.info(f"Fetching up to {limit} jobs needing scoring...")
-        # Select fields needed for scoring
-        response = supabase.table(config.SUPABASE_TABLE_NAME)\
-                           .select("job_id, job_title, company, description, level")\
-                           .eq("is_active", True)\
-                           .eq("is_filtered", False)\
-                           .is_("resume_score", None)\
-                           .order("scraped_at", desc=False)\
-                           .limit(limit)\
-                           .execute()
+        if archetype:
+            if not worker_id:
+                raise ValueError("worker_id is required for lane scoring claims")
+            response = supabase.rpc("get_lane_jobs_to_score", {
+                "p_archetype": canonical_lane_slug(archetype), "p_limit": limit,
+                "p_worker_id": worker_id, "p_lease_seconds": lease_seconds,
+            }).execute()
+        else:
+            response = supabase.table(config.SUPABASE_TABLE_NAME)\
+                               .select("job_id, job_title, company, description, level")\
+                               .eq("is_active", True)\
+                               .eq("is_filtered", False)\
+                               .is_("resume_score", None)\
+                               .order("scraped_at", desc=False)\
+                               .limit(limit)\
+                               .execute()
 
         if response.data:
             logging.info(f"Successfully fetched {len(response.data)} jobs to score.")
@@ -1555,7 +1799,10 @@ def get_top_scored_jobs_to_apply(limit: int) -> list:
         logging.error(f"Error fetching top-scored jobs to apply for from Supabase: {e}")
         return []
 
-def get_top_scored_jobs_for_resume_generation(limit: int) -> list:
+def get_top_scored_jobs_for_resume_generation(
+    limit: int, archetype: str | None = None, worker_id: str | None = None,
+    lease_seconds: int = 900,
+) -> list:
     """
     Fetches the top-scored jobs from Supabase using the RPC 'get_top_scored_jobs_custom_sort'.
     p_page_number is set to 1 and p_page_size is set to the limit.
@@ -1567,10 +1814,13 @@ def get_top_scored_jobs_for_resume_generation(limit: int) -> list:
 
     try:
         logging.info(f"Fetching up to {limit} top-scored jobs to apply for using RPC 'get_top_scored_jobs_custom_sort'...")
-        response = supabase.rpc(
-                "get_jobs_for_resume_generation_custom_sort",
-                {"p_page_number": 1, "p_page_size": limit}
-            ).execute()
+        rpc_name = "get_lane_jobs_for_resume_generation" if archetype else "get_jobs_for_resume_generation_custom_sort"
+        if archetype and not worker_id:
+            raise ValueError("worker_id is required for lane resume claims")
+        rpc_args = ({"p_archetype": canonical_lane_slug(archetype), "p_limit": limit,
+                     "p_worker_id": worker_id, "p_lease_seconds": lease_seconds}
+                    if archetype else {"p_page_number": 1, "p_page_size": limit})
+        response = supabase.rpc(rpc_name, rpc_args).execute()
 
         if response.data:
             logging.info(f"Successfully fetched {len(response.data)} top-scored jobs to apply for via RPC.")
@@ -1587,7 +1837,10 @@ def get_top_scored_jobs_for_resume_generation(limit: int) -> list:
         logging.error(f"Error fetching top-scored jobs to apply for from Supabase RPC: {e}")
         return []
 
-def get_jobs_to_rescore(limit: int) -> list:
+def get_jobs_to_rescore(
+    limit: int, archetype: str | None = None, worker_id: str | None = None,
+    lease_seconds: int = 900,
+) -> list:
     """
     Fetches jobs from Supabase that are ready for re-scoring with a custom resume.
     Filters by is_active = true, resume_link is not null, and resume_score_stage = 'initial'.
@@ -1601,9 +1854,13 @@ def get_jobs_to_rescore(limit: int) -> list:
     try:
         logging.info(f"Fetching up to {limit} jobs for re-scoring via RPC...")
         # Note: We updated the RPC to also return customized_resume_id
+        if archetype and not worker_id:
+            raise ValueError("worker_id is required for lane rescore claims")
         response = supabase.rpc(
-            "get_jobs_for_rescore", 
-            {"p_limit_val": limit}   
+            "get_lane_jobs_for_rescore" if archetype else "get_jobs_for_rescore",
+            ({"p_archetype": canonical_lane_slug(archetype), "p_limit": limit,
+              "p_worker_id": worker_id, "p_lease_seconds": lease_seconds}
+             if archetype else {"p_limit_val": limit})
         ).execute()
 
         if hasattr(response, 'data') and response.data is not None:
@@ -1625,7 +1882,10 @@ def get_jobs_to_rescore(limit: int) -> list:
         logging.error(f"Exception calling RPC get_jobs_for_rescore: {e}", exc_info=True)
         return []
 
-def update_job_score(job_id: str, score: int, resume_score_stage: str = "initial") -> bool:
+def update_job_score(
+    job_id: str, score: int, resume_score_stage: str = "initial",
+    archetype: str | None = None, worker_id: str | None = None,
+) -> bool:
     """
     Updates the 'resume_score' and 'resume_score_stage' for a specific job_id in the Supabase 'jobs' table.
     Returns True on success, False on failure.
@@ -1640,14 +1900,28 @@ def update_job_score(job_id: str, score: int, resume_score_stage: str = "initial
 
     try:
         logging.info(f"Updating score for job_id {job_id} to {score} and stage to {resume_score_stage}...")
-        update_payload = {
+        if archetype and worker_id:
+            response = supabase.rpc("complete_lane_score_claim", {
+                "p_job_id": job_id, "p_archetype": canonical_lane_slug(archetype),
+                "p_worker_id": worker_id, "p_score": score,
+                "p_score_stage": resume_score_stage,
+            }).execute()
+            return response.data is True
+        update_payload = ({
+            "match_score": score,
+            "score_stage": resume_score_stage,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        } if archetype else {
             "resume_score": score,
-            "resume_score_stage": resume_score_stage
-        }
-        response = supabase.table(config.SUPABASE_TABLE_NAME)\
+            "resume_score_stage": resume_score_stage,
+        })
+        table = "job_archetype_memberships" if archetype else config.SUPABASE_TABLE_NAME
+        query = supabase.table(table)\
                            .update(update_payload)\
-                           .eq("job_id", job_id)\
-                           .execute()
+                           .eq("job_id", job_id)
+        if archetype:
+            query = query.eq("archetype", canonical_lane_slug(archetype))
+        response = query.execute()
 
         # Check if the update was successful (response structure might vary)
         # A common pattern is checking if data is returned or count is non-zero
@@ -1746,7 +2020,7 @@ def upload_customized_resume_to_storage(file_content: bytes, destination_path: s
         #     logging.warning(f"Could not clean up potentially failed upload at {destination_path}")
         return None
 
-def update_job_with_resume_link(job_id: str, customized_resume_id: str,  new_status: Optional[str] = "resume_generated") -> bool:
+def update_job_with_resume_link(job_id: str, customized_resume_id: str, new_status: Optional[str] = "resume_generated", archetype: str | None = None) -> bool:
     """
     Updates the job record in the Supabase table with the resume link and optionally a new status.
 
@@ -1770,10 +2044,13 @@ def update_job_with_resume_link(job_id: str, customized_resume_id: str,  new_sta
 
         logging.info(f"Updating job {job_id} with resume link, resume id and status '{new_status or 'unchanged'}'...")
 
-        response = supabase.table(config.SUPABASE_TABLE_NAME)\
+        table = "job_archetype_memberships" if archetype else config.SUPABASE_TABLE_NAME
+        query = supabase.table(table)\
                            .update(update_data)\
-                           .eq("job_id", job_id)\
-                           .execute()
+                           .eq("job_id", job_id)
+        if archetype:
+            query = query.eq("archetype", canonical_lane_slug(archetype))
+        response = query.execute()
 
         # Check if the update affected any rows (response.data might contain updated rows)
         if response.data:
@@ -1789,7 +2066,50 @@ def update_job_with_resume_link(job_id: str, customized_resume_id: str,  new_sta
         logging.error(f"Error updating job {job_id} in Supabase: {e}")
         return False
 
-def save_customized_resume(resume_data: 'Resume', resume_path: str) -> Optional[Any]: # Return type changed
+
+def release_lane_score_claim(job_id: str, archetype: str, worker_id: str, *, failed: bool = False) -> bool:
+    """Release a score claim only when it is still owned by this worker."""
+    try:
+        response = supabase.rpc("fail_lane_score_claim" if failed else "release_lane_score_claim", {
+            "p_job_id": job_id, "p_archetype": canonical_lane_slug(archetype),
+            "p_worker_id": worker_id,
+        }).execute()
+        return response.data is True
+    except Exception as exc:
+        logging.error("Could not release score claim for %s/%s: %s", archetype, job_id, exc)
+        return False
+
+
+def complete_lane_resume_claim(
+    job_id: str, archetype: str, worker_id: str, customized_resume_id: str,
+    base_resume_id: str | None = None,
+) -> bool:
+    """Publish resume state only when the caller still owns its lease."""
+    try:
+        response = supabase.rpc("complete_lane_resume_claim", {
+            "p_job_id": job_id, "p_archetype": canonical_lane_slug(archetype),
+            "p_worker_id": worker_id, "p_customized_resume_id": customized_resume_id,
+            "p_base_resume_id": base_resume_id,
+        }).execute()
+        return response.data is True
+    except Exception as exc:
+        logging.error("Could not complete resume claim for %s/%s: %s", archetype, job_id, exc)
+        return False
+
+
+def release_lane_resume_claim(job_id: str, archetype: str, worker_id: str, *, failed: bool = False) -> bool:
+    """Release a resume claim only when it is still owned by this worker."""
+    try:
+        response = supabase.rpc("fail_lane_resume_claim" if failed else "release_lane_resume_claim", {
+            "p_job_id": job_id, "p_archetype": canonical_lane_slug(archetype),
+            "p_worker_id": worker_id,
+        }).execute()
+        return response.data is True
+    except Exception as exc:
+        logging.error("Could not release resume claim for %s/%s: %s", archetype, job_id, exc)
+        return False
+
+def save_customized_resume(resume_data: 'Resume', resume_path: str, archetype: str | None = None, base_resume_id: str | None = None, job_id: str | None = None, customized_resume_id: str | None = None) -> Optional[Any]:
     """
     Saves a customized resume to the Supabase 'customized_resumes' table.
 
@@ -1822,6 +2142,14 @@ def save_customized_resume(resume_data: 'Resume', resume_path: str) -> Optional[
             data_to_insert = resume_data.dict(exclude_none=True)
 
         data_to_insert['resume_link'] = resume_path
+        if customized_resume_id:
+            data_to_insert['id'] = customized_resume_id
+        if archetype:
+            data_to_insert['archetype'] = canonical_lane_slug(archetype)
+        if base_resume_id:
+            data_to_insert['base_resume_id'] = base_resume_id
+        if job_id:
+            data_to_insert['job_id'] = str(job_id)
 
         logging.info(
             f"Saving customized resume for email: {getattr(resume_data, 'email', 'N/A')} "
@@ -1992,4 +2320,23 @@ def get_base_resume() -> Optional[dict]:
 
     except Exception as e:
         logging.error(f"Error fetching base resume from Supabase: {e}", exc_info=True)
+        return None
+
+
+def get_archetype_base_resume(archetype: str) -> Optional[dict]:
+    """Return lane profile resume data plus its stable base_resume_id."""
+    try:
+        response = supabase.table("archetype_resume_profiles").select(
+            "base_resume_id, profile_data, base_resume(resume_data)"
+        ).eq("archetype", canonical_lane_slug(archetype)).eq("enabled", True).limit(1).execute()
+        if not response.data:
+            return None
+        row = response.data[0]
+        data = dict(row.get("profile_data") or (row.get("base_resume") or {}).get("resume_data") or {})
+        if not data:
+            return None
+        data["base_resume_id"] = row.get("base_resume_id")
+        return data
+    except Exception as exc:
+        logging.error("Error fetching archetype resume profile for %s: %s", archetype, exc)
         return None

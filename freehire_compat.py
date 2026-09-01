@@ -1,6 +1,7 @@
 import hashlib
 import html
 import json
+import logging
 import math
 import random
 import re
@@ -15,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from bs4 import BeautifulSoup
 
 import config
+
+
+logger = logging.getLogger(__name__)
 
 
 Category = Literal[
@@ -343,7 +347,6 @@ def classify_batch(
                     system_prompt=SYSTEM_PROMPT,
                     reasoning_effort="low",
                     response_format=FreehireClassificationBatch,
-                    max_api_attempts=1,
                 )
                 outcome.requests += 1
                 parsed, errors = _parse_response(raw, set(remaining))
@@ -358,6 +361,12 @@ def classify_batch(
                 outcome.requests += 1
                 last_error = str(exc)
                 if global_failure(exc):
+                    logger.error(
+                        "Freehire classification stopped after model-pool failure for %s jobs: %s: %s",
+                        len(remaining),
+                        type(exc).__name__,
+                        exc,
+                    )
                     outcome.global_error = last_error
                     outcome.failures.update({job_id: last_error for job_id in remaining})
                     return outcome

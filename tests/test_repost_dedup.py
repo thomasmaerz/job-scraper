@@ -64,6 +64,58 @@ def test_normalize_title_does_not_corrupt_embedded_tokens():
     assert supabase_utils.normalize_title("SRE Manager") == "sre manager"
 
 
+def test_canonical_save_mapping_preserves_inputs_while_ids_are_sorted_and_deduplicated(monkeypatch):
+    monkeypatch.setattr(supabase_utils.config, "ENABLE_REPOST_DEDUP", False)
+    returned = iter(["canonical-z", "canonical-a", "canonical-z"])
+    monkeypatch.setattr(supabase_utils, "save_job_to_supabase", lambda payload: next(returned))
+    monkeypatch.setattr(supabase_utils, "upsert_job_archetype_membership", lambda *args: None)
+
+    result = supabase_utils.save_jobs_canonicalized_with_mapping([
+        {"job_id": "source-1", "provider": "linkedin"},
+        {"job_id": "source-2", "provider": "linkedin"},
+        {"job_id": "source-1", "provider": "linkedin"},
+    ])
+
+    assert result.canonical_ids == ["canonical-a", "canonical-z"]
+    assert result.canonical_by_source == {
+        "source-1": "canonical-z",
+        "source-2": "canonical-a",
+    }
+    assert result.canonical_ids_by_input == ["canonical-z", "canonical-a", "canonical-z"]
+
+
+def test_canonical_save_mapping_retains_every_input_when_sources_fold_to_one_job(monkeypatch):
+    existing = {
+        "job_id": "canonical-1",
+        "provider": "linkedin",
+        "company": "Example",
+        "job_title": "Infrastructure Engineer",
+        "location": "Toronto",
+        "listing_instances": [],
+        "last_seen_at": None,
+    }
+    query = _RecordingQuery(response_data=[{"job_id": "canonical-1"}])
+    monkeypatch.setattr(supabase_utils.config, "ENABLE_REPOST_DEDUP", True)
+    monkeypatch.setattr(supabase_utils.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
+    monkeypatch.setattr(supabase_utils, "supabase", _FakeSupabase(query))
+    monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [existing])
+    monkeypatch.setattr(supabase_utils, "find_canonical_match", lambda job, candidates: existing)
+    monkeypatch.setattr(supabase_utils, "upsert_job_archetype_membership", lambda *args: None)
+
+    result = supabase_utils.save_jobs_canonicalized_with_mapping([
+        {"job_id": "source-1", "provider": "linkedin"},
+        {"job_id": "source-2", "provider": "linkedin"},
+        {"job_id": "source-1", "provider": "linkedin"},
+    ])
+
+    assert result.canonical_ids == ["canonical-1"]
+    assert result.canonical_by_source == {
+        "source-1": "canonical-1",
+        "source-2": "canonical-1",
+    }
+    assert result.canonical_ids_by_input == ["canonical-1", "canonical-1", "canonical-1"]
+
+
 def test_normalize_location_collapses_formatting_noise():
     assert supabase_utils.normalize_location(" Toronto , Ontario  , Canada ") == "toronto ontario canada"
 
@@ -220,6 +272,80 @@ def test_prepare_canonical_insert_payload():
     assert payload["freehire_compat_status"] == "pending"
     assert payload["freehire_compat_input_hash"]
     assert payload["is_remote"] is False
+
+
+def test_canonical_payloads_never_write_generated_or_transient_location_scope():
+    job = {
+        "job_id": "scope-1",
+        "provider": "linkedin",
+        "company": "Example",
+        "job_title": "Network Engineer",
+        "location": "Toronto, Ontario, Canada",
+        "location_scope": "canada",
+        "location_province_code": "configured-search-value",
+        "location_metro": "configured-search-value",
+        "listing_location_province_codes": ["configured-search-value"],
+        "listing_location_scopes": ["configured-search-value"],
+        "search_location_scope": "canada",
+        "query_scope": '{"location_scope":"canada"}',
+        "geography_id": "CA",
+        "lane": "technology_delivery",
+        "search_query_id": "en:precision:10:abc",
+        "search_query_type": "precision",
+        "search_query_language": "en",
+    }
+
+    insert = supabase_utils.prepare_canonical_insert_payload(job)
+    update = supabase_utils.prepare_repost_update_payload(
+        {
+            "job_id": "canonical",
+            "latest_job_id": "old",
+            "listing_instances": [{"job_id": "old"}],
+            "seen_count": 1,
+        },
+        job,
+    )
+
+    for payload in (insert, update):
+        assert "location_scope" not in payload
+        assert "location_province_code" not in payload
+        assert "location_metro" not in payload
+        assert "listing_location_province_codes" not in payload
+        assert "listing_location_scopes" not in payload
+        assert "search_location_scope" not in payload
+        assert "query_scope" not in payload
+        assert "geography_id" not in payload
+        assert "lane" not in payload
+        assert "search_query_id" not in payload
+        assert "search_query_type" not in payload
+        assert "search_query_language" not in payload
+
+
+def test_generic_jobs_upsert_drops_generated_location_scope(monkeypatch):
+    captured = []
+
+    class Query:
+        def upsert(self, payload):
+            captured.extend(payload)
+            return self
+
+        def execute(self):
+            return type("Response", (), {"data": captured})()
+
+    class Db:
+        def table(self, _name):
+            return Query()
+
+    monkeypatch.setattr(supabase_utils, "supabase", Db())
+    supabase_utils.save_jobs_to_supabase([{
+        "job_id": "scope-2",
+        "location": "Toronto, Ontario, Canada",
+        "location_scope": "canada",
+        "search_location_scope": "canada",
+        "query_scope": "{}",
+    }])
+
+    assert captured == [{"job_id": "scope-2", "location": "Toronto, Ontario, Canada"}]
 
 
 def test_prepare_repost_update_payload():
@@ -643,6 +769,7 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
         "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
         "recruiter_profile_url, recruiter_identifier, detail_metadata_checked_at, "
         "is_active, job_state, same_id_relist_count, provider, level, "
+        "search_query, archetype, filter_profile, location_scope, "
         "freehire_category, freehire_seniority, is_remote, freehire_remote_evidence, "
         "freehire_compat_status, freehire_compat_input_hash, freehire_compat_import_hash"
     )
@@ -748,6 +875,7 @@ def test_save_jobs_to_supabase_preserves_canonical_and_task2_metadata_fields(mon
 
 
 def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_company_variants(monkeypatch):
+    monkeypatch.setattr(supabase_utils, "upsert_job_archetype_membership", lambda *_args: None)
     existing = {
         "job_id": "4394716706",
         "canonical_key": "linkedin|foo bar|senior project manager|toronto ontario canada",
@@ -817,6 +945,7 @@ def test_save_linkedin_jobs_canonicalized_matches_repost_across_normalized_compa
 
 
 def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypatch):
+    monkeypatch.setattr(supabase_utils, "upsert_job_archetype_membership", lambda *_args: None)
     calls = []
 
     def fake_get_canonical_candidates(provider):
@@ -860,6 +989,7 @@ def test_save_linkedin_jobs_canonicalized_caches_candidates_by_provider(monkeypa
 
 
 def test_canonical_update_does_not_put_listing_history_in_patch_url(monkeypatch):
+    monkeypatch.setattr(supabase_utils, "upsert_job_archetype_membership", lambda *_args: None)
     query = _RecordingQuery(response_data=[{"job_id": "canonical-1"}])
     existing = {
         "job_id": "canonical-1",
@@ -936,6 +1066,7 @@ def test_existing_id_lookup_includes_historical_listing_instance_ids(monkeypatch
 
 
 def test_canonical_save_normalizes_dict_valued_saver_result_before_set_lookup(monkeypatch):
+    monkeypatch.setattr(supabase_utils, "upsert_job_archetype_membership", lambda *_args: None)
     query = _RecordingQuery(response_data=[{
         "id": {"job_id": "4459372203"},
         "result": [{"job_id": "4459372203"}],

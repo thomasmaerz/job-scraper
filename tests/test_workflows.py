@@ -9,6 +9,33 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 
 
+def test_downstream_workflows_default_to_enabled_lanes_with_optional_override():
+    analyze = load_workflow("analyze_jobs.yml")
+    score = load_workflow("score_jobs.yml")
+    resume = load_workflow("hourly_resume_customization.yml")
+    hourly = load_workflow("scrape_jobs.yml")
+
+    assert triggers(analyze)["workflow_dispatch"]["inputs"]["archetype"]["default"] == ""
+    assert triggers(score)["workflow_dispatch"]["inputs"]["archetype"]["default"] == ""
+    assert triggers(resume)["workflow_dispatch"]["inputs"]["archetype"]["default"] == ""
+
+    analyze_step = next(step for step in analyze["jobs"]["analyze"]["steps"] if step["name"] == "Run job insights analysis")
+    assert analyze_step["env"]["JOB_INSIGHTS_ARCHETYPE"] == "${{ github.event.inputs.archetype || '' }}"
+    score_step = next(step for step in score["jobs"]["score"]["steps"] if step["name"] == "Run job scoring script")
+    assert score_step["env"]["JOB_SCORE_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
+    resume_step = next(step for step in resume["jobs"]["customize_resumes"]["steps"] if step["name"] == "Run resume customization script")
+    assert resume_step["env"]["JOB_RESUME_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
+    hourly_step = next(step for step in hourly["jobs"]["analyze_jobs"]["steps"] if step.get("name") == "Incrementally analyze job insights")
+    assert hourly_step["env"]["JOB_INSIGHTS_ARCHETYPE"] == ""
+
+
+def test_scoring_and_resume_workflows_have_defense_in_depth_concurrency_groups():
+    score = load_workflow("score_jobs.yml")
+    resume = load_workflow("hourly_resume_customization.yml")
+    assert score["concurrency"] == {"group": "lane-scoring", "cancel-in-progress": False}
+    assert resume["concurrency"] == {"group": "lane-resume-generation", "cancel-in-progress": False}
+
+
 def load_workflow(name):
     return yaml.safe_load((WORKFLOWS / name).read_text())
 
@@ -73,7 +100,7 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
     compat_step = jobs["freehire_compat"]["steps"][-1]
     assert compat_step["env"]["FREEHIRE_CLASSIFY_LIMIT"] == "300"
     assert compat_step["env"]["FREEHIRE_DRAIN_BACKLOG"] == "false"
-    assert compat_step["run"] == "python frontfill_freehire_compat.py"
+    assert compat_step["run"] == "python incremental_freehire_compat.py"
 
     analyze_step = jobs["analyze_jobs"]["steps"][-1]
     assert analyze_step["env"]["JOB_INSIGHTS_MAX_JOBS"] == "100"

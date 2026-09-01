@@ -16,6 +16,9 @@ from models import (
 )
 import time
 import os
+import uuid
+from lane_catalog import canonical_lane_slug
+from lane_resume_storage import customized_resume_storage_path
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -334,7 +337,9 @@ async def validate_customization(
 
 
 # --- Main Processing Logic ---
-async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
+async def process_job(
+    job_details: Dict[str, Any], base_resume_details: Resume, worker_id: str | None = None
+):
     """
     Processes a single job: personalizes resume, generates PDF, uploads, updates status.
     """
@@ -344,6 +349,8 @@ async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
         return
 
     logging.info(f"--- Starting processing for job_id: {job_id} ---")
+    lane = canonical_lane_slug(job_details.get("archetype") or config.DEFAULT_ARCHETYPE)
+    claim_completed = False
 
     try:
         # 1. Personalize Resume Sections
@@ -419,9 +426,11 @@ async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
             # Skip to the next job if PDF generation fails
             return # Stop processing this job
 
-        # 3. Upload PDF to Supabase Storage
-        # Construct a unique path, e.g., using job_id
-        destination_path = f"resume_{job_id}.pdf"
+        # 3. Upload one immutable row/object version under the canonical lane.
+        customized_resume_id = str(uuid.uuid4())
+        destination_path = customized_resume_storage_path(
+            lane, job_id, customized_resume_id
+        )
         logging.info(f"Uploading PDF to {destination_path} for job_id: {job_id}")
         resume_path = supabase_utils.upload_customized_resume_to_storage(pdf_bytes, destination_path)
 
@@ -434,13 +443,35 @@ async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
 
         # 4. Add Customized Resume to Supabase
         logging.info("Adding customized resume to Supabase")
-        customized_resume_id = supabase_utils.save_customized_resume(personalized_resume_data, resume_path)
+        saved_resume_id = supabase_utils.save_customized_resume(
+            personalized_resume_data,
+            resume_path,
+            archetype=lane,
+            base_resume_id=job_details.get("base_resume_id"),
+            job_id=job_id,
+            customized_resume_id=customized_resume_id,
+        )
+
+        if saved_resume_id != customized_resume_id:
+            logging.error(
+                "Failed to persist customized resume row %s for job_id %s; membership was not updated.",
+                customized_resume_id,
+                job_id,
+            )
+            return
 
 
         # 4. Update Job Record in Supabase
         logging.info(f"Updating job record for job_id: {job_id} with resume path.")
         # Optionally set a new status like "resume_generated" or "ready_to_apply"
-        update_success = supabase_utils.update_job_with_resume_link(job_id, customized_resume_id, new_status="resume_generated")
+        update_success = (
+            supabase_utils.complete_lane_resume_claim(
+                job_id, lane, worker_id, saved_resume_id, job_details.get("base_resume_id")
+            ) if worker_id else supabase_utils.update_job_with_resume_link(
+                job_id, saved_resume_id, new_status="resume_generated", archetype=lane
+            )
+        )
+        claim_completed = update_success
 
         if update_success:
             logging.info(f"Successfully updated job record for job_id: {job_id}")
@@ -452,36 +483,31 @@ async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
     except Exception as e:
         logging.error(f"An unexpected error occurred while processing job_id {job_id}: {e}", exc_info=True)
         # Log the error but continue to the next job
+    finally:
+        if worker_id and not claim_completed:
+            supabase_utils.release_lane_resume_claim(job_id, lane, worker_id, failed=True)
 
-async def run_job_processing_cycle():
+    return claim_completed
+
+async def run_job_processing_cycle(archetype: str | None = None, worker_id: str | None = None):
     """
     Fetches top jobs and processes them one by one.
     """
     logging.info("Starting new job processing cycle...")
 
-    # 1. Retrieve Base Resume Details from Supabase (with local file fallback)
-    resume_path = getattr(config, 'BASE_RESUME_PATH', 'resume.json')
-    
-    # Try fetching resume from Supabase first
-    raw_resume_details = supabase_utils.get_base_resume()
-    
-    if raw_resume_details:
-        logging.info("Successfully loaded base resume from Supabase database.")
-    elif os.path.exists(resume_path):
-        logging.info(f"Supabase fetch failed. Falling back to local file: {resume_path}")
-        try:
-            with open(resume_path, 'r', encoding='utf-8') as f:
-                raw_resume_details = json.load(f)
-        except Exception as e:
-            logging.error(f"Failed to read or decode {resume_path}: {e}")
-            return
-    else:
-        logging.error(f"Base resume not found in Supabase or at '{resume_path}'. Please run the 'Parse Resume' workflow first.")
-        return
-
+    # 1. Retrieve the explicitly lane-bound base resume details from Supabase.
+    archetype = archetype or os.getenv("JOB_RESUME_ARCHETYPE") or config.DEFAULT_ARCHETYPE
+    worker_id = worker_id or f"resume-{uuid.uuid4()}"
+    # Prefer a lane profile and preserve the selected base resume identity.
+    raw_resume_details = supabase_utils.get_archetype_base_resume(archetype)
     if not raw_resume_details:
-        logging.error(f"Could not load valid base resume details. Aborting cycle.")
-        return
+        logging.warning(
+            "Skipping lane %s: no enabled archetype_resume_profiles row with resume data.", archetype
+        )
+        return {"status": "skipped_missing_resume_profile", "archetype": archetype}
+    selected_base_resume_id = raw_resume_details.pop("base_resume_id", None) if raw_resume_details else None
+
+    logging.info("Successfully loaded lane base resume from Supabase database.")
 
     # Parse raw details into Pydantic model
     try:
@@ -499,7 +525,11 @@ async def run_job_processing_cycle():
     # 2. Fetch Top Jobs to Process
     jobs_limit = config.JOBS_TO_CUSTOMIZE_PER_RUN
     logging.info(f"Fetching top {jobs_limit} scored jobs to apply for...")
-    jobs_to_process = supabase_utils.get_top_scored_jobs_for_resume_generation(limit=jobs_limit)
+    jobs_to_process = supabase_utils.get_top_scored_jobs_for_resume_generation(
+        limit=jobs_limit, archetype=archetype, worker_id=worker_id
+    )
+    for job in jobs_to_process:
+        job.setdefault("base_resume_id", selected_base_resume_id)
 
     if not jobs_to_process:
         logging.info("No new jobs found to process in this cycle.")
@@ -509,7 +539,7 @@ async def run_job_processing_cycle():
 
     # 3. Process Each Job Sequentially (to avoid overwhelming Gemini/resources)
     for job_details in jobs_to_process:
-        await process_job(job_details, base_resume_details) # Pass base resume
+        await process_job(job_details, base_resume_details, worker_id=worker_id) # Pass base resume
 
     logging.info("Finished job processing cycle.")
 
@@ -517,7 +547,17 @@ async def run_job_processing_cycle():
 if __name__ == "__main__":
     logging.info("Script started.")
     try:
-        asyncio.run(run_job_processing_cycle())
+        from downstream_orchestration import enabled_lane_slugs
+
+        lanes = enabled_lane_slugs(
+            supabase_utils.supabase, os.getenv("JOB_RESUME_ARCHETYPE")
+        )
+
+        async def run_enabled_cycles():
+            for lane in lanes:
+                await run_job_processing_cycle(archetype=lane)
+
+        asyncio.run(run_enabled_cycles())
         logging.info("Rresume processing completed successfully.")
     except Exception as e:
         logging.error(f"Error during task execution: {e}", exc_info=True)

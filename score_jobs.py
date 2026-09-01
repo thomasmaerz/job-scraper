@@ -1,15 +1,17 @@
 import time
-import json
 import logging
 from typing import List, Optional, Dict, Any
 import requests
 import io
 import pdfplumber
 import os
+import uuid
 
 import config
 import supabase_utils
 from llm_client import job_scoring_client
+from lane_catalog import canonical_lane_slug
+from scheduled_scoring import run_configured_scoring
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -197,12 +199,16 @@ def extract_text_from_pdf_url(pdf_url: str) -> Optional[str]:
         logging.error(f"An unexpected error occurred while extracting text from PDF URL {pdf_url}: {e}")
         return None
 
-def rescore_jobs_with_custom_resume():
+def rescore_jobs_with_custom_resume(
+    archetype: str = config.DEFAULT_ARCHETYPE, worker_id: str | None = None
+):
     """Fetches jobs with custom resumes and re-scores them."""
     logging.info("--- Starting Job Re-scoring with Custom Resumes ---")
     rescore_start_time = time.time()
 
-    jobs_to_rescore = supabase_utils.get_jobs_to_rescore(config.JOBS_TO_SCORE_PER_RUN)
+    jobs_to_rescore = supabase_utils.get_jobs_to_rescore(
+        config.JOBS_TO_SCORE_PER_RUN, archetype=archetype, worker_id=worker_id
+    )
     if not jobs_to_rescore:
         logging.info("No jobs require re-scoring with custom resumes at this time.")
         logging.info("--- Job Re-scoring Finished (No Jobs) ---")
@@ -225,6 +231,7 @@ def rescore_jobs_with_custom_resume():
         logging.info(f"--- Re-scoring Job {i+1}/{len(jobs_to_rescore)} (ID: {job_id}) ---")
 
         custom_resume_text = None
+        completed = False
 
         # Try to get resume data from database first
         if customized_resume_id:
@@ -244,6 +251,8 @@ def rescore_jobs_with_custom_resume():
         if not custom_resume_text:
             logging.error(f"Failed to obtain custom resume text for job_id {job_id} from both DB and PDF. Skipping.")
             failed_rescores += 1
+            if worker_id:
+                supabase_utils.release_lane_score_claim(job_id, archetype, worker_id, failed=True)
             if i < len(jobs_to_rescore) - 1:
                 logging.debug(f"Waiting {config.LLM_REQUEST_DELAY_SECONDS} seconds before next job...")
                 time.sleep(config.LLM_REQUEST_DELAY_SECONDS)
@@ -253,12 +262,19 @@ def rescore_jobs_with_custom_resume():
         score = get_resume_score_from_ai(custom_resume_text, job)
 
         if score is not None:
-            if supabase_utils.update_job_score(job_id, score, resume_score_stage="custom"):
+            if supabase_utils.update_job_score(
+                job_id, score, resume_score_stage="custom",
+                archetype=archetype, worker_id=worker_id,
+            ):
                 successful_rescores += 1
+                completed = True
             else:
                 failed_rescores += 1 
         else:
-            failed_rescores += 1 
+            failed_rescores += 1
+
+        if not completed and worker_id:
+            supabase_utils.release_lane_score_claim(job_id, archetype, worker_id, failed=True)
 
         if i < len(jobs_to_rescore) - 1: 
             logging.debug(f"Waiting {config.LLM_REQUEST_DELAY_SECONDS} seconds before next API call...")
@@ -272,37 +288,37 @@ def rescore_jobs_with_custom_resume():
 
 # --- Main Execution ---
 
-def main():
+def main(
+    archetype: str | None = None, *, run_filter_prepass: bool = True,
+    worker_id: str | None = None,
+):
     """Main function to score jobs based on the target resume."""
-    logging.info("--- Starting Job Scoring Script ---")
+    archetype = canonical_lane_slug(archetype or os.getenv("JOB_SCORE_ARCHETYPE") or config.DEFAULT_ARCHETYPE)
+    worker_id = worker_id or f"score-{uuid.uuid4()}"
+    logging.info(f"--- Starting Job Scoring Script for lane {archetype} ---")
     overall_start_time = time.time()
 
     # --- Pre-pass: Flag irrelevant jobs before any LLM scoring ---
     logging.info("--- Pre-pass: Flagging filtered jobs ---")
-    flagged_count = supabase_utils.flag_filtered_jobs()
-    logging.info(f"Pre-pass complete. {flagged_count} job(s) newly flagged as filtered.")
+    if run_filter_prepass:
+        flagged_count = supabase_utils.flag_filtered_jobs()
+        logging.info(f"Pre-pass complete. {flagged_count} job(s) newly flagged as filtered.")
 
     # --- Phase 1: Initial Scoring with Default Resume ---
     logging.info("--- Phase 1: Initial Scoring with Default Resume ---")
     initial_score_start_time = time.time()
     
-    resume_path = getattr(config, 'BASE_RESUME_PATH', 'resume.json')
-    
-    # Try fetching resume from Supabase first, fall back to local file
-    default_resume_data = supabase_utils.get_base_resume()
+    # Lane scoring must never silently use another lane's global resume.
+    default_resume_data = supabase_utils.get_archetype_base_resume(archetype)
     
     if default_resume_data:
-        logging.info("Successfully loaded base resume from Supabase database.")
-    elif os.path.exists(resume_path):
-        logging.info(f"Supabase fetch failed. Falling back to local file: {resume_path}")
-        try:
-            with open(resume_path, 'r', encoding='utf-8') as f:
-                default_resume_data = json.load(f)
-        except Exception as e:
-            logging.error(f"Failed to read or decode {resume_path}: {e}")
-            default_resume_data = None
+        default_resume_data.pop("base_resume_id", None)
+        logging.info("Successfully loaded lane base resume from Supabase database.")
     else:
-        logging.error(f"Base resume not found in Supabase or at '{resume_path}'. Please run the 'Parse Resume' workflow first.")
+        logging.warning(
+            "Skipping lane %s: no enabled archetype_resume_profiles row with resume data.", archetype
+        )
+        return {"status": "skipped_missing_resume_profile", "archetype": archetype}
 
     if default_resume_data:
         # 2. Format Resume to Text
@@ -310,7 +326,9 @@ def main():
         logging.info("Default resume data formatted to text.")
 
         # 3. Fetch Jobs to Score
-        jobs_to_score_initially = supabase_utils.get_jobs_to_score(config.JOBS_TO_SCORE_PER_RUN)
+        jobs_to_score_initially = supabase_utils.get_jobs_to_score(
+            config.JOBS_TO_SCORE_PER_RUN, archetype=archetype, worker_id=worker_id
+        )
         if not jobs_to_score_initially:
             logging.info("No jobs require initial scoring at this time.")
         else:
@@ -327,15 +345,26 @@ def main():
                     continue
 
                 logging.info(f"--- Initial Scoring Job {i+1}/{len(jobs_to_score_initially)} (ID: {job_id}) ---")
-                score = get_resume_score_from_ai(default_resume_text, job)
-
-                if score is not None:
-                    if supabase_utils.update_job_score(job_id, score, resume_score_stage="initial"):
+                completed = False
+                try:
+                    score = get_resume_score_from_ai(default_resume_text, job)
+                    if score is not None:
+                        completed = supabase_utils.update_job_score(
+                            job_id, score, resume_score_stage="initial",
+                            archetype=archetype, worker_id=worker_id,
+                        )
+                    if completed:
                         successful_initial_scores += 1
                     else:
                         failed_initial_scores += 1
-                else:
+                except Exception:
                     failed_initial_scores += 1
+                    logging.exception("Unexpected scoring failure for %s", job_id)
+                finally:
+                    if not completed:
+                        supabase_utils.release_lane_score_claim(
+                            job_id, archetype, worker_id, failed=True
+                        )
 
                 if i < len(jobs_to_score_initially) - 1:
                     logging.debug(f"Waiting {config.LLM_REQUEST_DELAY_SECONDS} seconds before next API call...")
@@ -348,17 +377,58 @@ def main():
             logging.info(f"Total initial scoring time: {initial_score_end_time - initial_score_start_time:.2f} seconds")
 
     # # --- Phase 2: Re-scoring with Custom Resumes ---
-    rescore_jobs_with_custom_resume() 
+    rescore_jobs_with_custom_resume(archetype=archetype, worker_id=worker_id)
 
     overall_end_time = time.time()
     logging.info("--- Job Scoring Script Finished (All Phases) ---")
     logging.info(f"Total script execution time: {overall_end_time - overall_start_time:.2f} seconds")
+    return {"status": "completed", "archetype": archetype}
+
+
+def run_scheduled_scoring(*, db=None, archetype_override: str | None = None):
+    """Run configured lane scoring, or return success/skipped when scoring is disabled.
+
+    This is the scheduled entrypoint. There is intentionally no implicit manual
+    bypass: callers that need one must invoke ``main(<canonical lane>)`` directly.
+    """
+    db = db or supabase_utils.supabase
+    prepass_complete = False
+
+    def run_lane(lane: str):
+        nonlocal prepass_complete
+        if not config.LLM_API_KEY:
+            logging.error(
+                "LLM_API_KEY environment variable not set. "
+                "(Also accepts GEMINI_API_KEY / GEMINI_FIRST_API_KEY)"
+            )
+            return {"status": "skipped_missing_llm_api_key", "archetype": lane}
+        result = main(lane, run_filter_prepass=not prepass_complete)
+        prepass_complete = True
+        return result
+
+    return run_configured_scoring(
+        run_lane,
+        db=db,
+        archetype_override=archetype_override,
+    )
+
+
+def run_manual_scoring_ignoring_score_jobs_setting(archetype: str):
+    """Explicit manual recovery override for one required canonical lane.
+
+    This intentionally bypasses scrape_settings.score_jobs. Scheduled callers
+    must use run_scheduled_scoring instead.
+    """
+    if not archetype or not archetype.strip():
+        raise ValueError("A canonical archetype is required for manual scoring override.")
+    return main(canonical_lane_slug(archetype))
 
 
 if __name__ == "__main__":
-    if not config.LLM_API_KEY:
-        logging.error("LLM_API_KEY environment variable not set. (Also accepts GEMINI_API_KEY / GEMINI_FIRST_API_KEY)")
-    elif not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
+    if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
         logging.error("Supabase URL or Key environment variable not set.")
     else:
-        main()
+        run_scheduled_scoring(
+            db=supabase_utils.supabase,
+            archetype_override=os.getenv("JOB_SCORE_ARCHETYPE"),
+        )

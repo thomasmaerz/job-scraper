@@ -417,21 +417,26 @@ def test_mark_jobs_analyzed_updates_timestamp_for_ids():
             calls.append(("in_", key, values))
             return self
 
+        def eq(self, key, value):
+            calls.append(("eq", key, value))
+            return self
+
         def execute(self):
             calls.append(("execute",))
             return SimpleNamespace(data=[])
 
     class FakeDb:
         def table(self, name):
-            assert name == "jobs"
+            assert name == "job_archetype_memberships"
             return FakeQuery()
 
     analyze_jobs.mark_jobs_analyzed(["1", "2"], db=FakeDb())
 
     assert calls[0][0] == "update"
-    assert "insights_analyzed_at" in calls[0][1]
+    assert "analyzed_at" in calls[0][1]
     assert calls[1] == ("in_", "job_id", ["1", "2"])
-    assert calls[2] == ("execute",)
+    assert calls[2] == ("eq", "archetype", "technology_delivery")
+    assert calls[3] == ("execute",)
 
 
 def test_mark_jobs_analyzed_sets_reanalyzed_timestamp_for_replacement_backfill():
@@ -446,22 +451,42 @@ def test_mark_jobs_analyzed_sets_reanalyzed_timestamp_for_replacement_backfill()
             calls.append(("in_", key, values))
             return self
 
+        def eq(self, key, value):
+            calls.append(("eq", key, value))
+            return self
+
         def execute(self):
             calls.append(("execute",))
             return SimpleNamespace(data=[])
 
     class FakeDb:
         def table(self, name):
-            assert name == "jobs"
+            assert name == "job_archetype_memberships"
             return FakeQuery()
 
     analyze_jobs.mark_jobs_analyzed(["1", "2"], db=FakeDb(), replacement_backfill=True)
 
     assert calls[0][0] == "update"
-    assert "insights_analyzed_at" in calls[0][1]
+    assert "analyzed_at" in calls[0][1]
     assert "insights_reanalyzed_at" in calls[0][1]
     assert calls[1] == ("in_", "job_id", ["1", "2"])
-    assert calls[2] == ("execute",)
+    assert calls[2] == ("eq", "archetype", "technology_delivery")
+    assert calls[3] == ("execute",)
+
+
+def test_mark_jobs_analyzed_scopes_same_job_to_explicit_lane():
+    lanes = []
+    class Query:
+        def update(self, payload): return self
+        def in_(self, key, values): return self
+        def eq(self, key, value): lanes.append(value); return self
+        def execute(self): return SimpleNamespace(data=[])
+    class Db:
+        def table(self, name): assert name == "job_archetype_memberships"; return Query()
+    db = Db()
+    analyze_jobs.mark_jobs_analyzed(["job-1"], db=db, archetype="data_pm")
+    analyze_jobs.mark_jobs_analyzed(["job-1"], db=db, archetype="network_infrastructure")
+    assert lanes == ["data_pm", "network_infrastructure"]
 
 
 def test_aggregate_keywords_preserves_acronyms_and_uppercase_keywords():
@@ -1133,7 +1158,7 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     monkeypatch.setattr(
         analyze_jobs,
         "mark_jobs_analyzed",
-        lambda job_ids, db=None, replacement_backfill=False: marked.append(job_ids),
+        lambda job_ids, db=None, replacement_backfill=False, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE: marked.append(job_ids),
     )
 
     processed = analyze_jobs.run(backfill_all=True)
@@ -1173,7 +1198,7 @@ def test_run_retries_idempotent_fact_replacement_after_crash_before_mark(monkeyp
         replace_calls.append((job_ids, facts))
         return facts
 
-    def fake_mark(job_ids, db=None, replacement_backfill=False):
+    def fake_mark(job_ids, db=None, replacement_backfill=False, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE):
         if not failed_once["value"]:
             failed_once["value"] = True
             raise RuntimeError("crash after replace")
@@ -1246,7 +1271,7 @@ def test_run_replaces_job_facts_before_marking_jobs_analyzed(monkeypatch):
         calls.append(("replace", job_ids, facts))
         return facts
 
-    def fake_mark(job_ids, db=None, replacement_backfill=False):
+    def fake_mark(job_ids, db=None, replacement_backfill=False, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE):
         calls.append(("mark", job_ids))
 
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", fake_replace)
@@ -1285,7 +1310,7 @@ def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
     monkeypatch.setattr(analyze_jobs, "replace_job_keyword_facts", lambda job_ids, facts, archetype=None, db=None: facts)
     monkeypatch.setattr(analyze_jobs, "rebuild_keyword_insights", lambda db=None: None)
 
-    def fake_mark(job_ids, db=None, replacement_backfill=False):
+    def fake_mark(job_ids, db=None, replacement_backfill=False, archetype=analyze_jobs.config.DEFAULT_ARCHETYPE):
         calls.append(("mark", job_ids, replacement_backfill))
 
     monkeypatch.setattr(analyze_jobs, "mark_jobs_analyzed", fake_mark)
@@ -1293,5 +1318,5 @@ def test_run_replacement_backfill_forwards_flag_to_fetch_and_mark(monkeypatch):
     processed = analyze_jobs.run(replacement_backfill=True)
 
     assert processed == 1
-    assert calls[0] == ("fetch", analyze_jobs.config.DEFAULT_ARCHETYPE, False, True)
+    assert calls[0] == ("fetch", "technology_delivery", False, True)
     assert calls[1] == ("mark", ["1"], True)

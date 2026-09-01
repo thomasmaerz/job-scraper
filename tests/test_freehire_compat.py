@@ -124,6 +124,7 @@ def test_classifier_retries_only_missing_or_invalid_ids_and_uses_schema(monkeypa
     assert set(outcome.results) == {"1", "2"}
     assert outcome.failures == {}
     assert calls[0]["response_format"] is freehire_compat.FreehireClassificationBatch
+    assert "max_api_attempts" not in calls[0]
     assert "Job ID: 1" in calls[0]["prompt"] and "Job ID: 2" in calls[0]["prompt"]
     assert "Job ID: 1" not in calls[1]["prompt"] and "Job ID: 2" in calls[1]["prompt"]
 
@@ -154,7 +155,7 @@ def test_classifier_splits_and_isolates_poison_record(monkeypatch):
     assert outcome.splits == 1
 
 
-def test_classifier_does_not_split_global_transport_failure(monkeypatch):
+def test_classifier_does_not_split_global_transport_failure(monkeypatch, caplog):
     class FakeClient:
         model = "fake/model"
         model_chain = None
@@ -176,6 +177,9 @@ def test_classifier_does_not_split_global_transport_failure(monkeypatch):
     assert client.calls == 1
     assert outcome.splits == 0
     assert set(outcome.failures) == {"1", "2"}
+    assert outcome.global_error == "transport unavailable"
+    assert "Freehire classification stopped after model-pool failure for 2 jobs" in caplog.text
+    assert "ConnectionError: transport unavailable" in caplog.text
 
 
 def test_classifier_hard_request_budget_bounds_split_tree(monkeypatch):

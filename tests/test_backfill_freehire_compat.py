@@ -4,7 +4,7 @@ import pytest
 
 import backfill_freehire_compat
 import freehire_compat
-import frontfill_freehire_compat
+import incremental_freehire_compat
 
 
 class Query:
@@ -252,10 +252,10 @@ def test_dry_run_never_calls_llm_or_updates():
     assert db.updates == 0
 
 
-def test_frontfill_query_is_bounded_eligible_and_newest_first():
+def test_incremental_query_is_bounded_eligible_and_newest_first():
     db = Db([])
 
-    backfill_freehire_compat.fetch_frontfill_candidates(db, 300)
+    backfill_freehire_compat.fetch_incremental_candidates(db, 300)
 
     assert db.orders == [("last_seen_at", True), ("job_id", True)]
     assert len(db.or_filters) == 1
@@ -281,7 +281,7 @@ def test_non_drain_hard_caps_at_300_without_complete_keyset_scan(monkeypatch):
     ]
     monkeypatch.setattr(
         backfill_freehire_compat,
-        "fetch_frontfill_candidates",
+        "fetch_incremental_candidates",
         lambda _db, limit: rows[:limit],
     )
     monkeypatch.setattr(
@@ -296,10 +296,10 @@ def test_non_drain_hard_caps_at_300_without_complete_keyset_scan(monkeypatch):
     assert result["would_classify"] == 300
 
 
-def test_hourly_frontfill_rejects_limit_above_300(monkeypatch):
+def test_hourly_incremental_worker_rejects_limit_above_300(monkeypatch):
     monkeypatch.setenv("FREEHIRE_CLASSIFY_LIMIT", "301")
     with pytest.raises(ValueError, match="hourly hard cap of 300"):
-        frontfill_freehire_compat.classify_limit_from_env()
+        incremental_freehire_compat.classify_limit_from_env()
 
 
 def test_capped_replacement_requires_cutoff_and_resumes_by_classified_timestamp():

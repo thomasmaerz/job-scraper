@@ -12,20 +12,35 @@ from markdownify import markdownify as md
 import json
 import uuid
 import math
-from urllib.parse import urlparse
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode, urlparse
 import relist_tracking
+from lane_catalog import canonical_lane_slug
+from scrape_configuration import (
+    LinkedInSearchExecution,
+    ScrapeConfiguration,
+    build_search_executions,
+    load_scrape_configuration,
+)
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 _relist_detail_fetches_used = 0
-_linkedin_search_coverage = {"pages_attempted": 0, "pages_completed": 0}
+_relist_detail_fetches_lock = threading.Lock()
+_linkedin_scrape_state = threading.local()
 
 
 def resolve_linkedin_lookback_hours(
     last_success_at: str | None,
     now: datetime | None = None,
+    configured_hours: int | None = None,
+    overlap_hours: int | None = None,
+    max_hours: int | None = None,
 ) -> int:
-    configured_hours = config.LINKEDIN_LOOKBACK_HOURS
+    configured_hours = configured_hours or config.LINKEDIN_LOOKBACK_HOURS
+    overlap_hours = config.LINKEDIN_LOOKBACK_OVERLAP_HOURS if overlap_hours is None else overlap_hours
+    max_hours = max_hours or config.LINKEDIN_MAX_LOOKBACK_HOURS
     if not last_success_at:
         return configured_hours
 
@@ -42,14 +57,21 @@ def resolve_linkedin_lookback_hours(
         now = now.replace(tzinfo=timezone.utc)
     elapsed_hours = max(0, math.ceil((now - parsed).total_seconds() / 3600))
     return min(
-        config.LINKEDIN_MAX_LOOKBACK_HOURS,
-        max(configured_hours, elapsed_hours + config.LINKEDIN_LOOKBACK_OVERLAP_HOURS),
+        max_hours,
+        max(configured_hours, elapsed_hours + overlap_hours),
     )
 
 
-def _resolve_archetype_config(archetype: str | None) -> tuple[str, dict]:
+def _resolve_archetype_config(
+    archetype: str | None,
+    runtime_profile: dict | None = None,
+) -> tuple[str, dict]:
     resolved_archetype = archetype or config.DEFAULT_ARCHETYPE
-    archetype_config = config.ARCHETYPE_CONFIGS.get(resolved_archetype)
+    archetype_config = (
+        runtime_profile
+        if runtime_profile is not None
+        else config.ARCHETYPE_CONFIGS.get(resolved_archetype)
+    )
     if archetype_config is None:
         raise ValueError(f"Unknown archetype '{resolved_archetype}'. Check config.ARCHETYPE_CONFIGS.")
 
@@ -61,6 +83,33 @@ def _resolve_archetype_config(archetype: str | None) -> tuple[str, dict]:
         )
 
     return resolved_archetype, archetype_config
+
+
+def _lane_runtime_archetype_config(execution: LinkedInSearchExecution) -> dict:
+    """Translate typed lane context to the existing filter interface."""
+    base_profile = config.ARCHETYPE_CONFIGS.get(execution.lane.archetype)
+    if base_profile is None and execution.lane.archetype == "technology_delivery":
+        base_profile = config.ARCHETYPE_CONFIGS.get("software_tpm")
+    profile = dict(base_profile or {})
+    profile.update({
+        "provider": "linkedin",
+        "location": execution.geography.location,
+        "filter_profile": f"{execution.lane.archetype}_v1",
+        "definition": execution.lane.description,
+        "route_when": execution.lane.routing_guidance,
+        "title_context": list(execution.lane.title_include),
+        "description_context": list(execution.lane.description_include),
+        "positive_signals": list(execution.lane.description_include),
+        "exclude_signals": [
+            *execution.lane.title_exclude,
+            *execution.lane.description_exclude,
+        ],
+        "title_blocklist": list(execution.lane.title_exclude),
+        "desc_blocklist": list(execution.lane.description_exclude),
+    })
+    for key in ("company_blocklist", "title_blocklist", "title_entry_level_blocklist", "desc_blocklist"):
+        profile.setdefault(key, [])
+    return profile
 
 def _parse_salary_fields(text: str) -> dict:
     if not text:
@@ -260,24 +309,52 @@ def _fetch_linkedin_job_ids(
     search_query: str,
     location: str,
     posting_date_filter: str | None = None,
+    geo_id: int | None = None,
+    max_start: int | None = None,
+    job_type: str | None = None,
+    work_types: str | None = None,
+    geo_id_is_explicit: bool = False,
+    request_delay_ms: int | None = None,
 ) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
-    global _linkedin_search_coverage
-    _linkedin_search_coverage = {"pages_attempted": 0, "pages_completed": 0}
+    coverage = {"pages_attempted": 0, "pages_completed": 0}
+    _linkedin_scrape_state.coverage = coverage
     scraped_cards = []
     start = 0
-    max_start = config.LINKEDIN_MAX_START
+    max_start = config.LINKEDIN_MAX_START if max_start is None else max_start
     posting_date_filter = posting_date_filter or config.LINKEDIN_JOB_POSTING_DATE
+    resolved_geo_id = geo_id
+    if geo_id is None and not geo_id_is_explicit and location == config.LINKEDIN_LOCATION:
+        resolved_geo_id = config.LINKEDIN_GEO_ID
+    job_type = job_type or config.LINKEDIN_JOB_TYPE
+    work_types = work_types or config.LINKEDIN_F_WT
 
 
     logging.info(f"--- Starting Phase 1: Scraping Job IDs (Max Start: {max_start}) ---")
     while start <= max_start:
-        _linkedin_search_coverage["pages_attempted"] += 1
-        target_url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={search_query.replace(' ', '%20')}&location={location}&geoId={config.LINKEDIN_GEO_ID}&f_TPR={posting_date_filter}&f_JT={config.LINKEDIN_JOB_TYPE}&f_WT={config.LINKEDIN_F_WT}&start={start}"
+        coverage["pages_attempted"] += 1
+        query_parameters = {
+            "keywords": search_query,
+            "location": location,
+            "f_TPR": posting_date_filter,
+            "f_JT": job_type,
+            "f_WT": work_types,
+            "start": start,
+        }
+        if resolved_geo_id is not None:
+            query_parameters["geoId"] = resolved_geo_id
+        target_url = (
+            "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
+            + urlencode(query_parameters)
+        )
 
         if start > 0:
-            sleep_time = random.uniform(5.0, 15.0)
+            sleep_time = (
+                request_delay_ms / 1000
+                if request_delay_ms is not None
+                else random.uniform(5.0, 15.0)
+            )
             logging.info(f"Waiting for {sleep_time:.2f} seconds before next request...")
             time.sleep(sleep_time)
 
@@ -330,7 +407,7 @@ def _fetch_linkedin_job_ids(
              logging.info(f"Received empty response text at start={start}, stopping.")
              break
 
-        _linkedin_search_coverage["pages_completed"] += 1
+        coverage["pages_completed"] += 1
 
         soup = BeautifulSoup(res.text, 'html.parser')
         all_jobs_on_this_page = soup.find_all('li')
@@ -532,6 +609,21 @@ def process_linkedin_query(
     archetype: str | None = None,
     filter_profile: str | None = None,
     posting_date_filter: str | None = None,
+    query_id: str | None = None,
+    query_kind: str | None = None,
+    query_language: str | None = None,
+    lane: str | None = None,
+    location_scope: str | None = None,
+    geography_id: str | None = None,
+    geo_id: int | None = None,
+    max_start: int | None = None,
+    job_type: str | None = None,
+    work_types: str | None = None,
+    geo_id_is_explicit: bool = False,
+    request_delay_ms: int | None = None,
+    fetch_descriptions: bool = True,
+    runtime_profile: dict | None = None,
+    relist_budget: int | None = None,
 ) -> list[dict]:
     """
     Orchestrates scraping and detail fetching for a single query,
@@ -541,15 +633,22 @@ def process_linkedin_query(
     orchestration boundary merges both dictionaries into each returned job.
     """
 
-    global _relist_detail_fetches_used, _linkedin_search_coverage
-    resolved_archetype, archetype_config = _resolve_archetype_config(archetype)
+    global _relist_detail_fetches_used
+    resolved_archetype, archetype_config = _resolve_archetype_config(archetype, runtime_profile)
     resolved_filter_profile = filter_profile or archetype_config["filter_profile"]
     run_id = str(uuid.uuid4())
     query_scope = json.dumps({
         "archetype": resolved_archetype,
+        "lane": lane or canonical_lane_slug(resolved_archetype),
         "filter_profile": resolved_filter_profile,
         "location": location,
+        # This serialized scope is provenance, not a jobs.location_scope write.
+        "location_scope": location_scope,
+        "geography_id": geography_id,
         "posting_date_filter": posting_date_filter or config.LINKEDIN_JOB_POSTING_DATE,
+        "query_id": query_id,
+        "query_kind": query_kind,
+        "language": query_language,
         "search_query": search_query,
     }, sort_keys=True, separators=(",", ":"))
     tracking_enabled = getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
@@ -563,18 +662,33 @@ def process_linkedin_query(
             query_scope=query_scope,
         )
 
-    scraped_cards = _fetch_linkedin_job_ids(
-        search_query,
-        location,
-        posting_date_filter=posting_date_filter,
+    fetch_options = {"posting_date_filter": posting_date_filter}
+    if geo_id is not None:
+        fetch_options["geo_id"] = geo_id
+    if max_start is not None:
+        fetch_options["max_start"] = max_start
+    if job_type is not None:
+        fetch_options["job_type"] = job_type
+    if work_types is not None:
+        fetch_options["work_types"] = work_types
+    if geo_id_is_explicit:
+        fetch_options["geo_id_is_explicit"] = True
+    if request_delay_ms is not None:
+        fetch_options["request_delay_ms"] = request_delay_ms
+    _linkedin_scrape_state.coverage = {"pages_attempted": 0, "pages_completed": 0}
+    scraped_cards = _fetch_linkedin_job_ids(search_query, location, **fetch_options)
+    coverage = getattr(
+        _linkedin_scrape_state,
+        "coverage",
+        {"pages_attempted": 0, "pages_completed": 0},
     )
     if not scraped_cards:
         if tracking_enabled:
             supabase_utils.finish_ingestion_run(
                 run_id,
                 status="incomplete",
-                pages_attempted=_linkedin_search_coverage["pages_attempted"],
-                pages_completed=_linkedin_search_coverage["pages_completed"],
+                pages_attempted=coverage["pages_attempted"],
+                pages_completed=coverage["pages_completed"],
                 cards_seen=0,
                 coverage_complete=False,
                 coverage_reason="zero cards; empty result or parser/request failure",
@@ -683,10 +797,15 @@ def process_linkedin_query(
     ]
     enrichment_limit = getattr(config, "LINKEDIN_METADATA_ENRICH_LIMIT_PER_QUERY", 10)
     query_relist_limit = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY", 3)
-    run_relist_remaining = max(
-        0,
-        getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", 20) - _relist_detail_fetches_used,
-    )
+    if relist_budget is None:
+        with _relist_detail_fetches_lock:
+            run_relist_remaining = max(
+                0,
+                getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", 20)
+                - _relist_detail_fetches_used,
+            )
+    else:
+        run_relist_remaining = max(0, relist_budget)
     relist_limit = min(query_relist_limit, run_relist_remaining)
     relist_job_ids_to_process = [
         job_id for job_id in relist_candidates if job_id in job_ids_set
@@ -709,13 +828,35 @@ def process_linkedin_query(
 
     logging.info(f"Identified {len(new_job_ids_to_process)} new job IDs to fetch details for.")
 
+    # Search matches are lane evidence even when the canonical job was saved by
+    # an earlier query or lane. Persist these before the detail/new-ID early
+    # return; canonical saves below handle new IDs and reposts.
+    known_source_ids = [job_id for job_id in unique_linkedin_job_ids if job_id in job_ids_set]
+    canonical_ids = (
+        supabase_utils.get_canonical_job_ids_for_sources(known_source_ids)
+        if known_source_ids else {}
+    )
+    membership_job = {
+        "lane": lane or canonical_lane_slug(resolved_archetype),
+        "archetype": resolved_archetype,
+        "search_query": search_query,
+        "search_query_id": query_id,
+        "search_query_type": query_kind,
+        "search_query_language": query_language,
+        "search_location_scope": location_scope,
+        "geography_id": geography_id,
+        "query_scope": query_scope,
+    }
+    for canonical_id in sorted(set(canonical_ids.values())):
+        supabase_utils.upsert_job_archetype_membership(canonical_id, membership_job)
+
     if not job_ids_to_process:
         if tracking_enabled:
             supabase_utils.finish_ingestion_run(
                 run_id,
                 status="complete",
-                pages_attempted=_linkedin_search_coverage["pages_attempted"],
-                pages_completed=_linkedin_search_coverage["pages_completed"],
+                pages_attempted=coverage["pages_attempted"],
+                pages_completed=coverage["pages_completed"],
                 cards_seen=len(normalized_cards),
                 detail_budget_used=0,
                 coverage_complete=False,
@@ -738,9 +879,25 @@ def process_linkedin_query(
         if detail_result:
             details, detail_metadata = detail_result
             details = {**details, **detail_metadata}
+            if not fetch_descriptions:
+                details["description"] = None
             details["search_query"] = search_query
+            if query_id is not None:
+                details["search_query_id"] = query_id
+            if query_kind is not None:
+                details["search_query_type"] = query_kind
+            if query_language is not None:
+                details["search_query_language"] = query_language
+            if lane is not None:
+                details["lane"] = lane
+            if geography_id is not None:
+                details["geography_id"] = geography_id
+            if any(value is not None for value in (query_id, query_kind, query_language, lane, location_scope, geography_id)):
+                details["query_scope"] = query_scope
             details["archetype"] = resolved_archetype
             details["filter_profile"] = resolved_filter_profile
+            if location_scope:
+                details["search_location_scope"] = location_scope
             details["scrape_run_id"] = run_id
             if job_id in relist_job_ids_to_process:
                 details["same_id_relist_candidate"] = bool(
@@ -748,9 +905,11 @@ def process_linkedin_query(
                 )
                 details["same_id_relist_date"] = card_by_job_id[job_id].get("same_id_relist_date")
                 details["same_id_relist_evidence"] = card_by_job_id[job_id].get("same_id_relist_evidence")
-                _relist_detail_fetches_used += 1
+                if relist_budget is None:
+                    with _relist_detail_fetches_lock:
+                        _relist_detail_fetches_used += 1
             description = details.get('description')
-            if description and description.strip(): 
+            if not fetch_descriptions or (description and description.strip()):
                 if 'job_id' in details and details['job_id'] is not None:
                     detailed_new_jobs.append(details)
                     processed_count += 1
@@ -770,8 +929,8 @@ def process_linkedin_query(
         supabase_utils.finish_ingestion_run(
             run_id,
             status="complete" if processed_count == len(ids_to_fetch) else "incomplete",
-            pages_attempted=_linkedin_search_coverage["pages_attempted"],
-            pages_completed=_linkedin_search_coverage["pages_completed"],
+            pages_attempted=coverage["pages_attempted"],
+            pages_completed=coverage["pages_completed"],
             cards_seen=len(normalized_cards),
             detail_budget_used=len(ids_to_fetch),
             coverage_complete=False,
@@ -1073,6 +1232,112 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
     return detailed_new_jobs
 
 
+def _run_database_configured_linkedin(
+    scrape_config: ScrapeConfiguration,
+    saved_job_ids: list[str],
+) -> None:
+    global _relist_detail_fetches_used
+    settings = scrape_config.settings
+    last_success_at = supabase_utils.get_last_successful_scrape_at() or config.LINKEDIN_LAST_SUCCESS_AT
+    if not settings.scraping_enabled:
+        logging.info("LinkedIn scraping disabled by scrape_settings.scraping_enabled")
+        return
+    lookback_hours = resolve_linkedin_lookback_hours(
+        last_success_at,
+        configured_hours=settings.lookback_days * 24,
+        overlap_hours=0,
+        max_hours=settings.lookback_days * 24,
+    )
+    posting_date_filter = f"r{lookback_hours * 3600}"
+    logging.info(
+        "LinkedIn configured search: version=%s lookback=%s hours scopes=%s",
+        scrape_config.version,
+        lookback_hours,
+        ",".join(sorted({scope.value for lane in scrape_config.lanes for scope in lane.locations})),
+    )
+
+    # The legacy persistence helper reads this setting. Restore it so invoking
+    # orchestration in-process cannot leak database configuration to later work.
+    previous_repost_dedup = config.ENABLE_REPOST_DEDUP
+    config.ENABLE_REPOST_DEDUP = settings.deduplicate_jobs
+    _relist_detail_fetches_used = 0
+    executions = build_search_executions(scrape_config)
+    query_relist_limit = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY", 3)
+    run_relist_remaining = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", 20)
+    work_items = []
+    for execution in executions:
+        runtime_profile = _lane_runtime_archetype_config(execution)
+        relist_budget = None
+        if settings.concurrent_queries > 1:
+            relist_budget = min(query_relist_limit, max(0, run_relist_remaining))
+            run_relist_remaining -= relist_budget
+        work_items.append((execution, runtime_profile, relist_budget))
+
+    def fetch_execution(work_item):
+        execution, runtime_profile, relist_budget = work_item
+        lane_slug = execution.lane.archetype
+        logging.info(
+            "Processing LinkedIn lane=%s query_id=%s query_kind=%s location_scope=%s geography=%s query=%r",
+            lane_slug,
+            execution.query.query_id,
+            execution.query.query_type.value,
+            execution.geography.location_scope.value,
+            execution.geography.geography_id,
+            execution.query.query,
+        )
+        jobs = process_linkedin_query(
+            search_query=execution.query.query,
+            location=execution.geography.location,
+            limit=settings.max_jobs_per_query,
+            archetype=lane_slug,
+            filter_profile=f"{lane_slug}_v1",
+            posting_date_filter=posting_date_filter,
+            query_id=execution.query.query_id,
+            query_kind=execution.query.query_type.value,
+            query_language=execution.query.language,
+            lane=lane_slug,
+            location_scope=execution.geography.location_scope.value,
+            geography_id=execution.geography.geography_id,
+            geo_id=execution.geography.geo_id,
+            max_start=(settings.max_pages_per_query - 1) * 25,
+            request_delay_ms=settings.request_delay_ms,
+            fetch_descriptions=settings.fetch_descriptions,
+            geo_id_is_explicit=True,
+            runtime_profile=runtime_profile,
+            relist_budget=relist_budget,
+        )
+        return execution, runtime_profile, jobs
+
+    executor = None
+    try:
+        if settings.concurrent_queries == 1:
+            fetched_results = map(fetch_execution, work_items)
+        else:
+            executor = ThreadPoolExecutor(max_workers=settings.concurrent_queries)
+            # Finish all provider work before deterministic serialized writes.
+            fetched_results = list(executor.map(fetch_execution, work_items))
+
+        # Canonical persistence and lane-state writes remain serialized.
+        for execution, runtime_profile, jobs in fetched_results:
+            if not jobs:
+                continue
+            lane_slug = execution.lane.archetype
+            save_result = supabase_utils.save_linkedin_jobs_canonicalized_with_mapping(jobs)
+            saved_job_ids.extend(save_result.canonical_ids)
+            for job, canonical_id in zip(jobs, save_result.canonical_ids_by_input):
+                if canonical_id:
+                    supabase_utils.persist_lane_filter_state(
+                        canonical_id,
+                        lane_slug,
+                        job,
+                        runtime_profile=runtime_profile,
+                    )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+        config.ENABLE_REPOST_DEDUP = previous_repost_dedup
+
+
 def main() -> list[str]:
     """Run configured scrapers and return the canonical job IDs that were saved."""
     saved_job_ids: list[str] = []
@@ -1080,45 +1345,8 @@ def main() -> list[str]:
     # Get jobs from LinkedIn
     if "linkedin" in config.SCRAPING_SOURCES:
         logging.info("\n--- Starting LinkedIn Job Scraping ---")
-        last_success_at = (
-            supabase_utils.get_last_successful_scrape_at()
-            or config.LINKEDIN_LAST_SUCCESS_AT
-        )
-        lookback_hours = resolve_linkedin_lookback_hours(last_success_at)
-        posting_date_filter = f"r{lookback_hours * 3600}"
-        logging.info(
-            "LinkedIn lookback: %s hours (last successful run: %s)",
-            lookback_hours,
-            last_success_at or "unavailable",
-        )
-        max_jobs_per_search = config.MAX_JOBS_PER_SEARCH.get("linkedin", getattr(config, 'DEFAULT_MAX_JOBS_PER_SEARCH', 10))
-        for archetype_name, archetype_config in config.ARCHETYPE_CONFIGS.items():
-            if archetype_config["provider"] != "linkedin":
-                continue
-
-            for query in archetype_config["search_queries"]:
-                print(f"\n{'='*20} Processing Search Query: '{query}' {'='*20}")
-
-                # 1. Process the query: Scrape IDs, filter, fetch new details
-                new_linkedin_job_details = process_linkedin_query(
-                    search_query=query,
-                    location=archetype_config["location"],
-                    limit=max_jobs_per_search,
-                    archetype=archetype_name,
-                    filter_profile=archetype_config["filter_profile"],
-                    posting_date_filter=posting_date_filter,
-                )
-
-                # 2. Save the NEW scraped data to Supabase
-                if new_linkedin_job_details:
-                    print(f"\n--- Saving {len(new_linkedin_job_details)} new job(s) for query '{query}' ---")
-                    saved_job_ids.extend(
-                        supabase_utils.save_linkedin_jobs_canonicalized(
-                            new_linkedin_job_details
-                        )
-                    )
-                else:
-                    print(f"\nNo new job details were fetched or processed for query '{query}'.")
+        scrape_config = load_scrape_configuration(db=supabase_utils.supabase)
+        _run_database_configured_linkedin(scrape_config, saved_job_ids)
     else:
         logging.info("\n--- Skipping LinkedIn Job Scraping per config ---")
 

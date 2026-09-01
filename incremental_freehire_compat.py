@@ -1,4 +1,4 @@
-"""Continuous Freehire compatibility worker."""
+"""Incremental Freehire compatibility worker."""
 
 import logging
 import os

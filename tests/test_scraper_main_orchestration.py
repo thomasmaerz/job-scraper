@@ -543,7 +543,7 @@ def test_main_consumes_canonical_saver_id_lists_for_all_sources(monkeypatch, cap
     monkeypatch.setattr(
         scraper.supabase_utils,
         "save_linkedin_jobs_canonicalized_with_mapping",
-        lambda jobs: linkedin_save_calls.append(jobs) or scraper.supabase_utils.CanonicalSaveResult(
+        lambda jobs, run_context=None: linkedin_save_calls.append(jobs) or scraper.supabase_utils.CanonicalSaveResult(
             canonical_ids=["linkedin-canonical-id"],
             canonical_by_source={"linkedin-id": "linkedin-canonical-id"},
             canonical_ids_by_input=["linkedin-canonical-id"],

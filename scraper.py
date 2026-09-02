@@ -624,6 +624,7 @@ def process_linkedin_query(
     fetch_descriptions: bool = True,
     runtime_profile: dict | None = None,
     relist_budget: int | None = None,
+    run_context: supabase_utils.CanonicalRunContext | None = None,
 ) -> list[dict]:
     """
     Orchestrates scraping and detail fetching for a single query,
@@ -788,7 +789,10 @@ def process_linkedin_query(
 
 
     logging.info("\n--- Starting Filtering Step: Checking against Supabase ---")
-    job_ids_set, company_title_set = supabase_utils.get_existing_jobs_from_supabase()
+    if run_context is None:
+        job_ids_set, company_title_set = supabase_utils.get_existing_jobs_from_supabase()
+    else:
+        job_ids_set, company_title_set = run_context.existing_indexes("linkedin")
     incomplete_metadata_ids = supabase_utils.get_incomplete_linkedin_metadata_ids(unique_linkedin_job_ids)
 
     new_job_ids_to_process = [
@@ -832,10 +836,12 @@ def process_linkedin_query(
     # an earlier query or lane. Persist these before the detail/new-ID early
     # return; canonical saves below handle new IDs and reposts.
     known_source_ids = [job_id for job_id in unique_linkedin_job_ids if job_id in job_ids_set]
-    canonical_ids = (
-        supabase_utils.get_canonical_job_ids_for_sources(known_source_ids)
-        if known_source_ids else {}
-    )
+    if not known_source_ids:
+        canonical_ids = {}
+    elif run_context is None:
+        canonical_ids = supabase_utils.get_canonical_job_ids_for_sources(known_source_ids)
+    else:
+        canonical_ids = run_context.canonical_ids_for_sources("linkedin", known_source_ids)
     membership_job = {
         "lane": lane or canonical_lane_slug(resolved_archetype),
         "archetype": resolved_archetype,
@@ -1261,6 +1267,7 @@ def _run_database_configured_linkedin(
     previous_repost_dedup = config.ENABLE_REPOST_DEDUP
     config.ENABLE_REPOST_DEDUP = settings.deduplicate_jobs
     _relist_detail_fetches_used = 0
+    run_context = supabase_utils.CanonicalRunContext()
     executions = build_search_executions(scrape_config)
     query_relist_limit = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY", 3)
     run_relist_remaining = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", 20)
@@ -1305,6 +1312,7 @@ def _run_database_configured_linkedin(
             geo_id_is_explicit=True,
             runtime_profile=runtime_profile,
             relist_budget=relist_budget,
+            run_context=run_context,
         )
         return execution, runtime_profile, jobs
 
@@ -1330,7 +1338,10 @@ def _run_database_configured_linkedin(
             if not jobs:
                 continue
             lane_slug = execution.lane.archetype
-            save_result = supabase_utils.save_linkedin_jobs_canonicalized_with_mapping(jobs)
+            save_result = supabase_utils.save_linkedin_jobs_canonicalized_with_mapping(
+                jobs,
+                run_context=run_context,
+            )
             saved_job_ids.extend(save_result.canonical_ids)
             for job, canonical_id in zip(jobs, save_result.canonical_ids_by_input):
                 if canonical_id:

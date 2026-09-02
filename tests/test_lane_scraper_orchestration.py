@@ -1,5 +1,6 @@
 import json
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import scraper
@@ -76,7 +77,7 @@ def test_configured_queries_use_bounded_workers_and_isolated_runtime_profiles(mo
     monkeypatch.setattr(
         scraper.supabase_utils,
         "save_linkedin_jobs_canonicalized_with_mapping",
-        lambda jobs: supabase_utils.CanonicalSaveResult(
+        lambda jobs, run_context=None: supabase_utils.CanonicalSaveResult(
             canonical_ids=[f"canonical-{jobs[0]['archetype']}"],
             canonical_by_source={jobs[0]["job_id"]: f"canonical-{jobs[0]['archetype']}"},
             canonical_ids_by_input=[f"canonical-{jobs[0]['archetype']}"],
@@ -142,7 +143,7 @@ def test_configured_save_uses_per_input_canonical_mapping_for_filter_state(monke
     monkeypatch.setattr(
         scraper.supabase_utils,
         "save_linkedin_jobs_canonicalized_with_mapping",
-        lambda value: supabase_utils.CanonicalSaveResult(
+        lambda value, run_context=None: supabase_utils.CanonicalSaveResult(
             canonical_ids=["canonical-1"],
             canonical_by_source={"source-z": "canonical-1", "source-a": "canonical-1"},
             canonical_ids_by_input=["canonical-1", "canonical-1", "canonical-1"],
@@ -198,6 +199,84 @@ def test_production_query_function_serializes_shared_supabase_client(monkeypatch
     assert calls
 
     assert scraper.config.ENABLE_REPOST_DEDUP is True
+
+
+def test_configured_batches_share_one_write_through_canonical_snapshot(monkeypatch):
+    configured = configuration()
+    candidate_loads = []
+    inserted = []
+    updated = []
+    contexts = []
+
+    jobs = [
+        {
+            "job_id": "source-1",
+            "provider": "linkedin",
+            "company": "Acme",
+            "job_title": "Technical Program Manager",
+            "location": "Toronto, Ontario, Canada",
+            "description": "Own software delivery and cross-functional execution. " * 8,
+            "archetype": "technology_delivery",
+        },
+        {
+            "job_id": "source-2",
+            "provider": "linkedin",
+            "company": "Acme",
+            "job_title": "Technical Program Manager",
+            "location": "Toronto, Ontario, Canada",
+            "description": "Own software delivery and cross-functional execution. " * 8,
+            "archetype": "technology_delivery",
+        },
+    ]
+
+    def process(**kwargs):
+        contexts.append(kwargs["run_context"])
+        return [jobs[len(contexts) - 1]] if len(contexts) <= 2 else []
+
+    class UpdateQuery:
+        def update(self, payload):
+            updated.append(payload)
+            return self
+
+        def eq(self, *_args):
+            return self
+
+        def is_(self, *_args):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[{"job_id": "source-1"}])
+
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
+    monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
+    monkeypatch.setattr(scraper, "process_linkedin_query", process)
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "get_canonical_candidates",
+        lambda provider: candidate_loads.append(provider) or [],
+    )
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "save_job_to_supabase",
+        lambda payload: inserted.append(payload) or payload["job_id"],
+    )
+    monkeypatch.setattr(scraper.supabase_utils, "upsert_job_archetype_membership", lambda *_args: None)
+    monkeypatch.setattr(scraper.supabase_utils, "persist_lane_filter_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "supabase",
+        SimpleNamespace(table=lambda _name: UpdateQuery()),
+    )
+
+    saved = []
+    scraper._run_database_configured_linkedin(configured, saved)
+
+    assert candidate_loads == ["linkedin"]
+    assert len({id(context) for context in contexts}) == 1
+    assert len(inserted) == 1
+    assert len(updated) == 1
+    assert updated[0]["latest_job_id"] == "source-2"
+    assert saved[:2] == ["source-1", "source-1"]
 
 
 def test_process_query_persists_membership_for_already_known_canonical_job(monkeypatch):

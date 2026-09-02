@@ -10,8 +10,9 @@ import string
 import unicodedata
 import html
 import json
+import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
@@ -739,7 +740,102 @@ class CanonicalSaveResult:
     canonical_ids_by_input: list[str | None]
 
 
-def save_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult:
+def _candidate_source_ids(candidate: Mapping[str, Any]) -> set[str]:
+    source_ids = {
+        normalized
+        for value in (candidate.get("job_id"), candidate.get("latest_job_id"))
+        if (normalized := normalize_job_identifier(value)) is not None
+    }
+    source_ids.update(
+        identifier
+        for instance in (candidate.get("listing_instances") or [])
+        if isinstance(instance, Mapping)
+        and (identifier := normalize_job_identifier(instance.get("job_id"))) is not None
+    )
+    return source_ids
+
+
+@dataclass
+class CanonicalRunContext:
+    """Run-scoped canonical snapshots and indexes with write-through updates."""
+
+    candidates_by_provider: dict[str, list[dict]] = field(default_factory=dict)
+    existing_job_ids_by_provider: dict[str, set[str]] = field(default_factory=dict)
+    company_title_keys_by_provider: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
+    canonical_by_source_by_provider: dict[str, dict[str, str]] = field(default_factory=dict)
+    _load_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def candidates_for(self, provider: str) -> list[dict]:
+        if provider not in self.candidates_by_provider:
+            with self._load_lock:
+                if provider not in self.candidates_by_provider:
+                    candidates = get_canonical_candidates(provider=provider)
+                    existing_job_ids: set[str] = set()
+                    company_title_keys: set[tuple[str, str]] = set()
+                    canonical_by_source: dict[str, str] = {}
+                    for candidate in candidates:
+                        canonical_id = normalize_job_identifier(candidate.get("job_id"))
+                        source_ids = _candidate_source_ids(candidate)
+                        existing_job_ids.update(source_ids)
+                        if canonical_id is not None:
+                            canonical_by_source.update(
+                                {source_id: canonical_id for source_id in source_ids}
+                            )
+                        company = candidate.get("company")
+                        job_title = candidate.get("job_title")
+                        if company and job_title:
+                            company_title_keys.add(
+                                (company.strip().lower(), job_title.strip().lower())
+                            )
+                    self.existing_job_ids_by_provider[provider] = existing_job_ids
+                    self.company_title_keys_by_provider[provider] = company_title_keys
+                    self.canonical_by_source_by_provider[provider] = canonical_by_source
+                    # Publish last so racing readers cannot observe an
+                    # initialized snapshot with incomplete derived indexes.
+                    self.candidates_by_provider[provider] = candidates
+        return self.candidates_by_provider[provider]
+
+    def existing_indexes(self, provider: str) -> tuple[set[str], set[tuple[str, str]]]:
+        self.candidates_for(provider)
+        return (
+            self.existing_job_ids_by_provider[provider],
+            self.company_title_keys_by_provider[provider],
+        )
+
+    def canonical_ids_for_sources(self, provider: str, source_job_ids: list[str]) -> dict[str, str]:
+        self.candidates_for(provider)
+        index = self.canonical_by_source_by_provider[provider]
+        return {source_id: index[source_id] for source_id in source_job_ids if source_id in index}
+
+    def refresh_candidate(self, provider: str, candidate: Mapping[str, Any]) -> None:
+        """Update derived indexes after an insert or in-memory canonical mutation."""
+        with self._load_lock:
+            existing_ids = self.existing_job_ids_by_provider.setdefault(provider, set())
+            canonical_by_source = self.canonical_by_source_by_provider.setdefault(provider, {})
+            canonical_id = normalize_job_identifier(candidate.get("job_id"))
+            source_ids = _candidate_source_ids(candidate)
+            existing_ids.update(source_ids)
+            if canonical_id is not None:
+                canonical_by_source.update({source_id: canonical_id for source_id in source_ids})
+
+            company = candidate.get("company")
+            job_title = candidate.get("job_title")
+            if company and job_title:
+                self.company_title_keys_by_provider.setdefault(provider, set()).add(
+                    (company.strip().lower(), job_title.strip().lower())
+                )
+
+    def add_candidate(self, provider: str, candidate: dict) -> None:
+        self.candidates_for(provider)
+        with self._load_lock:
+            self.candidates_by_provider[provider].append(candidate)
+            self.refresh_candidate(provider, candidate)
+
+
+def save_jobs_canonicalized_with_mapping(
+    jobs_data: list,
+    run_context: CanonicalRunContext | None = None,
+) -> CanonicalSaveResult:
     """Save jobs and retain the canonical ID for every source input position."""
     candidates_cache = {}
     saved_job_ids: set[str] = set()
@@ -756,17 +852,21 @@ def save_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult
         job["job_id"] = job_id
         job.setdefault("scrape_run_id", scrape_run_id)
         if not getattr(config, "ENABLE_REPOST_DEDUP", True):
-            result = save_job_to_supabase(prepare_canonical_insert_payload(job))
+            persisted = prepare_canonical_insert_payload(job)
+            result = save_job_to_supabase(persisted)
             saved_job_id = normalize_job_identifier(result)
             if saved_job_id is not None:
                 saved_job_ids.add(saved_job_id)
                 canonical_by_source[job_id] = saved_job_id
                 upsert_job_archetype_membership(saved_job_id, job)
+                if run_context is not None:
+                    persisted["job_id"] = saved_job_id
+                    run_context.add_candidate(job.get("provider"), persisted)
             canonical_ids_by_input.append(saved_job_id)
             continue
 
         cache_key = job.get("provider")
-        candidates = candidates_cache.get(cache_key)
+        candidates = run_context.candidates_for(cache_key) if run_context is not None else candidates_cache.get(cache_key)
         if candidates is None:
             candidates = get_canonical_candidates(provider=cache_key)
             candidates_cache[cache_key] = candidates
@@ -813,18 +913,25 @@ def save_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult
                 upsert_job_archetype_membership(matched_job_id, job)
             canonical_ids_by_input.append(matched_job_id)
             match.update(payload)
+            if run_context is not None:
+                run_context.refresh_candidate(cache_key, match)
         else:
             payload = prepare_canonical_insert_payload(job)
             result = save_job_to_supabase(payload)
             saved_job_id = normalize_job_identifier(result)
             if saved_job_id is not None:
+                payload["job_id"] = saved_job_id
                 saved_job_ids.add(saved_job_id)
                 canonical_by_source[job_id] = saved_job_id
                 upsert_job_archetype_membership(saved_job_id, job)
+                if run_context is not None:
+                    run_context.add_candidate(cache_key, payload)
+                else:
+                    candidates.append(payload)
             canonical_ids_by_input.append(saved_job_id)
-            candidates.append(payload)
             if job.get("provider") == "linkedin" and getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True):
-                save_listing_content_version(job, canonical_job_id=payload["job_id"])
+                if saved_job_id is not None:
+                    save_listing_content_version(job, canonical_job_id=saved_job_id)
     return CanonicalSaveResult(
         canonical_ids=sorted(saved_job_ids),
         canonical_by_source=canonical_by_source,
@@ -832,19 +939,28 @@ def save_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult
     )
 
 
-def save_jobs_canonicalized(jobs_data: list) -> list[str]:
+def save_jobs_canonicalized(
+    jobs_data: list,
+    run_context: CanonicalRunContext | None = None,
+) -> list[str]:
     """Save jobs and return sorted, deduplicated canonical IDs."""
-    return save_jobs_canonicalized_with_mapping(jobs_data).canonical_ids
+    return save_jobs_canonicalized_with_mapping(jobs_data, run_context=run_context).canonical_ids
 
 
-def save_linkedin_jobs_canonicalized(jobs_data: list) -> list[str]:
+def save_linkedin_jobs_canonicalized(
+    jobs_data: list,
+    run_context: CanonicalRunContext | None = None,
+) -> list[str]:
     """Save LinkedIn jobs and return the same list[str] canonical-ID contract."""
-    return save_jobs_canonicalized(jobs_data)
+    return save_jobs_canonicalized(jobs_data, run_context=run_context)
 
 
-def save_linkedin_jobs_canonicalized_with_mapping(jobs_data: list) -> CanonicalSaveResult:
+def save_linkedin_jobs_canonicalized_with_mapping(
+    jobs_data: list,
+    run_context: CanonicalRunContext | None = None,
+) -> CanonicalSaveResult:
     """Save LinkedIn jobs with exact source/input-to-canonical correspondence."""
-    return save_jobs_canonicalized_with_mapping(jobs_data)
+    return save_jobs_canonicalized_with_mapping(jobs_data, run_context=run_context)
 
 # --- Supabase Functions ---
 def start_ingestion_run(

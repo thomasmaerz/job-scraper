@@ -4,6 +4,7 @@ from uuid import UUID
 import scraper
 import requests
 import freehire_compat
+import supabase_utils
 
 
 def _detail(job_id, search_card=None):
@@ -16,6 +17,42 @@ def _detail(job_id, search_card=None):
         "provider": "linkedin",
         "posted_at": (search_card or {}).get("posted_at"),
     }
+
+
+def test_run_context_supplies_tracking_source_index(monkeypatch):
+    cards = [{"job_id": "source-1", "posted_at": "2026-08-03"}]
+    captured = {}
+    run_context = supabase_utils.CanonicalRunContext(
+        candidates_by_provider={"linkedin": []},
+        existing_job_ids_by_provider={"linkedin": {"source-1"}},
+        company_title_keys_by_provider={"linkedin": set()},
+        canonical_by_source_by_provider={"linkedin": {"source-1": "canonical-1"}},
+    )
+
+    def tracking_context(_provider, _source_ids, canonical_by_source=None):
+        captured.update(canonical_by_source or {})
+        return {}
+
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda *_args, **_kwargs: cards)
+    monkeypatch.setattr(scraper.supabase_utils, "get_listing_tracking_context", tracking_context)
+    monkeypatch.setattr(scraper.supabase_utils, "start_ingestion_run", lambda *_args, **_kwargs: "run-1")
+    monkeypatch.setattr(scraper.supabase_utils, "finish_ingestion_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scraper.supabase_utils, "save_listing_observations", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scraper.supabase_utils, "save_listing_states", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scraper.supabase_utils, "upsert_job_archetype_membership", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scraper.supabase_utils, "get_incomplete_linkedin_metadata_ids", lambda _ids: set())
+    monkeypatch.setattr(scraper.supabase_utils, "get_existing_jobs_from_supabase", lambda: (_ for _ in ()).throw(AssertionError("unexpected full scan")))
+    monkeypatch.setattr(scraper.supabase_utils, "get_canonical_job_ids_for_sources", lambda *_args: (_ for _ in ()).throw(AssertionError("unexpected source scan")))
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_details", lambda *_args, **_kwargs: (None, {}))
+
+    scraper.process_linkedin_query(
+        "Technical Program Manager",
+        "Canada",
+        run_context=run_context,
+    )
+
+    assert captured == {"source-1": "canonical-1"}
 
 
 def test_known_card_observation_happens_before_bounded_relist_fetch(monkeypatch):

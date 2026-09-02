@@ -1136,7 +1136,11 @@ def record_scrape_success() -> bool:
     return True
 
 
-def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> dict[str, dict]:
+def get_listing_tracking_context(
+    provider: str,
+    source_job_ids: list[str],
+    canonical_by_source: Mapping[str, str] | None = None,
+) -> dict[str, dict]:
     ids = list(dict.fromkeys(str(job_id) for job_id in source_job_ids if job_id is not None))
     if not ids:
         return {}
@@ -1151,6 +1155,14 @@ def get_listing_tracking_context(provider: str, source_job_ids: list[str]) -> di
     for row in state_response.data or []:
         context[str(row["source_job_id"])] = dict(row)
     unresolved = set(ids) - set(context)
+    if canonical_by_source is not None:
+        for source_id in unresolved:
+            canonical_id = normalize_job_identifier(canonical_by_source.get(source_id))
+            if canonical_id is not None:
+                context.setdefault(source_id, {})["canonical_job_id"] = canonical_id
+        # The supplied index is authoritative for this run. IDs absent from it
+        # are genuinely new and must not trigger a repeated full JSON scan.
+        unresolved.clear()
     if unresolved:
         offset = 0
         while unresolved:

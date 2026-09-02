@@ -708,7 +708,18 @@ def process_linkedin_query(
     unique_linkedin_job_ids = list(card_by_job_id.keys())
 
     tracking_context = (
-        supabase_utils.get_listing_tracking_context("linkedin", unique_linkedin_job_ids)
+        supabase_utils.get_listing_tracking_context(
+            "linkedin",
+            unique_linkedin_job_ids,
+            canonical_by_source=(
+                run_context.canonical_ids_for_sources(
+                    "linkedin",
+                    unique_linkedin_job_ids,
+                )
+                if run_context is not None
+                else None
+            ),
+        )
         if tracking_enabled
         else {}
     )

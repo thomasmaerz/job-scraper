@@ -1,6 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import time 
 import random 
 import logging
@@ -13,6 +14,7 @@ import json
 import uuid
 import math
 import threading
+import os
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode, urlparse
 import relist_tracking
@@ -29,6 +31,74 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 _relist_detail_fetches_used = 0
 _relist_detail_fetches_lock = threading.Lock()
 _linkedin_scrape_state = threading.local()
+
+
+class LinkedInAccessDenied(RuntimeError):
+    """Stop the complete run when LinkedIn explicitly denies access."""
+
+
+class LinkedInRequestFailed(RuntimeError):
+    """Stop the complete run when required LinkedIn coverage is incomplete."""
+
+
+class LinkedInQueryJobs(list):
+    """List-compatible query result that carries operational completeness."""
+
+    def __init__(
+        self,
+        jobs=(),
+        *,
+        processing_complete: bool = True,
+        incomplete_reason: str | None = None,
+    ):
+        super().__init__(jobs)
+        self.processing_complete = processing_complete
+        self.incomplete_reason = incomplete_reason
+
+
+class _LinkedInDetailUnavailable:
+    """Falsey marker for a confirmed terminal LinkedIn detail response."""
+
+    def __bool__(self) -> bool:
+        return False
+
+
+LINKEDIN_DETAIL_UNAVAILABLE = _LinkedInDetailUnavailable()
+
+
+class LinkedInRequestLimiter:
+    """Apply one polite request cadence across search and detail endpoints."""
+
+    def __init__(self, minimum_interval_ms: int, jitter_ms: int = 1_500):
+        self.minimum_interval_seconds = max(0, minimum_interval_ms) / 1000
+        self.jitter_seconds = max(0, jitter_ms) / 1000
+        self._last_request_started_at: float | None = None
+        self._lock = threading.Lock()
+        self.request_count = 0
+        self.total_wait_seconds = 0.0
+
+    def wait(self) -> float:
+        with self._lock:
+            now = time.monotonic()
+            target_interval = self.minimum_interval_seconds + random.uniform(
+                0, self.jitter_seconds
+            )
+            elapsed = (
+                target_interval
+                if self._last_request_started_at is None
+                else now - self._last_request_started_at
+            )
+            wait_seconds = max(0.0, target_interval - elapsed)
+            if wait_seconds:
+                logging.info(
+                    "Waiting %.2f seconds for global LinkedIn request pacing...",
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+            self._last_request_started_at = time.monotonic()
+            self.request_count += 1
+            self.total_wait_seconds += wait_seconds
+            return wait_seconds
 
 
 def resolve_linkedin_lookback_hours(
@@ -315,6 +385,7 @@ def _fetch_linkedin_job_ids(
     work_types: str | None = None,
     geo_id_is_explicit: bool = False,
     request_delay_ms: int | None = None,
+    request_limiter: LinkedInRequestLimiter | None = None,
 ) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
@@ -349,7 +420,9 @@ def _fetch_linkedin_job_ids(
             + urlencode(query_parameters)
         )
 
-        if start > 0:
+        if request_limiter is not None:
+            request_limiter.wait()
+        elif start > 0:
             sleep_time = (
                 request_delay_ms / 1000
                 if request_delay_ms is not None
@@ -371,36 +444,48 @@ def _fetch_linkedin_job_ids(
         while retries <= config.MAX_RETRIES:
             try:
                 res = requests.get(target_url, headers=headers, timeout=config.REQUEST_TIMEOUT)
+                if _linkedin_response_is_challenge(res):
+                    raise LinkedInAccessDenied(
+                        f"LinkedIn denied or challenged search access (status={res.status_code})"
+                    )
                 res.raise_for_status()
                 break
+            except LinkedInAccessDenied:
+                raise
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 429 and retries < config.MAX_RETRIES:
                     retries += 1
-                    wait_time = config.RETRY_DELAY_SECONDS + random.uniform(0, 5) 
+                    wait_time = max(
+                        _retry_after_seconds(e.response) or 0,
+                        config.RETRY_DELAY_SECONDS + random.uniform(0, 5),
+                    )
                     
                     logging.warning(f"Error 429: Too Many Requests. Retrying attempt {retries}/{config.MAX_RETRIES} after {wait_time:.2f} seconds...")
                     time.sleep(wait_time)
 
-                    user_agent = random.choice(user_agents.USER_AGENTS)
-                    headers = {'User-Agent': user_agent}
-                
-                    logging.info(f"Retrying with new User-Agent: {user_agent}")
+                    logging.info("Retrying search request after LinkedIn cooldown")
+                    if request_limiter is not None:
+                        request_limiter.wait()
                     continue
+                if e.response.status_code == 429:
+                    raise LinkedInRequestFailed(
+                        "LinkedIn search throttling exhausted the retry budget"
+                    ) from e
                 else:
                     
                     logging.error(f"HTTP Error fetching search results page: {e}")
                     res = None 
                     break
             except requests.exceptions.RequestException as e:
-                
-                logging.error(f"Request Exception fetching search results page: {e}")
-                res = None
-                break
+                raise LinkedInRequestFailed(
+                    f"LinkedIn search request failed: {e}"
+                ) from e
 
         
         if res is None:
-            logging.error(f"Failed to fetch {target_url} after {retries} retries. Stopping pagination for this query.")
-            break 
+            raise LinkedInRequestFailed(
+                f"Failed to fetch {target_url} after {retries} retries"
+            )
 
         if not res.text:
             
@@ -440,17 +525,61 @@ def _fetch_linkedin_job_ids(
     logging.info(f"--- Finished Phase 1: Found {len(scraped_cards)} unique job IDs during scraping ---")
     return scraped_cards
 
-def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) -> tuple[dict, dict] | None:
+
+def _linkedin_max_start_for_pages(max_pages: int) -> int:
+    """Translate an exact page count into LinkedIn's 10-result start offset."""
+    if max_pages < 1:
+        raise ValueError("max_pages must be at least 1")
+    return (max_pages - 1) * 10
+
+
+def _retry_after_seconds(response) -> float | None:
+    value = (getattr(response, "headers", None) or {}).get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def _linkedin_response_is_challenge(response) -> bool:
+    if getattr(response, "status_code", None) in (403, 999):
+        return True
+    url = str(getattr(response, "url", "") or "").lower()
+    if "/checkpoint/" in url or "/challenge/" in url:
+        return True
+    text = (getattr(response, "text", "") or "")[:2_000].lower()
+    return (
+        "<title>security verification" in text
+        or 'id="challenge-page"' in text
+        or "id='challenge-page'" in text
+    )
+
+
+def _fetch_linkedin_job_details(
+    job_id: str,
+    search_card: dict | None = None,
+    request_limiter: LinkedInRequestLimiter | None = None,
+) -> tuple[dict, dict] | _LinkedInDetailUnavailable | None:
     """Fetch job content and detail metadata, returned as separate dictionaries."""
 
     job_detail_url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
 
     logging.info(f"Preparing to fetch details for job ID: {job_id}")
 
-    sleep_time = random.uniform(3.0, 10.0)
-
-    logging.info(f"Waiting for {sleep_time:.2f} seconds before fetching details...")
-    time.sleep(sleep_time)
+    if request_limiter is None:
+        sleep_time = random.uniform(3.0, 10.0)
+        logging.info(f"Waiting for {sleep_time:.2f} seconds before fetching details...")
+        time.sleep(sleep_time)
+    else:
+        request_limiter.wait()
 
     user_agent = random.choice(user_agents.USER_AGENTS)
     headers = {'User-Agent': user_agent}
@@ -465,28 +594,56 @@ def _fetch_linkedin_job_details(job_id: str, search_card: dict | None = None) ->
     while retries <= config.MAX_RETRIES:
         try:
             resp = requests.get(job_detail_url, headers=headers, timeout=config.REQUEST_TIMEOUT)
+            if _linkedin_response_is_challenge(resp):
+                raise LinkedInAccessDenied(
+                    f"LinkedIn denied or challenged detail access (status={resp.status_code})"
+                )
             resp.raise_for_status()
             break
+        except LinkedInAccessDenied:
+            raise
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429 and retries < config.MAX_RETRIES:
+            if e.response.status_code in (429, 500, 502, 503, 504) and retries < config.MAX_RETRIES:
                 retries += 1
-                wait_time = config.RETRY_DELAY_SECONDS + random.uniform(0, 5) 
+                wait_time = max(
+                    _retry_after_seconds(e.response) or 0,
+                    config.RETRY_DELAY_SECONDS + random.uniform(0, 5),
+                )
                 
-                logging.warning(f"Error 429 for job ID {job_id}. Retrying attempt {retries}/{config.MAX_RETRIES} after {wait_time:.2f} seconds...")
+                logging.warning(
+                    "HTTP %s for job ID %s. Retrying attempt %s/%s after %.2f seconds...",
+                    e.response.status_code,
+                    job_id,
+                    retries,
+                    config.MAX_RETRIES,
+                    wait_time,
+                )
                 time.sleep(wait_time)
-                user_agent = random.choice(user_agents.USER_AGENTS)
-                headers = {'User-Agent': user_agent}
-            
-                logging.info(f"Retrying job {job_id} with new User-Agent: {user_agent}")
+                logging.info(
+                    "Retrying job %s after LinkedIn cooldown with the same request identity",
+                    job_id,
+                )
+                if request_limiter is not None:
+                    request_limiter.wait()
                 continue
-            else:
-                
-                logging.error(f"HTTP Error fetching details for job ID {job_id}: {e}")
-                return None
+            if e.response.status_code in (429, 500, 502, 503, 504):
+                raise LinkedInRequestFailed(
+                    f"LinkedIn detail HTTP {e.response.status_code} exhausted retries for job {job_id}"
+                ) from e
+            if e.response.status_code in (404, 410):
+                logging.info(
+                    "LinkedIn detail is no longer available for job ID %s (status=%s)",
+                    job_id,
+                    e.response.status_code,
+                )
+                return LINKEDIN_DETAIL_UNAVAILABLE
+            raise LinkedInRequestFailed(
+                f"LinkedIn detail HTTP {e.response.status_code} failed for job {job_id}"
+            ) from e
         except requests.exceptions.RequestException as e:
-            
-            logging.error(f"Request Exception fetching details for job ID {job_id}: {e}")
-            return None 
+            raise LinkedInRequestFailed(
+                f"LinkedIn detail request failed for job {job_id}: {e}"
+            ) from e
 
     
     if resp is None:
@@ -625,6 +782,7 @@ def process_linkedin_query(
     runtime_profile: dict | None = None,
     relist_budget: int | None = None,
     run_context: supabase_utils.CanonicalRunContext | None = None,
+    request_limiter: LinkedInRequestLimiter | None = None,
 ) -> list[dict]:
     """
     Orchestrates scraping and detail fetching for a single query,
@@ -676,8 +834,29 @@ def process_linkedin_query(
         fetch_options["geo_id_is_explicit"] = True
     if request_delay_ms is not None:
         fetch_options["request_delay_ms"] = request_delay_ms
+    if request_limiter is not None:
+        fetch_options["request_limiter"] = request_limiter
     _linkedin_scrape_state.coverage = {"pages_attempted": 0, "pages_completed": 0}
-    scraped_cards = _fetch_linkedin_job_ids(search_query, location, **fetch_options)
+    try:
+        scraped_cards = _fetch_linkedin_job_ids(search_query, location, **fetch_options)
+    except (LinkedInAccessDenied, LinkedInRequestFailed) as exc:
+        coverage = getattr(
+            _linkedin_scrape_state,
+            "coverage",
+            {"pages_attempted": 0, "pages_completed": 0},
+        )
+        if tracking_enabled:
+            supabase_utils.finish_ingestion_run(
+                run_id,
+                status="failed",
+                pages_attempted=coverage["pages_attempted"],
+                pages_completed=coverage["pages_completed"],
+                cards_seen=0,
+                detail_budget_used=0,
+                coverage_complete=False,
+                coverage_reason=str(exc),
+            )
+        raise
     coverage = getattr(
         _linkedin_scrape_state,
         "coverage",
@@ -695,7 +874,10 @@ def process_linkedin_query(
                 coverage_reason="zero cards; empty result or parser/request failure",
             )
         logging.info("No job IDs found in Phase 1. Skipping detail fetching.")
-        return []
+        return LinkedInQueryJobs(
+            processing_complete=False,
+            incomplete_reason="zero cards; empty result or parser/request failure",
+        )
 
     normalized_cards = []
     for card in scraped_cards:
@@ -880,7 +1062,7 @@ def process_linkedin_query(
                 coverage_reason="LinkedIn guest recent-window search cannot prove absence",
             )
         logging.info("No new job IDs to process after filtering.")
-        return []
+        return LinkedInQueryJobs()
 
     if limit is not None and len(job_ids_to_process) > limit:
         logging.info(f"Truncating job_ids_to_process from {len(job_ids_to_process)} to {limit} to stay within source limit.")
@@ -889,11 +1071,31 @@ def process_linkedin_query(
     logging.info(f"\n--- Starting Phase 2: Fetching Job Details for {len(job_ids_to_process)} IDs ---")
     detailed_new_jobs = []
     processed_count = 0
+    terminal_unavailable_count = 0
 
     ids_to_fetch = job_ids_to_process
     for job_id in ids_to_fetch:
-        detail_result = _fetch_linkedin_job_details(job_id, search_card=card_by_job_id.get(job_id))
-        if detail_result:
+        detail_fetch_options = {"search_card": card_by_job_id.get(job_id)}
+        if request_limiter is not None:
+            detail_fetch_options["request_limiter"] = request_limiter
+        try:
+            detail_result = _fetch_linkedin_job_details(job_id, **detail_fetch_options)
+        except (LinkedInAccessDenied, LinkedInRequestFailed) as exc:
+            if tracking_enabled:
+                supabase_utils.finish_ingestion_run(
+                    run_id,
+                    status="failed",
+                    pages_attempted=coverage["pages_attempted"],
+                    pages_completed=coverage["pages_completed"],
+                    cards_seen=len(normalized_cards),
+                    detail_budget_used=processed_count,
+                    coverage_complete=False,
+                    coverage_reason=str(exc),
+                )
+            raise
+        if detail_result is LINKEDIN_DETAIL_UNAVAILABLE:
+            terminal_unavailable_count += 1
+        elif detail_result:
             details, detail_metadata = detail_result
             details = {**details, **detail_metadata}
             if not fetch_descriptions:
@@ -941,11 +1143,12 @@ def process_linkedin_query(
             logging.warning(f"Skipping job ID {job_id} as detail fetching failed or returned no data.") 
 
 
+    completed_detail_count = processed_count + terminal_unavailable_count
     logging.info(f"--- Finished Phase 2: Successfully fetched details for {processed_count} new job(s) ---")
     if tracking_enabled:
         supabase_utils.finish_ingestion_run(
             run_id,
-            status="complete" if processed_count == len(ids_to_fetch) else "incomplete",
+            status="complete" if completed_detail_count == len(ids_to_fetch) else "incomplete",
             pages_attempted=coverage["pages_attempted"],
             pages_completed=coverage["pages_completed"],
             cards_seen=len(normalized_cards),
@@ -953,11 +1156,20 @@ def process_linkedin_query(
             coverage_complete=False,
             coverage_reason=(
                 "LinkedIn guest recent-window search cannot prove absence"
-                if processed_count == len(ids_to_fetch)
-                else f"detail validation accepted {processed_count} of {len(ids_to_fetch)} selected IDs"
+                if completed_detail_count == len(ids_to_fetch)
+                else f"detail validation accepted {completed_detail_count} of {len(ids_to_fetch)} selected IDs"
             ),
         )
-    return detailed_new_jobs
+    processing_complete = completed_detail_count == len(ids_to_fetch)
+    return LinkedInQueryJobs(
+        detailed_new_jobs,
+        processing_complete=processing_complete,
+        incomplete_reason=(
+            None
+            if processing_complete
+            else f"detail validation accepted {completed_detail_count} of {len(ids_to_fetch)} selected IDs"
+        ),
+    )
 
 def _fetch_careers_future_jobs(search_query: str) -> list:
     """
@@ -1252,13 +1464,13 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
 def _run_database_configured_linkedin(
     scrape_config: ScrapeConfiguration,
     saved_job_ids: list[str],
-) -> None:
+) -> bool:
     global _relist_detail_fetches_used
     settings = scrape_config.settings
     last_success_at = supabase_utils.get_last_successful_scrape_at() or config.LINKEDIN_LAST_SUCCESS_AT
     if not settings.scraping_enabled:
         logging.info("LinkedIn scraping disabled by scrape_settings.scraping_enabled")
-        return
+        return False
     lookback_hours = resolve_linkedin_lookback_hours(
         last_success_at,
         configured_hours=settings.lookback_days * 24,
@@ -1279,7 +1491,23 @@ def _run_database_configured_linkedin(
     config.ENABLE_REPOST_DEDUP = settings.deduplicate_jobs
     _relist_detail_fetches_used = 0
     run_context = supabase_utils.CanonicalRunContext()
-    executions = build_search_executions(scrape_config)
+    request_limiter = LinkedInRequestLimiter(
+        minimum_interval_ms=max(
+            2_500,
+            int(settings.options.get("global_request_interval_ms", settings.request_delay_ms)),
+        ),
+        jitter_ms=int(settings.options.get("request_jitter_ms", 1_500)),
+    )
+    archetype_override = os.getenv("SCRAPE_ARCHETYPE")
+    executions = build_search_executions(
+        scrape_config,
+        archetype_override=archetype_override,
+    )
+    if archetype_override and archetype_override.strip():
+        logging.info(
+            "LinkedIn scrape restricted by SCRAPE_ARCHETYPE=%s",
+            executions[0].lane.archetype,
+        )
     query_relist_limit = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_QUERY", 3)
     run_relist_remaining = getattr(config, "LINKEDIN_RELIST_REFRESH_LIMIT_PER_RUN", 20)
     work_items = []
@@ -1317,13 +1545,14 @@ def _run_database_configured_linkedin(
             location_scope=execution.geography.location_scope.value,
             geography_id=execution.geography.geography_id,
             geo_id=execution.geography.geo_id,
-            max_start=(settings.max_pages_per_query - 1) * 25,
+            max_start=_linkedin_max_start_for_pages(settings.max_pages_per_query),
             request_delay_ms=settings.request_delay_ms,
             fetch_descriptions=settings.fetch_descriptions,
             geo_id_is_explicit=True,
             runtime_profile=runtime_profile,
             relist_budget=relist_budget,
             run_context=run_context,
+            request_limiter=request_limiter,
         )
         return execution, runtime_profile, jobs
 
@@ -1345,7 +1574,15 @@ def _run_database_configured_linkedin(
             fetched_results = list(executor.map(fetch_execution, work_items))
 
         # Canonical persistence and lane-state writes remain serialized.
+        incomplete_queries = []
         for execution, runtime_profile, jobs in fetched_results:
+            if not getattr(jobs, "processing_complete", True):
+                incomplete_queries.append(
+                    (
+                        execution.query.query_id,
+                        getattr(jobs, "incomplete_reason", None) or "query processing incomplete",
+                    )
+                )
             if not jobs:
                 continue
             lane_slug = execution.lane.archetype
@@ -1362,21 +1599,37 @@ def _run_database_configured_linkedin(
                         job,
                         runtime_profile=runtime_profile,
                     )
+        if incomplete_queries:
+            summary = "; ".join(
+                f"{query_id}: {reason}" for query_id, reason in incomplete_queries
+            )
+            raise LinkedInRequestFailed(
+                f"LinkedIn configured query coverage incomplete: {summary}"
+            )
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+        logging.info(
+            "LinkedIn request pacing summary: requests=%s wait_seconds=%.2f",
+            request_limiter.request_count,
+            request_limiter.total_wait_seconds,
+        )
         config.ENABLE_REPOST_DEDUP = previous_repost_dedup
+    return not bool(archetype_override and archetype_override.strip())
 
 
 def main() -> list[str]:
     """Run configured scrapers and return the canonical job IDs that were saved."""
     saved_job_ids: list[str] = []
+    complete_linkedin_coverage = False
 
     # Get jobs from LinkedIn
     if "linkedin" in config.SCRAPING_SOURCES:
         logging.info("\n--- Starting LinkedIn Job Scraping ---")
         scrape_config = load_scrape_configuration(db=supabase_utils.supabase)
-        _run_database_configured_linkedin(scrape_config, saved_job_ids)
+        complete_linkedin_coverage = _run_database_configured_linkedin(
+            scrape_config, saved_job_ids
+        )
     else:
         logging.info("\n--- Skipping LinkedIn Job Scraping per config ---")
 
@@ -1406,8 +1659,13 @@ def main() -> list[str]:
     # --- End of Script ---
     logging.info(f"\n{'='*20} Job scraping script finished {'='*20}")
     logging.info(f"Total new jobs saved across all queries: {len(saved_job_ids)}")
-    if not supabase_utils.record_scrape_success():
-        raise RuntimeError("Failed to persist scrape success watermark")
+    if "linkedin" not in config.SCRAPING_SOURCES or complete_linkedin_coverage:
+        if not supabase_utils.record_scrape_success():
+            raise RuntimeError("Failed to persist scrape success watermark")
+    else:
+        logging.info(
+            "Skipped global scrape watermark for partial SCRAPE_ARCHETYPE recovery"
+        )
     return saved_job_ids
 
 

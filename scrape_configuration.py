@@ -22,7 +22,7 @@ from pydantic import (
     model_validator,
 )
 
-from lane_catalog import CANONICAL_LANE_SLUGS
+from lane_catalog import CANONICAL_LANE_SLUGS, canonical_lane_slug
 
 
 class ScrapeConfigurationError(RuntimeError):
@@ -145,6 +145,28 @@ class ScrapeSettings(BaseModel):
     options: dict[str, Any]
     updated_at: StrictStr
 
+    @model_validator(mode="after")
+    def validate_linkedin_pacing_options(self) -> "ScrapeSettings":
+        interval = self.options.get("global_request_interval_ms")
+        if interval is not None and (
+            not isinstance(interval, int)
+            or isinstance(interval, bool)
+            or not 2_500 <= interval <= 60_000
+        ):
+            raise ValueError(
+                "options.global_request_interval_ms must be an integer from 2500 to 60000"
+            )
+        jitter = self.options.get("request_jitter_ms")
+        if jitter is not None and (
+            not isinstance(jitter, int)
+            or isinstance(jitter, bool)
+            or not 0 <= jitter <= 10_000
+        ):
+            raise ValueError(
+                "options.request_jitter_ms must be an integer from 0 to 10000"
+            )
+        return self
+
 
 class ScrapeConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -230,11 +252,34 @@ def expand_location_scopes(scopes: list[LocationRegion]) -> tuple[LinkedInGeogra
     return tuple(expanded)
 
 
-def build_search_executions(configuration: ScrapeConfiguration) -> tuple[LinkedInSearchExecution, ...]:
+def build_search_executions(
+    configuration: ScrapeConfiguration,
+    archetype_override: str | None = None,
+) -> tuple[LinkedInSearchExecution, ...]:
+    requested_archetype = (
+        canonical_lane_slug(archetype_override)
+        if archetype_override and archetype_override.strip()
+        else None
+    )
+    if requested_archetype and requested_archetype not in CANONICAL_LANE_SLUGS:
+        expected = ", ".join(CANONICAL_LANE_SLUGS)
+        raise ScrapeConfigurationError(
+            f"Unknown SCRAPE_ARCHETYPE '{archetype_override}'. Expected one of: {expected}"
+        )
+
     lanes = sorted(
-        (lane for lane in configuration.lanes if lane.enabled),
+        (
+            lane
+            for lane in configuration.lanes
+            if lane.enabled
+            and (requested_archetype is None or lane.archetype == requested_archetype)
+        ),
         key=lambda lane: (lane.sort_order, lane.archetype),
     )
+    if requested_archetype and not lanes:
+        raise ScrapeConfigurationError(
+            f"SCRAPE_ARCHETYPE '{requested_archetype}' is disabled in scrape configuration"
+        )
     return tuple(
         LinkedInSearchExecution(lane=lane, query=query, geography=geography)
         for lane in lanes

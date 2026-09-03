@@ -12,6 +12,11 @@ on:
         default: "48"
         type: choice
         options: ["24", "48", "72", "96", "168"]
+      archetype:
+        description: "Optional single canonical lane for manual recovery; blank scrapes all enabled lanes"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: linkedin-freehire-pipeline
@@ -53,9 +58,11 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPE_ARCHETYPE: ${{ inputs.archetype || '' }}
         run: python scraper.py
 
   freehire_compat:
+    if: ${{ inputs.archetype == '' || inputs.archetype == null }}
     needs: scrape
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -80,39 +87,9 @@ jobs:
           FREEHIRE_CLASSIFY_LIMIT: "300"
         run: python incremental_freehire_compat.py
 
-  analyze_jobs:
-    needs: freehire_compat
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    concurrency:
-      group: linkedin-job-insights-analysis
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Incrementally analyze job insights
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY || secrets.GEMINI_FIRST_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          JOB_INSIGHTS_ARCHETYPE: ""
-          JOB_INSIGHTS_BACKFILL_ALL: "false"
-          JOB_INSIGHTS_REPLACEMENT_BACKFILL: "false"
-          JOB_INSIGHTS_MAX_JOBS: "100"
-        run: python analyze_jobs.py
-
   publication_gate:
-    if: ${{ always() }}
-    needs: [scrape, freehire_compat, analyze_jobs]
+    if: ${{ always() && (inputs.archetype == '' || inputs.archetype == null) }}
+    needs: [scrape, freehire_compat]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -138,4 +115,3 @@ jobs:
           python publication_gate.py
           --scrape-result "${{ needs.scrape.result }}"
           --freehire-compat-result "${{ needs.freehire_compat.result }}"
-          --analyze-jobs-result "${{ needs.analyze_jobs.result }}"

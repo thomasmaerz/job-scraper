@@ -645,3 +645,20 @@ def test_main_fails_when_required_watermark_cannot_be_persisted(monkeypatch):
         assert str(error) == "Failed to persist scrape success watermark"
     else:
         raise AssertionError("main() should require watermark persistence")
+
+
+def test_main_does_not_advance_global_watermark_for_single_lane_recovery(monkeypatch):
+    monkeypatch.setattr(scraper.config, "SCRAPING_SOURCES", {"linkedin"})
+    monkeypatch.setattr(scraper, "load_scrape_configuration", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        scraper,
+        "_run_database_configured_linkedin",
+        lambda _configuration, _saved_ids: False,
+    )
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "record_scrape_success",
+        lambda: (_ for _ in ()).throw(AssertionError("partial run advanced watermark")),
+    )
+
+    assert scraper.main() == []

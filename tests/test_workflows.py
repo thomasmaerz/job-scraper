@@ -25,8 +25,8 @@ def test_downstream_workflows_default_to_enabled_lanes_with_optional_override():
     assert score_step["env"]["JOB_SCORE_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
     resume_step = next(step for step in resume["jobs"]["customize_resumes"]["steps"] if step["name"] == "Run resume customization script")
     assert resume_step["env"]["JOB_RESUME_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
-    hourly_step = next(step for step in hourly["jobs"]["analyze_jobs"]["steps"] if step.get("name") == "Incrementally analyze job insights")
-    assert hourly_step["env"]["JOB_INSIGHTS_ARCHETYPE"] == ""
+    scrape_step = next(step for step in hourly["jobs"]["scrape"]["steps"] if step.get("name") == "Run scraper script")
+    assert scrape_step["env"]["SCRAPE_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
 
 
 def test_scrape_workflow_allows_multi_lane_serial_runtime():
@@ -60,6 +60,7 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
         "timezone": "America/New_York",
     }]
     assert triggers(workflow)["workflow_dispatch"]["inputs"]["lookback_hours"]["default"] == "48"
+    assert triggers(workflow)["workflow_dispatch"]["inputs"]["archetype"]["default"] == ""
     assert workflow["concurrency"] == {
         "group": "linkedin-freehire-pipeline",
         "cancel-in-progress": False,
@@ -89,18 +90,14 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
     assert list(jobs) == [
         "scrape",
         "freehire_compat",
-        "analyze_jobs",
         "publication_gate",
     ]
     assert jobs["freehire_compat"]["needs"] == "scrape"
-    assert jobs["analyze_jobs"]["needs"] == "freehire_compat"
-    assert jobs["publication_gate"]["needs"] == ["scrape", "freehire_compat", "analyze_jobs"]
+    assert jobs["freehire_compat"]["if"] == (
+        "${{ inputs.archetype == '' || inputs.archetype == null }}"
+    )
+    assert jobs["publication_gate"]["needs"] == ["scrape", "freehire_compat"]
     assert jobs["freehire_compat"]["timeout-minutes"] == 45
-    assert jobs["analyze_jobs"]["timeout-minutes"] == 45
-    assert jobs["analyze_jobs"]["concurrency"] == {
-        "group": "linkedin-job-insights-analysis",
-        "cancel-in-progress": False,
-    }
     assert jobs["publication_gate"]["timeout-minutes"] == 10
 
     compat_step = jobs["freehire_compat"]["steps"][-1]
@@ -108,11 +105,11 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
     assert compat_step["env"]["FREEHIRE_DRAIN_BACKLOG"] == "false"
     assert compat_step["run"] == "python incremental_freehire_compat.py"
 
-    analyze_step = jobs["analyze_jobs"]["steps"][-1]
-    assert analyze_step["env"]["JOB_INSIGHTS_MAX_JOBS"] == "100"
-    assert analyze_step["env"]["JOB_INSIGHTS_BACKFILL_ALL"] == "false"
-    assert analyze_step["env"]["JOB_INSIGHTS_REPLACEMENT_BACKFILL"] == "false"
-    assert analyze_step["run"] == "python analyze_jobs.py"
+    analyze = load_workflow("analyze_jobs.yml")
+    assert triggers(analyze)["workflow_run"] == {
+        "workflows": ["Hourly Job Publication Pipeline"],
+        "types": ["completed"],
+    }
 
 
 def test_publication_gate_checks_results_and_production_contract():
@@ -120,11 +117,11 @@ def test_publication_gate_checks_results_and_production_contract():
     gate = workflow["jobs"]["publication_gate"]
     run = gate["steps"][-1]["run"]
 
-    assert gate["if"] == "${{ always() }}"
+    assert gate["if"] == "${{ always() && (inputs.archetype == '' || inputs.archetype == null) }}"
     assert "python publication_gate.py" in run
     assert '--scrape-result "${{ needs.scrape.result }}"' in run
     assert '--freehire-compat-result "${{ needs.freehire_compat.result }}"' in run
-    assert '--analyze-jobs-result "${{ needs.analyze_jobs.result }}"' in run
+    assert "--analyze-jobs-result" not in run
     assert gate["outputs"]["scrape_watermark"] == "${{ steps.gate.outputs.scrape_watermark }}"
     assert gate["outputs"]["generation"] == "${{ steps.gate.outputs.generation }}"
     assert gate["outputs"]["schema_version"] == "${{ steps.gate.outputs.schema_version }}"
@@ -170,16 +167,24 @@ def test_freehire_recovery_is_manual_bounded_and_dry_run_by_default():
     assert "backfill_freehire_compat.py" in run
 
 
-def test_analyze_recovery_is_manual_only_and_serialized():
+def test_analyze_worker_runs_after_successful_source_pipeline_and_is_serialized():
     workflow = load_workflow("analyze_jobs.yml")
 
-    assert "schedule" not in triggers(workflow)
+    assert triggers(workflow)["workflow_run"] == {
+        "workflows": ["Hourly Job Publication Pipeline"],
+        "types": ["completed"],
+    }
     assert "workflow_dispatch" in triggers(workflow)
     assert "concurrency" not in workflow
     assert workflow["jobs"]["analyze"]["concurrency"] == {
         "group": "linkedin-job-insights-analysis",
         "cancel-in-progress": False,
     }
+    assert workflow["jobs"]["analyze"]["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' || "
+        "(github.event.workflow_run.conclusion == 'success' && "
+        "github.event.workflow_run.event == 'schedule') }}"
+    )
     assert workflow["permissions"] == {"contents": "read"}
     assert workflow["jobs"]["analyze"]["timeout-minutes"] == 120
 

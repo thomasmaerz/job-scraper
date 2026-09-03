@@ -63,13 +63,6 @@ WHERE state.id = 1
   )
 ON CONFLICT (generation) DO NOTHING;
 
-DELETE FROM public.freehire_publication_snapshots AS snapshot
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM public.freehire_publication_generations AS retained
-    WHERE retained.generation = snapshot.generation
-);
-
 DO $migration$
 BEGIN
     IF NOT EXISTS (
@@ -83,18 +76,11 @@ BEGIN
             FOREIGN KEY (generation)
             REFERENCES public.freehire_publication_generations(generation)
             ON DELETE CASCADE
-            DEFERRABLE INITIALLY DEFERRED;
+            DEFERRABLE INITIALLY DEFERRED
+            NOT VALID;
     END IF;
 END;
 $migration$;
-
-DELETE FROM public.freehire_publication_generations AS expired
-WHERE expired.generation NOT IN (
-    SELECT retained.generation
-    FROM public.freehire_publication_generations AS retained
-    ORDER BY retained.generation DESC
-    LIMIT 3
-);
 
 CREATE OR REPLACE FUNCTION public.finalize_freehire_publication(
     p_source_scrape_watermark timestamptz
@@ -109,6 +95,7 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
+SET statement_timeout = '60s'
 AS $function$
 DECLARE
     current_state public.freehire_publication_state%ROWTYPE;
@@ -120,7 +107,6 @@ DECLARE
     snapshot_count bigint;
 BEGIN
     PERFORM pg_catalog.set_config('lock_timeout', '10s', true);
-    PERFORM pg_catalog.set_config('statement_timeout', '5min', true);
     PERFORM pg_catalog.set_config('idle_in_transaction_session_timeout', '6min', true);
 
     IF p_source_scrape_watermark IS NULL THEN
@@ -270,20 +256,56 @@ BEGIN
 
     -- A generation is complete only after its completion row is inserted.
     -- Deleting older completion rows cascades their immutable snapshot rows.
-    DELETE FROM public.freehire_publication_generations AS expired
-    WHERE expired.generation NOT IN (
-        SELECT retained.generation
-        FROM public.freehire_publication_generations AS retained
-        ORDER BY retained.generation DESC
-        LIMIT 3
-    );
-
     RETURN QUERY SELECT
         completed_generation.generation,
         completed_generation.published_at,
         completed_generation.source_scrape_watermark,
         completed_generation.row_count,
         completed_generation.schema_version;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.prune_freehire_publication_generations(
+    p_keep_generations integer DEFAULT 3,
+    p_max_generations integer DEFAULT 3
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+SET statement_timeout = '60s'
+AS $function$
+DECLARE
+    deleted_count integer;
+BEGIN
+    IF p_keep_generations < 3 THEN
+        RAISE EXCEPTION 'p_keep_generations must be at least 3' USING ERRCODE = '22023';
+    END IF;
+    IF p_max_generations < 1 OR p_max_generations > 10 THEN
+        RAISE EXCEPTION 'p_max_generations must be between 1 and 10' USING ERRCODE = '22023';
+    END IF;
+
+    WITH expired AS (
+        SELECT generation
+        FROM public.freehire_publication_generations
+        WHERE generation < (
+            SELECT COALESCE(MIN(retained.generation), 0)
+            FROM (
+                SELECT generation
+                FROM public.freehire_publication_generations
+                ORDER BY generation DESC
+                LIMIT p_keep_generations
+            ) AS retained
+        )
+        ORDER BY generation
+        LIMIT p_max_generations
+    )
+    DELETE FROM public.freehire_publication_generations AS generation
+    USING expired
+    WHERE generation.generation = expired.generation;
+
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RETURN deleted_count;
 END;
 $function$;
 
@@ -442,10 +464,12 @@ REVOKE ALL ON SCHEMA public FROM freehire_publication_reader;
 GRANT USAGE ON SCHEMA public TO freehire_publication_reader;
 
 REVOKE ALL ON FUNCTION public.finalize_freehire_publication(timestamptz) FROM PUBLIC, anon, authenticated, service_role, freehire_publication_reader;
+REVOKE ALL ON FUNCTION public.prune_freehire_publication_generations(integer, integer) FROM PUBLIC, anon, authenticated, service_role, freehire_publication_reader;
 REVOKE ALL ON FUNCTION public.get_freehire_publication_state() FROM PUBLIC, anon, authenticated, service_role, freehire_publication_reader;
 REVOKE ALL ON FUNCTION public.get_freehire_publication_page(bigint, text, integer) FROM PUBLIC, anon, authenticated, service_role, freehire_publication_reader;
 
 GRANT EXECUTE ON FUNCTION public.finalize_freehire_publication(timestamptz) TO service_role;
+GRANT EXECUTE ON FUNCTION public.prune_freehire_publication_generations(integer, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.get_freehire_publication_state() TO freehire_publication_reader;
 GRANT EXECUTE ON FUNCTION public.get_freehire_publication_page(bigint, text, integer) TO freehire_publication_reader;
 REVOKE EXECUTE ON FUNCTION public.finalize_freehire_publication(timestamptz) FROM freehire_publication_reader;

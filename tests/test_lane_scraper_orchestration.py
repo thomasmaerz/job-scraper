@@ -1,4 +1,5 @@
 import json
+import pytest
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -33,10 +34,63 @@ def test_run_configuration_passes_exact_settings_and_query_provenance(monkeypatc
         ("recall", "canada", "CA"), ("recall", "usa", "US"),
     ]
     assert all(call["archetype"] == "technology_delivery" for call in calls)
-    assert all(call["limit"] == 7 and call["max_start"] == 50 for call in calls)
+    assert all(call["limit"] == 7 and call["max_start"] == 20 for call in calls)
     assert all(call["request_delay_ms"] == 500 for call in calls)
     assert all(call["posting_date_filter"] == "r172800" for call in calls)
     assert calls[0]["query_id"].startswith("en:precision:10:")
+    assert len({id(call["request_limiter"]) for call in calls}) == 1
+
+
+def test_configured_run_fails_when_any_query_reports_incomplete_processing(monkeypatch):
+    configured = configuration()
+    execution = SimpleNamespace(
+        lane=SimpleNamespace(archetype="technology_delivery"),
+        query=SimpleNamespace(
+            query_id="technology_delivery_precision_en",
+            query_type=SimpleNamespace(value="precision"),
+            language="en",
+            query="TPM",
+        ),
+        geography=SimpleNamespace(
+            location="Canada",
+            location_scope=SimpleNamespace(value="canada"),
+            geography_id="CA",
+            geo_id="101174742",
+        ),
+    )
+    monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
+    monkeypatch.setattr(scraper, "build_search_executions", lambda *_args, **_kwargs: [execution])
+    monkeypatch.setattr(scraper, "_lane_runtime_archetype_config", lambda _execution: {})
+    monkeypatch.setattr(
+        scraper,
+        "process_linkedin_query",
+        lambda **_kwargs: scraper.LinkedInQueryJobs(
+            processing_complete=False,
+            incomplete_reason="zero cards; empty result or parser/request failure",
+        ),
+    )
+
+    with pytest.raises(scraper.LinkedInRequestFailed, match="technology_delivery_precision_en"):
+        scraper._run_database_configured_linkedin(configured, [])
+
+
+def test_linkedin_page_count_uses_ten_result_offsets():
+    assert scraper._linkedin_max_start_for_pages(1) == 0
+    assert scraper._linkedin_max_start_for_pages(3) == 20
+    with pytest.raises(ValueError, match="at least 1"):
+        scraper._linkedin_max_start_for_pages(0)
+
+
+def test_run_configuration_passes_scrape_archetype_override(monkeypatch):
+    calls = []
+    monkeypatch.setenv("SCRAPE_ARCHETYPE", "software_tpm")
+    monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
+    monkeypatch.setattr(scraper, "process_linkedin_query", lambda **kwargs: calls.append(kwargs) or [])
+
+    scraper._run_database_configured_linkedin(configuration(), [])
+
+    assert calls
+    assert {call["archetype"] for call in calls} == {"technology_delivery"}
     assert all(call["query_language"] == "en" for call in calls)
 
 
@@ -116,7 +170,7 @@ def test_concurrent_queries_one_keeps_serial_executor_free_path(monkeypatch):
         "settings": configuration().settings.model_copy(update={"concurrent_queries": 1}),
     })
     execution = scraper.build_search_executions(configured)[0]
-    monkeypatch.setattr(scraper, "build_search_executions", lambda _: [execution])
+    monkeypatch.setattr(scraper, "build_search_executions", lambda *_args, **_kwargs: [execution])
     monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
     monkeypatch.setattr(scraper, "process_linkedin_query", lambda **kwargs: [])
     monkeypatch.setattr(
@@ -138,7 +192,7 @@ def test_configured_save_uses_per_input_canonical_mapping_for_filter_state(monke
     ]
     calls = []
     monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
-    monkeypatch.setattr(scraper, "build_search_executions", lambda _: [execution])
+    monkeypatch.setattr(scraper, "build_search_executions", lambda *_args, **_kwargs: [execution])
     monkeypatch.setattr(scraper, "process_linkedin_query", lambda **kwargs: jobs)
     monkeypatch.setattr(
         scraper.supabase_utils,
@@ -175,7 +229,7 @@ def test_configured_run_restores_process_global_dedup_setting(monkeypatch):
     })
     monkeypatch.setattr(scraper.config, "ENABLE_REPOST_DEDUP", True)
     monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
-    monkeypatch.setattr(scraper, "build_search_executions", lambda _: ())
+    monkeypatch.setattr(scraper, "build_search_executions", lambda *_args, **_kwargs: ())
 
     scraper._run_database_configured_linkedin(config, [])
 

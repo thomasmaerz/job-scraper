@@ -399,8 +399,11 @@ def test_publication_snapshot_contract_is_idempotent_bounded_and_least_privilege
         assert "p_source_scrape_watermark > authoritative_watermark" in sql
         assert "p_source_scrape_watermark < authoritative_watermark" in sql
         assert "LIMIT LEAST(p_page_size, 1000)" in sql
-        assert "ORDER BY retained.generation DESC" in sql
-        assert "LIMIT 3" in sql
+        assert "CREATE OR REPLACE FUNCTION public.prune_freehire_publication_generations" in sql
+        assert "DEFERRABLE INITIALLY DEFERRED" in sql
+        assert "NOT VALID" in sql
+        assert "p_max_generations integer DEFAULT 3" in sql
+        assert "SET statement_timeout = '60s'" in sql
         assert "FROM public.freehire_jobs AS source" in sql
         assert "pg_catalog.to_jsonb(source)" in sql
         assert "CREATE ROLE freehire_publication_reader" in sql
@@ -427,6 +430,10 @@ def test_finalize_contract_is_transactional_idempotent_and_updates_state_after_c
 
     assert sql.index(idempotency) < sql.index(copy)
     assert sql.index(copy) < sql.index(completion, sql.index(copy)) < sql.index(update)
+    finalize_body = _publication_function_body(
+        sql, "finalize_freehire_publication", "function"
+    )
+    assert "DELETE FROM public.freehire_publication_generations" not in finalize_body
     assert "FOR UPDATE" in sql
     assert "p_source_scrape_watermark IS NULL" in sql
     assert "source scrape watermark cannot move backwards" in sql

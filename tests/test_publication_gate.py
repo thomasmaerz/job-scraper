@@ -58,9 +58,12 @@ class Db:
         return Query(self, name)
 
     def rpc(self, name, params):
+        self.rpc_calls = getattr(self, "rpc_calls", []) + [(name, params)]
+        if name == "prune_freehire_publication_generations":
+            assert params == {"p_keep_generations": 3, "p_max_generations": 3}
+            return SimpleNamespace(execute=lambda: SimpleNamespace(data=1))
         assert name == "finalize_freehire_publication"
         assert params == {"p_source_scrape_watermark": "2025-01-02T03:04:05+00:00"}
-        self.rpc_calls = getattr(self, "rpc_calls", []) + [(name, params)]
         return SimpleNamespace(
             execute=lambda: SimpleNamespace(data=[{
                 "generation": 7,
@@ -74,13 +77,29 @@ class Db:
 
 def test_verify_pipeline_results_requires_every_dependency_success():
     publication_gate.verify_pipeline_results(
-        {"scrape": "success", "freehire_compat": "success", "analyze_jobs": "success"}
+        {"scrape": "success", "freehire_compat": "success"}
     )
 
     with pytest.raises(RuntimeError, match="freehire_compat=failure"):
         publication_gate.verify_pipeline_results(
-            {"scrape": "success", "freehire_compat": "failure", "analyze_jobs": "skipped"}
+            {"scrape": "success", "freehire_compat": "failure"}
         )
+
+
+def test_publication_pruning_is_bounded():
+    db = Db()
+    assert publication_gate.prune_publication_generations(db) == 1
+
+
+def test_publication_pruning_failure_does_not_undo_publication(capsys):
+    class FailedPruneDb:
+        def rpc(self, _name, _params):
+            return SimpleNamespace(
+                execute=lambda: (_ for _ in ()).throw(RuntimeError("timeout"))
+            )
+
+    assert publication_gate.try_prune_publication_generations(FailedPruneDb()) == 0
+    assert "Publication pruning deferred: timeout" in capsys.readouterr().out
 
 
 def test_publication_state_reports_backlog_without_blocking_published_rows():

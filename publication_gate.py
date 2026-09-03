@@ -7,7 +7,7 @@ from pathlib import Path
 import config
 
 
-PIPELINE_JOBS = ("scrape", "freehire_compat", "analyze_jobs")
+PIPELINE_JOBS = ("scrape", "freehire_compat")
 PUBLICATION_SCHEMA_VERSION = "freehire-publication-v1"
 
 
@@ -151,6 +151,31 @@ def finalize_publication(db, state: dict[str, int | str | None]) -> dict[str, in
     }
 
 
+def prune_publication_generations(db) -> int:
+    """Prune at most one expired generation outside the publish transaction."""
+    response = db.rpc(
+        "prune_freehire_publication_generations",
+        {"p_keep_generations": 3, "p_max_generations": 3},
+    ).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, dict):
+        value = value.get("prune_freehire_publication_generations")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError("Publication pruning returned an invalid deletion count")
+    return value
+
+
+def try_prune_publication_generations(db) -> int:
+    """Best-effort retention maintenance after an atomic publication commit."""
+    try:
+        return prune_publication_generations(db)
+    except Exception as exc:
+        print(f"Publication pruning deferred: {exc}")
+        return 0
+
+
 def write_github_outputs(state: dict[str, int | str | None], output_path: str | None) -> None:
     if not output_path:
         return
@@ -172,13 +197,13 @@ def main() -> None:
     results = {
         "scrape": args.scrape_result,
         "freehire_compat": args.freehire_compat_result,
-        "analyze_jobs": args.analyze_jobs_result,
     }
     verify_pipeline_results(results)
     db = _get_db()
     state = query_publication_state(db)
     validate_publication_state(state)
     state.update(finalize_publication(db, state))
+    pruned_generations = try_prune_publication_generations(db)
     print(
         "Publication state: "
         f"total={state['total']} current={state['current']} pending={state['pending']} "
@@ -186,7 +211,8 @@ def main() -> None:
         f"published={state['published']} prior_publication={state['prior_publication']} "
         f"scrape_watermark={state['scrape_watermark'] or 'unavailable'} "
         f"generation={state['generation']} published_at={state['published_at']} "
-        f"schema_version={state['schema_version']} row_count={state['row_count']}"
+        f"schema_version={state['schema_version']} row_count={state['row_count']} "
+        f"pruned_generations={pruned_generations}"
     )
     write_github_outputs(state, os.getenv("GITHUB_OUTPUT"))
 

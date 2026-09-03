@@ -1,6 +1,10 @@
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 from bs4 import BeautifulSoup
+import pytest
+import requests
 
 import scraper
 
@@ -59,6 +63,107 @@ def test_fetch_linkedin_job_details_returns_content_and_metadata(monkeypatch):
     assert metadata["applicant_count"] == 26
     assert metadata["salary_min"] == 120000
     assert metadata["detail_metadata_checked_at"]
+
+
+def test_global_request_limiter_spaces_requests_from_one_clock(monkeypatch):
+    clock = iter([10.0, 10.0, 11.0, 12.5])
+    sleeps = []
+    monkeypatch.setattr(scraper.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(scraper.time, "sleep", sleeps.append)
+    monkeypatch.setattr(scraper.random, "uniform", lambda _low, _high: 0.5)
+    limiter = scraper.LinkedInRequestLimiter(2_000, 1_000)
+
+    assert limiter.wait() == 0
+    assert limiter.wait() == 1.5
+    assert sleeps == [1.5]
+    assert limiter.request_count == 2
+    assert limiter.total_wait_seconds == 1.5
+
+
+def test_retry_after_supports_delta_seconds_and_http_date():
+    class Response:
+        headers = {"Retry-After": "42"}
+
+    assert scraper._retry_after_seconds(Response()) == 42
+
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    Response.headers = {"Retry-After": format_datetime(retry_at, usegmt=True)}
+    assert 28 <= scraper._retry_after_seconds(Response()) <= 30
+
+
+def test_linkedin_challenge_detection_covers_denial_status_and_body():
+    assert scraper._linkedin_response_is_challenge(
+        type("Response", (), {"status_code": 403, "text": ""})()
+    )
+    assert scraper._linkedin_response_is_challenge(
+        type("Response", (), {"status_code": 200, "text": "<title>Security Verification</title>", "url": ""})()
+    )
+    assert not scraper._linkedin_response_is_challenge(
+        type("Response", (), {"status_code": 200, "text": "Security verification engineer", "url": ""})()
+    )
+
+
+def test_search_request_failure_aborts_required_coverage(monkeypatch):
+    monkeypatch.setattr(
+        scraper.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            requests.exceptions.ConnectionError("offline")
+        ),
+    )
+
+    with pytest.raises(scraper.LinkedInRequestFailed, match="search request failed"):
+        scraper._fetch_linkedin_job_ids("TPM", "Canada", max_start=0)
+
+
+def test_detail_transient_http_failure_exhaustion_aborts_required_coverage(monkeypatch):
+    class Response:
+        status_code = 503
+        text = "temporarily unavailable"
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/123"
+        headers = {}
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError(response=self)
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(scraper.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(scraper.random, "uniform", lambda *_args: 0)
+    monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
+
+    with pytest.raises(scraper.LinkedInRequestFailed, match="HTTP 503 exhausted retries"):
+        scraper._fetch_linkedin_job_details("123")
+
+
+def test_detail_not_found_is_a_terminal_unavailable_result(monkeypatch):
+    class Response:
+        status_code = 404
+        text = "not found"
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/123"
+        headers = {}
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError(response=self)
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(scraper.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
+
+    result = scraper._fetch_linkedin_job_details("123")
+
+    assert result is scraper.LINKEDIN_DETAIL_UNAVAILABLE
+    assert not result
+
+
+def test_process_query_marks_zero_cards_incomplete(monkeypatch):
+    _disable_relist_tracking(monkeypatch)
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", lambda *_args, **_kwargs: [])
+
+    jobs = scraper.process_linkedin_query("TPM", "Canada")
+
+    assert jobs == []
+    assert jobs.processing_complete is False
+    assert jobs.incomplete_reason == "zero cards; empty result or parser/request failure"
 
 
 def test_parse_salary_supports_common_range_formats():

@@ -117,6 +117,17 @@ def test_contract_keeps_scalar_types_strict():
         parse_scrape_configuration(payload)
 
 
+def test_scrape_options_require_safe_global_pacing():
+    payload = rpc_payload()
+    payload["settings"]["options"] = {"global_request_interval_ms": 2499}
+    with pytest.raises(ScrapeConfigurationError, match="global_request_interval_ms"):
+        parse_scrape_configuration(payload)
+
+    payload["settings"]["options"] = {"request_jitter_ms": -1}
+    with pytest.raises(ScrapeConfigurationError, match="request_jitter_ms"):
+        parse_scrape_configuration(payload)
+
+
 def test_location_expansion_is_deterministic_and_independently_selectable():
     geographies = expand_location_scopes(
         [LocationRegion.canada, LocationRegion.usa, LocationRegion.eea]
@@ -137,6 +148,25 @@ def test_executions_use_per_lane_locations_and_migration_sort_order():
         ("recall", "CA"), ("recall", "US"),
     ]
     assert executions[0].query.query_id.startswith("en:precision:10:")
+
+
+def test_execution_archetype_override_selects_one_enabled_lane_and_alias():
+    configuration = parse_scrape_configuration(rpc_payload())
+    canonical = build_search_executions(configuration, "technology_delivery")
+    alias = build_search_executions(configuration, "software_tpm")
+
+    assert canonical
+    assert {item.lane.archetype for item in canonical} == {"technology_delivery"}
+    assert alias == canonical
+
+
+def test_execution_archetype_override_rejects_unknown_or_disabled_lane():
+    configuration = parse_scrape_configuration(rpc_payload())
+
+    with pytest.raises(ScrapeConfigurationError, match="Unknown SCRAPE_ARCHETYPE"):
+        build_search_executions(configuration, "unknown_lane")
+    with pytest.raises(ScrapeConfigurationError, match="is disabled"):
+        build_search_executions(configuration, "network_infrastructure")
 
 
 def test_enabled_lane_requires_enabled_precision_recall_and_location():

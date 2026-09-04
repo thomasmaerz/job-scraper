@@ -77,8 +77,22 @@ def test_configured_run_fails_when_any_query_reports_incomplete_processing(monke
 def test_linkedin_page_count_uses_ten_result_offsets():
     assert scraper._linkedin_max_start_for_pages(1) == 0
     assert scraper._linkedin_max_start_for_pages(3) == 20
+    assert scraper._linkedin_max_start_for_pages(6) == 50
     with pytest.raises(ValueError, match="at least 1"):
         scraper._linkedin_max_start_for_pages(0)
+
+
+def test_configured_run_honors_larger_manual_lookback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(scraper.config, "LINKEDIN_LOOKBACK_HOURS", 96)
+    monkeypatch.setattr(scraper.config, "LINKEDIN_MAX_LOOKBACK_HOURS", 168)
+    monkeypatch.setattr(scraper.supabase_utils, "get_last_successful_scrape_at", lambda: None)
+    monkeypatch.setattr(scraper, "process_linkedin_query", lambda **kwargs: calls.append(kwargs) or [])
+
+    scraper._run_database_configured_linkedin(configuration(), [])
+
+    assert calls
+    assert {call["posting_date_filter"] for call in calls} == {"r345600"}
 
 
 def test_run_configuration_passes_scrape_archetype_override(monkeypatch):

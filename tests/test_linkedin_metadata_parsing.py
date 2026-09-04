@@ -166,6 +166,134 @@ def test_process_query_marks_zero_cards_incomplete(monkeypatch):
     assert jobs.incomplete_reason == "zero cards; empty result or parser/request failure"
 
 
+def test_search_continues_after_duplicate_only_page_and_records_page_yield(monkeypatch):
+    class Response:
+        status_code = 200
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        headers = {}
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    pages = iter([
+        Response('<li><div class="base-card" data-entity-urn="urn:li:jobPosting:1"></div></li>'),
+        Response('<li><div class="base-card" data-entity-urn="urn:li:jobPosting:1"></div></li>'),
+        Response('<li><div class="base-card" data-entity-urn="urn:li:jobPosting:2"></div></li>'),
+    ])
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: next(pages))
+    monkeypatch.setattr(scraper.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
+
+    cards = scraper._fetch_linkedin_job_ids("TPM", "Canada", max_start=20, request_delay_ms=0)
+
+    assert [card["job_id"] for card in cards] == ["1", "2"]
+    assert scraper._linkedin_scrape_state.coverage == {
+        "pages_attempted": 3,
+        "pages_completed": 3,
+        "page_coverage": [
+            {"page": 1, "start": 0, "elements": 1, "cards": 1, "new_source_ids": 1, "result": "complete"},
+            {"page": 2, "start": 10, "elements": 1, "cards": 1, "new_source_ids": 0, "result": "complete"},
+            {"page": 3, "start": 20, "elements": 1, "cards": 1, "new_source_ids": 1, "result": "complete"},
+        ],
+    }
+
+
+def test_search_rejects_nonempty_page_when_no_cards_parse(monkeypatch):
+    class Response:
+        status_code = 200
+        text = "<li><div>unknown markup</div></li>"
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
+
+    with pytest.raises(scraper.LinkedInRequestFailed, match="parser extracted zero cards"):
+        scraper._fetch_linkedin_job_ids("TPM", "Canada", max_start=0)
+
+    assert scraper._linkedin_scrape_state.coverage["page_coverage"] == [
+        {
+            "page": 1,
+            "start": 0,
+            "elements": 1,
+            "cards": 0,
+            "new_source_ids": 0,
+            "result": "parser_failure",
+        }
+    ]
+
+
+def test_search_records_terminal_no_results_page(monkeypatch):
+    class Response:
+        status_code = 200
+        text = "<html></html>"
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
+
+    assert scraper._fetch_linkedin_job_ids("TPM", "Canada", max_start=0) == []
+    assert scraper._linkedin_scrape_state.coverage["page_coverage"][0]["result"] == "no_results"
+
+
+def test_search_rejects_empty_response_body(monkeypatch):
+    class Response:
+        status_code = 200
+        text = ""
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
+
+    with pytest.raises(scraper.LinkedInRequestFailed, match="empty response"):
+        scraper._fetch_linkedin_job_ids("TPM", "Canada", max_start=0)
+
+    assert scraper._linkedin_scrape_state.coverage["page_coverage"][0]["result"] == "empty_response"
+
+
+def test_process_query_persists_page_coverage(monkeypatch):
+    monkeypatch.setattr(scraper.config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
+    finished = []
+
+    def fetch(*_args, **_kwargs):
+        scraper._linkedin_scrape_state.coverage = {
+            "pages_attempted": 1,
+            "pages_completed": 1,
+            "page_coverage": [
+                {"page": 1, "start": 0, "elements": 0, "cards": 0, "new_source_ids": 0, "result": "no_results"}
+            ],
+        }
+        return []
+
+    monkeypatch.setattr(scraper, "_fetch_linkedin_job_ids", fetch)
+    monkeypatch.setattr(scraper.supabase_utils, "start_ingestion_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "finish_ingestion_run",
+        lambda _run_id, **metrics: finished.append(metrics),
+    )
+
+    scraper.process_linkedin_query("TPM", "Canada")
+
+    assert finished[0]["page_coverage"] == [
+        {"page": 1, "start": 0, "elements": 0, "cards": 0, "new_source_ids": 0, "result": "no_results"}
+    ]
+
+
 def test_parse_salary_supports_common_range_formats():
     assert scraper._parse_salary_fields("CAD $120K to $135K per year") == {
         "salary_text": "CAD $120K to $135K",

@@ -389,7 +389,11 @@ def _fetch_linkedin_job_ids(
 ) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
-    coverage = {"pages_attempted": 0, "pages_completed": 0}
+    coverage = {
+        "pages_attempted": 0,
+        "pages_completed": 0,
+        "page_coverage": [],
+    }
     _linkedin_scrape_state.coverage = coverage
     scraped_cards = []
     start = 0
@@ -488,9 +492,17 @@ def _fetch_linkedin_job_ids(
             )
 
         if not res.text:
-            
-             logging.info(f"Received empty response text at start={start}, stopping.")
-             break
+             coverage["page_coverage"].append({
+                 "page": start // 10 + 1,
+                 "start": start,
+                 "elements": 0,
+                 "cards": 0,
+                 "new_source_ids": 0,
+                 "result": "empty_response",
+             })
+             raise LinkedInRequestFailed(
+                 f"LinkedIn search returned an empty response at start={start}"
+             )
 
         coverage["pages_completed"] += 1
 
@@ -498,7 +510,14 @@ def _fetch_linkedin_job_ids(
         all_jobs_on_this_page = soup.find_all('li')
 
         if not all_jobs_on_this_page:
-            
+             coverage["page_coverage"].append({
+                 "page": start // 10 + 1,
+                 "start": start,
+                 "elements": 0,
+                 "cards": 0,
+                 "new_source_ids": 0,
+                 "result": "no_results",
+             })
              logging.info(f"No job listings ('li' elements) found on page at start={start}, stopping.")
              break
 
@@ -506,18 +525,41 @@ def _fetch_linkedin_job_ids(
         logging.info(f"Found {len(all_jobs_on_this_page)} potential job elements on this page.")
 
         page_cards = _extract_linkedin_search_cards(all_jobs_on_this_page)
+        if not page_cards:
+            coverage["page_coverage"].append({
+                "page": start // 10 + 1,
+                "start": start,
+                "elements": len(all_jobs_on_this_page),
+                "cards": 0,
+                "new_source_ids": 0,
+                "result": "parser_failure",
+            })
+            raise LinkedInRequestFailed(
+                f"LinkedIn search parser extracted zero cards from "
+                f"{len(all_jobs_on_this_page)} list elements at start={start}"
+            )
         existing_ids = {card["job_id"] for card in scraped_cards}
         new_page_cards = [card for card in page_cards if card["job_id"] not in existing_ids]
         scraped_cards.extend(new_page_cards)
         jobs_found_this_iteration = len(new_page_cards)
 
+        coverage["page_coverage"].append({
+            "page": start // 10 + 1,
+            "start": start,
+            "elements": len(all_jobs_on_this_page),
+            "cards": len(page_cards),
+            "new_source_ids": jobs_found_this_iteration,
+            "result": "complete",
+        })
+
     
         logging.info(f"Added {jobs_found_this_iteration} unique job IDs from this page.")
 
         if jobs_found_this_iteration == 0 and len(all_jobs_on_this_page) > 0:
-        
-            logging.info("Found list items but no new job IDs extracted, potentially end of relevant results or parsing issue.")
-            break
+            logging.info(
+                "Found list items but no new job IDs at start=%s; continuing to the configured bound.",
+                start,
+            )
 
         start += 10
 
@@ -836,14 +878,19 @@ def process_linkedin_query(
         fetch_options["request_delay_ms"] = request_delay_ms
     if request_limiter is not None:
         fetch_options["request_limiter"] = request_limiter
-    _linkedin_scrape_state.coverage = {"pages_attempted": 0, "pages_completed": 0}
+    empty_coverage = {
+        "pages_attempted": 0,
+        "pages_completed": 0,
+        "page_coverage": [],
+    }
+    _linkedin_scrape_state.coverage = empty_coverage.copy()
     try:
         scraped_cards = _fetch_linkedin_job_ids(search_query, location, **fetch_options)
     except (LinkedInAccessDenied, LinkedInRequestFailed) as exc:
         coverage = getattr(
             _linkedin_scrape_state,
             "coverage",
-            {"pages_attempted": 0, "pages_completed": 0},
+            empty_coverage,
         )
         if tracking_enabled:
             supabase_utils.finish_ingestion_run(
@@ -855,12 +902,13 @@ def process_linkedin_query(
                 detail_budget_used=0,
                 coverage_complete=False,
                 coverage_reason=str(exc),
+                page_coverage=coverage["page_coverage"],
             )
         raise
     coverage = getattr(
         _linkedin_scrape_state,
         "coverage",
-        {"pages_attempted": 0, "pages_completed": 0},
+        empty_coverage,
     )
     if not scraped_cards:
         if tracking_enabled:
@@ -872,6 +920,7 @@ def process_linkedin_query(
                 cards_seen=0,
                 coverage_complete=False,
                 coverage_reason="zero cards; empty result or parser/request failure",
+                page_coverage=coverage["page_coverage"],
             )
         logging.info("No job IDs found in Phase 1. Skipping detail fetching.")
         return LinkedInQueryJobs(
@@ -1060,6 +1109,7 @@ def process_linkedin_query(
                 detail_budget_used=0,
                 coverage_complete=False,
                 coverage_reason="LinkedIn guest recent-window search cannot prove absence",
+                page_coverage=coverage["page_coverage"],
             )
         logging.info("No new job IDs to process after filtering.")
         return LinkedInQueryJobs()
@@ -1091,6 +1141,7 @@ def process_linkedin_query(
                     detail_budget_used=processed_count,
                     coverage_complete=False,
                     coverage_reason=str(exc),
+                    page_coverage=coverage["page_coverage"],
                 )
             raise
         if detail_result is LINKEDIN_DETAIL_UNAVAILABLE:
@@ -1159,6 +1210,7 @@ def process_linkedin_query(
                 if completed_detail_count == len(ids_to_fetch)
                 else f"detail validation accepted {completed_detail_count} of {len(ids_to_fetch)} selected IDs"
             ),
+            page_coverage=coverage["page_coverage"],
         )
     processing_complete = completed_detail_count == len(ids_to_fetch)
     return LinkedInQueryJobs(
@@ -1471,11 +1523,15 @@ def _run_database_configured_linkedin(
     if not settings.scraping_enabled:
         logging.info("LinkedIn scraping disabled by scrape_settings.scraping_enabled")
         return False
+    configured_lookback_hours = max(
+        settings.lookback_days * 24,
+        config.LINKEDIN_LOOKBACK_HOURS,
+    )
     lookback_hours = resolve_linkedin_lookback_hours(
         last_success_at,
-        configured_hours=settings.lookback_days * 24,
+        configured_hours=configured_lookback_hours,
         overlap_hours=0,
-        max_hours=settings.lookback_days * 24,
+        max_hours=max(config.LINKEDIN_MAX_LOOKBACK_HOURS, configured_lookback_hours),
     )
     posting_date_filter = f"r{lookback_hours * 3600}"
     logging.info(

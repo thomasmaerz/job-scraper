@@ -108,9 +108,19 @@ CREATE TABLE IF NOT EXISTS "public"."ingestion_runs" (
     "detail_budget_used" integer NOT NULL DEFAULT 0 CHECK ("detail_budget_used" >= 0),
     "coverage_complete" boolean NOT NULL DEFAULT false,
     "coverage_reason" text,
-    CHECK ("pages_completed" <= "pages_attempted"),
-    "created_at" timestamp with time zone NOT NULL DEFAULT now()
+    "page_coverage" jsonb NOT NULL DEFAULT '[]'::jsonb,
+    "created_at" timestamp with time zone NOT NULL DEFAULT now(),
+    CHECK ("pages_completed" <= "pages_attempted")
 );
+ALTER TABLE "public"."ingestion_runs"
+    ADD COLUMN IF NOT EXISTS "page_coverage" jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE "public"."ingestion_runs"
+    DROP CONSTRAINT IF EXISTS "ingestion_runs_page_coverage_json_check";
+ALTER TABLE "public"."ingestion_runs"
+    ADD CONSTRAINT "ingestion_runs_page_coverage_json_check" CHECK (
+        jsonb_typeof("page_coverage") = 'array'
+        AND jsonb_array_length("page_coverage") <= 100
+    );
 
 CREATE TABLE IF NOT EXISTS "public"."scrape_run_state" (
     "id" integer PRIMARY KEY CHECK ("id" = 1),

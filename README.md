@@ -341,7 +341,7 @@ This fills only missing `salary_min`, `salary_max`, and `salary_currency`, prese
 - Source listing-ID deduplication and posting-wave calculation make overlapping searches idempotent.
 - A last-seen listing ID is not used as a cursor because LinkedIn search ordering is not a durable total order and one ID cannot represent all configured queries.
 
-For one-off recovery, run the scraper workflow with `lookback_hours=96` or `168`. Normal scheduled runs return to the watermark-derived 48-hour minimum automatically.
+For one-off recovery, run the scraper workflow with `lookback_hours=96` or `168`. The workflow input raises the database-configured lookback for that run; normal scheduled runs return to the 48-hour database baseline automatically. Keep `archetype` blank for a complete recovery that may advance the global scrape watermark and publication pipeline. Recovery runs are bounded by the workflow's three-hour scrape timeout and retain the same source-wide request cadence.
 
 ### Freehire publication snapshots
 

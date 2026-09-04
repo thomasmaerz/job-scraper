@@ -596,6 +596,25 @@ def test_same_id_relist_schema_is_idempotent_append_only_and_service_role_only()
         assert "service_role" in sql
 
 
+def test_ingestion_page_coverage_migration_is_bounded_and_init_aligned():
+    migration = (ROOT / "supabase_setup" / "add_ingestion_page_coverage.sql").read_text()
+    init_sql = (ROOT / "supabase_setup" / "init.sql").read_text()
+
+    for sql in (migration, init_sql):
+        assert "page_coverage" in sql
+        assert "jsonb_typeof" in sql
+        assert "jsonb_array_length" in sql
+        assert "<= 100" in sql
+
+
+def test_restore_linkedin_page_depth_is_compare_and_set():
+    sql = (ROOT / "supabase_setup" / "restore_linkedin_page_depth.sql").read_text()
+
+    assert "SET max_pages_per_query = 6" in sql
+    assert "WHERE singleton IS TRUE" in sql
+    assert "AND max_pages_per_query = 3" in sql
+
+
 def test_cleanup_drops_same_id_relist_ledger_tables():
     sql = (ROOT / "supabase_setup" / "cleanup.sql").read_text()
     for table in (

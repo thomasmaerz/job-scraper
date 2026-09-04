@@ -1,4 +1,5 @@
 from supabase import create_client, Client
+from postgrest.types import ReturnMethod
 import config # Import configuration
 from typing import Optional, Any, Dict
 from models import Resume
@@ -978,13 +979,18 @@ def start_ingestion_run(
         "archetype": archetype,
         "filter_profile": filter_profile,
         "query_scope": query_scope or "",
-    }, on_conflict="id", ignore_duplicates=True).execute()
+    }, on_conflict="id", ignore_duplicates=True, returning=ReturnMethod.minimal).execute()
 
 
 def finish_ingestion_run(run_id: str, **metrics: Any) -> None:
     payload = {key: value for key, value in metrics.items() if value is not None}
     payload["finished_at"] = datetime.now(timezone.utc).isoformat()
-    supabase.table("ingestion_runs").update(payload).eq("id", run_id).execute()
+    (
+        supabase.table("ingestion_runs")
+        .update(payload, returning=ReturnMethod.minimal)
+        .eq("id", run_id)
+        .execute()
+    )
 
 
 SCRAPE_RUN_STATE_ID = 1
@@ -1268,6 +1274,7 @@ def save_listing_observations(
                 payloads,
                 on_conflict="provider,source_job_id,ingestion_run_id,query_scope,result",
                 ignore_duplicates=True,
+                returning=ReturnMethod.minimal,
             )
             .execute()
         )
@@ -1318,7 +1325,15 @@ def save_listing_states(
             ),
         })
     if payloads:
-        supabase.table("listing_states").upsert(payloads, on_conflict="provider,source_job_id").execute()
+        (
+            supabase.table("listing_states")
+            .upsert(
+                payloads,
+                on_conflict="provider,source_job_id",
+                returning=ReturnMethod.minimal,
+            )
+            .execute()
+        )
 
 
 def save_listing_content_version(job: dict, canonical_job_id: str | None) -> str | None:

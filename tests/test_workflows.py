@@ -29,10 +29,22 @@ def test_downstream_workflows_default_to_enabled_lanes_with_optional_override():
     assert scrape_step["env"]["SCRAPE_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
 
 
+def test_scrape_workflow_exports_manual_recovery_lookback():
+    hourly = load_workflow("scrape_jobs.yml")
+    recovery_step = next(
+        step
+        for step in hourly["jobs"]["scrape"]["steps"]
+        if step.get("name") == "Determine LinkedIn recovery window"
+    )
+
+    assert recovery_step["env"]["REQUESTED_LOOKBACK_HOURS"] == "${{ inputs.lookback_hours || '48' }}"
+    assert "LINKEDIN_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" in recovery_step["run"]
+
+
 def test_scrape_workflow_allows_multi_lane_serial_runtime():
     hourly = load_workflow("scrape_jobs.yml")
 
-    assert hourly["jobs"]["scrape"]["timeout-minutes"] == 120
+    assert hourly["jobs"]["scrape"]["timeout-minutes"] == 180
 
 
 def test_scoring_and_resume_workflows_have_defense_in_depth_concurrency_groups():
@@ -70,7 +82,7 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
         "actions": "read",
         "contents": "read",
     }
-    assert workflow["jobs"]["scrape"]["timeout-minutes"] == 120
+    assert workflow["jobs"]["scrape"]["timeout-minutes"] == 180
 
     recovery_step = next(
         step

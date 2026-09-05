@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import config
 import scraper
 import supabase_utils
+from linkedin_source_policy import DurableLinkedInRequestGate
 
 
 SELECT_FIELDS = "job_id,last_seen_at,listing_instances,posting_wave_count,repost_count"
@@ -112,6 +113,8 @@ def run(limit: int, apply: bool) -> dict:
         "updated": 0,
         "recovered_source_ids": [],
     }
+    gate = DurableLinkedInRequestGate("location-backfill")
+    user_agent = scraper.user_agents.USER_AGENTS[0]
     current_rows = {}
     for candidate in fetch_candidates(limit=limit):
         original_row = candidate["row"]
@@ -119,7 +122,9 @@ def run(limit: int, apply: bool) -> dict:
         row = current_rows.get(canonical_id, original_row)
         source_job_id = candidate["source_job_id"]
         result["selected"] += 1
-        detail_result = scraper._fetch_linkedin_job_details(source_job_id)
+        detail_result = scraper._fetch_linkedin_job_details(
+            source_job_id, durable_gate=gate, user_agent=user_agent
+        )
         if not detail_result:
             result["unavailable"] += 1
             continue

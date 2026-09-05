@@ -94,33 +94,63 @@ def query_publication_state(db=None) -> dict[str, int | str | None]:
     return counts
 
 
-def validate_publication_state(state: dict[str, int | str | None]) -> None:
+def validate_publication_state(
+    state: dict[str, int | str | None], *, require_legacy_ready: bool = True
+) -> None:
     current = int(state["current"] or 0)
     published = int(state["published"] or 0)
     if published > current:
         raise RuntimeError(
             f"Publication gate blocked: published={published} exceeds current={current}"
         )
-    if not state.get("scrape_watermark"):
+    if require_legacy_ready and not state.get("scrape_watermark"):
         raise RuntimeError("Publication gate blocked: scrape watermark is absent")
-    if published == 0:
+    if require_legacy_ready and published == 0:
         raise RuntimeError("Publication gate blocked: zero published rows")
 
 
-def finalize_publication(db, state: dict[str, int | str | None]) -> dict[str, int | str]:
-    watermark = state.get("scrape_watermark")
-    if not isinstance(watermark, str) or not watermark:
-        raise RuntimeError("Publication finalization requires a non-null scrape watermark")
-
-    response = db.rpc(
-        "finalize_freehire_publication",
-        {"p_source_scrape_watermark": watermark},
-    ).execute()
+def finalize_publication(
+    db,
+    state: dict[str, int | str | None],
+    discovery_cycle_id: int | None = None,
+) -> dict[str, int | str | None]:
+    if discovery_cycle_id is None:
+        watermark = state.get("scrape_watermark")
+        if not isinstance(watermark, str) or not watermark:
+            raise RuntimeError("Publication finalization requires a non-null scrape watermark")
+        rpc_name = "finalize_freehire_publication"
+        rpc_args = {"p_source_scrape_watermark": watermark}
+    else:
+        if discovery_cycle_id <= 0:
+            raise RuntimeError("Publication finalization requires a positive discovery cycle ID")
+        rpc_name = "finalize_freehire_publication_v2"
+        rpc_args = {"p_cycle_id": discovery_cycle_id}
+    response = db.rpc(rpc_name, rpc_args).execute()
     rows = response.data or []
-    if len(rows) != 1 or not isinstance(rows[0], dict):
+    if isinstance(rows, dict):
+        publication = rows
+    elif len(rows) == 1 and isinstance(rows[0], dict):
+        publication = rows[0]
+    else:
         raise RuntimeError("Publication finalization did not return exactly one state row")
 
-    publication = rows[0]
+    outcome = publication.get("outcome") if discovery_cycle_id is not None else "published"
+    if outcome == "deferred":
+        return {
+            "outcome": "deferred",
+            "reason": str(publication.get("reason") or "publication deferred"),
+            "requested_cycle_id": discovery_cycle_id,
+            "eligible_cycle_id": publication.get("eligible_cycle_id"),
+            "blocking_count": int(publication.get("blocking_count") or 0),
+            "generation": None,
+            "published_at": None,
+            "source_scrape_watermark": publication.get("source_scrape_watermark")
+            or state.get("scrape_watermark"),
+            "row_count": None,
+            "schema_version": PUBLICATION_SCHEMA_VERSION,
+        }
+    if outcome not in {"published", "unchanged"}:
+        raise RuntimeError(f"Publication finalization returned an invalid outcome ({outcome!r})")
     generation = publication.get("generation")
     row_count = publication.get("row_count")
     returned_watermark = publication.get("source_scrape_watermark")
@@ -130,7 +160,7 @@ def finalize_publication(db, state: dict[str, int | str | None]) -> dict[str, in
         raise RuntimeError("Publication finalization returned an invalid generation")
     if not isinstance(row_count, int) or row_count < 0:
         raise RuntimeError("Publication finalization returned an invalid row count")
-    if returned_watermark != watermark:
+    if discovery_cycle_id is None and returned_watermark != watermark:
         raise RuntimeError(
             "Publication finalization returned a different scrape watermark "
             f"({returned_watermark!r} != {watermark!r})"
@@ -142,13 +172,22 @@ def finalize_publication(db, state: dict[str, int | str | None]) -> dict[str, in
             "Publication finalization returned an unsupported schema version "
             f"({schema_version!r})"
         )
-    return {
+    result = {
         "generation": generation,
         "published_at": published_at,
         "source_scrape_watermark": returned_watermark,
         "row_count": row_count,
         "schema_version": schema_version,
     }
+    if discovery_cycle_id is not None:
+        result.update({
+            "outcome": outcome,
+            "reason": publication.get("reason"),
+            "requested_cycle_id": discovery_cycle_id,
+            "eligible_cycle_id": publication.get("eligible_cycle_id", discovery_cycle_id),
+            "blocking_count": 0,
+        })
+    return result
 
 
 def prune_publication_generations(db) -> int:
@@ -193,6 +232,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     for job in PIPELINE_JOBS:
         parser.add_argument(f"--{job.replace('_', '-')}-result", required=True)
+    parser.add_argument("--discovery-cycle-id", type=int, required=True)
     args = parser.parse_args()
     results = {
         "scrape": args.scrape_result,
@@ -201,15 +241,23 @@ def main() -> None:
     verify_pipeline_results(results)
     db = _get_db()
     state = query_publication_state(db)
-    validate_publication_state(state)
-    state.update(finalize_publication(db, state))
-    pruned_generations = try_prune_publication_generations(db)
+    validate_publication_state(state, require_legacy_ready=False)
+    state.update(finalize_publication(db, state, args.discovery_cycle_id))
+    pruned_generations = (
+        try_prune_publication_generations(db)
+        if state["outcome"] in {"published", "unchanged"}
+        else 0
+    )
     print(
         "Publication state: "
         f"total={state['total']} current={state['current']} pending={state['pending']} "
         f"failed={state['failed']} processing={state['processing']} stale={state['stale']} "
         f"published={state['published']} prior_publication={state['prior_publication']} "
         f"scrape_watermark={state['scrape_watermark'] or 'unavailable'} "
+        f"outcome={state['outcome']} reason={state['reason'] or 'none'} "
+        f"requested_cycle_id={state['requested_cycle_id']} "
+        f"eligible_cycle_id={state['eligible_cycle_id'] or 'none'} "
+        f"blocking_count={state['blocking_count']} "
         f"generation={state['generation']} published_at={state['published_at']} "
         f"schema_version={state['schema_version']} row_count={state['row_count']} "
         f"pruned_generations={pruned_generations}"

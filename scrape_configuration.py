@@ -165,6 +165,28 @@ class ScrapeSettings(BaseModel):
             raise ValueError(
                 "options.request_jitter_ms must be an integer from 0 to 10000"
             )
+        bounded_integer_options = {
+            "min_pages_per_query": (1, 100),
+            "soft_max_pages_per_query": (1, 100),
+            "hard_max_pages_per_query": (1, 100),
+            "max_adaptive_extra_requests": (0, 10_000),
+            "max_detail_tasks_per_run": (0, 10_000),
+            "max_source_http_attempts_per_run": (1, 10_000),
+            "minimum_recent_window_hours": (1, 8_760),
+            "indexing_overlap_hours": (0, 8_760),
+            "maximum_normal_window_hours": (1, 8_760),
+            "outage_recovery_cap_hours": (1, 8_760),
+        }
+        for name, (minimum, maximum) in bounded_integer_options.items():
+            value = self.options.get(name)
+            if value is not None and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(
+                    f"options.{name} must be an integer from {minimum} to {maximum}"
+                )
         return self
 
 

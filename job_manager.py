@@ -9,9 +9,12 @@ import logging
 import config
 import user_agents
 from supabase_utils import supabase # Use the initialized Supabase client
+from linkedin_source_policy import DurableLinkedInRequestGate, LinkedInCircuitOpen
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+_linkedin_request_gate = DurableLinkedInRequestGate("job-manager")
+_linkedin_user_agent = user_agents.USER_AGENTS[0]
 
 # --- Helper Functions ---
 
@@ -37,17 +40,17 @@ async def _check_single_linkedin_job_active(job_id: str, client: httpx.AsyncClie
 
 
     while retries <= config.ACTIVE_CHECK_MAX_RETRIES:
+        grant = None
         try:
-            sleep_time = random.uniform(5.0, 15.0)
-            logging.info(f"Waiting for {sleep_time:.2f} seconds before next request...")
-            time.sleep(sleep_time)
+            headers = {'User-Agent': _linkedin_user_agent}
 
-            # Rotate user agent and proxy for each attempt
-            user_agent = random.choice(user_agents.USER_AGENTS)
-            headers = {'User-Agent': user_agent}
+            logging.debug(f"Checking job {job_id} (Attempt {retries+1}/{config.ACTIVE_CHECK_MAX_RETRIES+1}) URL: {job_detail_url} with UA: {_linkedin_user_agent}")
 
-            logging.debug(f"Checking job {job_id} (Attempt {retries+1}/{config.ACTIVE_CHECK_MAX_RETRIES+1}) URL: {job_detail_url} with UA: {user_agent}")
-
+            grant = await asyncio.to_thread(
+                _linkedin_request_gate.acquire,
+                "activity_check",
+                f"{job_id}:{retries}",
+            )
             response = await client.get(
                 job_detail_url,
                 headers=headers,
@@ -57,32 +60,64 @@ async def _check_single_linkedin_job_active(job_id: str, client: httpx.AsyncClie
 
             # Check for 404 specifically
             if response.status_code == 404:
+                await asyncio.to_thread(
+                    _linkedin_request_gate.finish, grant, "terminal_unavailable", 404
+                )
                 logging.info(f"Job {job_id} returned 404. Marking as inactive.")
                 return True
+
+            response_text_lower = response.text.lower()
+            response_url = str(response.url or "").lower()
+            if response.status_code in (403, 999) or "/checkpoint/" in response_url or "/challenge/" in response_url or "security verification" in response_text_lower:
+                await asyncio.to_thread(
+                    _linkedin_request_gate.open_circuit,
+                    grant,
+                    f"LinkedIn denied or challenged activity check for {job_id}",
+                    response.status_code,
+                )
+                raise LinkedInCircuitOpen("LinkedIn denied or challenged activity checks")
 
             # Check for other non-successful status codes (could indicate removal, private, etc.)
             # Allow redirects (3xx) as httpx handles them by default with follow_redirects=True
             if response.status_code >= 400:
+                 await asyncio.to_thread(
+                     _linkedin_request_gate.finish, grant, "http_error", response.status_code
+                 )
                  logging.warning(f"Job {job_id} check failed with status {response.status_code}. Assuming active for now.")
                  # Decide if other errors mean inactive. For now, only 404 is definitive.
                  # Could return True here for stricter checking.
                  return False # Or None if we want to retry later
 
             # Check content for inactive keywords
-            response_text_lower = response.text.lower()
             for keyword in inactive_keywords:
                 if keyword in response_text_lower:
+                    await asyncio.to_thread(
+                        _linkedin_request_gate.finish, grant, "terminal_unavailable", response.status_code
+                    )
                     logging.info(f"Job {job_id} contains inactive keyword '{keyword}'. Marking as inactive.")
                     return True
 
             # If status is OK and no inactive keywords found
+            await asyncio.to_thread(
+                _linkedin_request_gate.finish, grant, "complete", response.status_code
+            )
             logging.debug(f"Job {job_id} appears active (Status: {response.status_code}).")
             return False
 
         except httpx.TimeoutException:
+            if grant is not None:
+                await asyncio.to_thread(
+                    _linkedin_request_gate.finish, grant, "transport_error", None
+                )
             logging.warning(f"Timeout checking job {job_id} (Attempt {retries+1}).")
         except httpx.RequestError as e:
+            if grant is not None:
+                await asyncio.to_thread(
+                    _linkedin_request_gate.finish, grant, "transport_error", None
+                )
             logging.warning(f"Request error checking job {job_id} (Attempt {retries+1}): {e}")
+        except LinkedInCircuitOpen:
+            raise
         except Exception as e:
             logging.error(f"Unexpected error checking job {job_id} (Attempt {retries+1}): {e}")
 

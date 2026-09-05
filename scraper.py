@@ -25,6 +25,11 @@ from scrape_configuration import (
     build_search_executions,
     load_scrape_configuration,
 )
+from linkedin_source_policy import (
+    DurableLinkedInRequestGate,
+    LinkedInCircuitOpen,
+    LinkedInGrantRejected,
+)
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -58,6 +63,12 @@ class LinkedInQueryJobs(list):
 
 class _LinkedInDetailUnavailable:
     """Falsey marker for a confirmed terminal LinkedIn detail response."""
+
+    confirmed_terminal_unavailable = True
+
+    def __init__(self, status_code: int = 404, confirmations: int = 2):
+        self.status_code = status_code
+        self.confirmations = confirmations
 
     def __bool__(self) -> bool:
         return False
@@ -386,6 +397,8 @@ def _fetch_linkedin_job_ids(
     geo_id_is_explicit: bool = False,
     request_delay_ms: int | None = None,
     request_limiter: LinkedInRequestLimiter | None = None,
+    durable_gate: DurableLinkedInRequestGate | None = None,
+    user_agent: str | None = None,
 ) -> list:
     """Fetches job IDs from LinkedIn search results pages with delays, rotating user agents, and retries."""
 
@@ -435,10 +448,10 @@ def _fetch_linkedin_job_ids(
             logging.info(f"Waiting for {sleep_time:.2f} seconds before next request...")
             time.sleep(sleep_time)
 
-        user_agent = random.choice(user_agents.USER_AGENTS)
-        headers = {'User-Agent': user_agent}
+        request_user_agent = user_agent or random.choice(user_agents.USER_AGENTS)
+        headers = {'User-Agent': request_user_agent}
     
-        logging.info(f"Using User-Agent: {user_agent}")
+        logging.info(f"Using User-Agent: {request_user_agent}")
 
     
         logging.info(f"Scraping URL: {target_url}")
@@ -446,17 +459,30 @@ def _fetch_linkedin_job_ids(
         res = None 
         retries = 0
         while retries <= config.MAX_RETRIES:
+            grant = None
             try:
+                if durable_gate is not None:
+                    grant = durable_gate.acquire(
+                        "search", f"legacy:{search_query}:{location}:{start}:{retries}"
+                    )
                 res = requests.get(target_url, headers=headers, timeout=config.REQUEST_TIMEOUT)
                 if _linkedin_response_is_challenge(res):
+                    if durable_gate is not None and grant is not None:
+                        durable_gate.open_circuit(
+                            grant, "LinkedIn denied or challenged legacy search", res.status_code
+                        )
                     raise LinkedInAccessDenied(
                         f"LinkedIn denied or challenged search access (status={res.status_code})"
                     )
                 res.raise_for_status()
+                if durable_gate is not None and grant is not None:
+                    durable_gate.finish(grant, "complete", res.status_code)
                 break
             except LinkedInAccessDenied:
                 raise
             except requests.exceptions.HTTPError as e:
+                if durable_gate is not None and grant is not None:
+                    durable_gate.finish(grant, "http_error", e.response.status_code)
                 if e.response.status_code == 429 and retries < config.MAX_RETRIES:
                     retries += 1
                     wait_time = max(
@@ -481,6 +507,8 @@ def _fetch_linkedin_job_ids(
                     res = None 
                     break
             except requests.exceptions.RequestException as e:
+                if durable_gate is not None and grant is not None:
+                    durable_gate.finish(grant, "transport_error", None)
                 raise LinkedInRequestFailed(
                     f"LinkedIn search request failed: {e}"
                 ) from e
@@ -609,6 +637,12 @@ def _fetch_linkedin_job_details(
     job_id: str,
     search_card: dict | None = None,
     request_limiter: LinkedInRequestLimiter | None = None,
+    durable_gate: DurableLinkedInRequestGate | None = None,
+    user_agent: str | None = None,
+    request_key: str | None = None,
+    physical_attempts: list[int] | None = None,
+    physical_limit: int | None = None,
+    required_fields: tuple[str, ...] = (),
 ) -> tuple[dict, dict] | _LinkedInDetailUnavailable | None:
     """Fetch job content and detail metadata, returned as separate dictionaries."""
 
@@ -616,14 +650,14 @@ def _fetch_linkedin_job_details(
 
     logging.info(f"Preparing to fetch details for job ID: {job_id}")
 
-    if request_limiter is None:
+    if durable_gate is None and request_limiter is None:
         sleep_time = random.uniform(3.0, 10.0)
         logging.info(f"Waiting for {sleep_time:.2f} seconds before fetching details...")
         time.sleep(sleep_time)
-    else:
+    elif durable_gate is None:
         request_limiter.wait()
 
-    user_agent = random.choice(user_agents.USER_AGENTS)
+    user_agent = user_agent or random.choice(user_agents.USER_AGENTS)
     headers = {'User-Agent': user_agent}
 
     logging.info(f"Using User-Agent for details: {user_agent}")
@@ -634,18 +668,54 @@ def _fetch_linkedin_job_details(
     resp = None 
     retries = 0
     while retries <= config.MAX_RETRIES:
+        grant = None
         try:
+            if physical_attempts is not None:
+                if physical_limit is not None and physical_attempts[0] >= physical_limit:
+                    raise LinkedInRequestFailed("LinkedIn detail physical-attempt budget exhausted")
+                physical_attempts[0] += 1
+            if durable_gate is not None:
+                grant = durable_gate.acquire(
+                    "detail", f"{request_key or job_id}:{retries}"
+                )
             resp = requests.get(job_detail_url, headers=headers, timeout=config.REQUEST_TIMEOUT)
             if _linkedin_response_is_challenge(resp):
-                raise LinkedInAccessDenied(
+                if durable_gate is not None and grant is not None:
+                    durable_gate.open_circuit(
+                        grant,
+                        f"LinkedIn denied or challenged detail access for {job_id}",
+                        resp.status_code,
+                    )
+                error_type = LinkedInCircuitOpen if durable_gate is not None else LinkedInAccessDenied
+                raise error_type(
                     f"LinkedIn denied or challenged detail access (status={resp.status_code})"
                 )
             resp.raise_for_status()
             break
-        except LinkedInAccessDenied:
+        except (LinkedInAccessDenied, LinkedInCircuitOpen):
             raise
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code in (429, 500, 502, 503, 504) and retries < config.MAX_RETRIES:
+            status_code = e.response.status_code
+            if status_code == 404 and retries < 1:
+                if durable_gate is not None and grant is not None:
+                    durable_gate.finish(grant, "not_found_unconfirmed", status_code)
+                retries += 1
+                time.sleep(config.RETRY_DELAY_SECONDS)
+                continue
+            if status_code in (404, 410):
+                if durable_gate is not None and grant is not None:
+                    durable_gate.finish(grant, "terminal_unavailable", status_code)
+                logging.info(
+                    "LinkedIn detail is no longer available for job ID %s (status=%s)",
+                    job_id,
+                    status_code,
+                )
+                if status_code == 404:
+                    return LINKEDIN_DETAIL_UNAVAILABLE
+                return _LinkedInDetailUnavailable(status_code=410, confirmations=1)
+            if durable_gate is not None and grant is not None:
+                durable_gate.finish(grant, "http_error", status_code)
+            if status_code in (429, 500, 502, 503, 504) and retries < config.MAX_RETRIES:
                 retries += 1
                 wait_time = max(
                     _retry_after_seconds(e.response) or 0,
@@ -654,7 +724,7 @@ def _fetch_linkedin_job_details(
                 
                 logging.warning(
                     "HTTP %s for job ID %s. Retrying attempt %s/%s after %.2f seconds...",
-                    e.response.status_code,
+                    status_code,
                     job_id,
                     retries,
                     config.MAX_RETRIES,
@@ -668,21 +738,16 @@ def _fetch_linkedin_job_details(
                 if request_limiter is not None:
                     request_limiter.wait()
                 continue
-            if e.response.status_code in (429, 500, 502, 503, 504):
+            if status_code in (429, 500, 502, 503, 504):
                 raise LinkedInRequestFailed(
-                    f"LinkedIn detail HTTP {e.response.status_code} exhausted retries for job {job_id}"
+                    f"LinkedIn detail HTTP {status_code} exhausted retries for job {job_id}"
                 ) from e
-            if e.response.status_code in (404, 410):
-                logging.info(
-                    "LinkedIn detail is no longer available for job ID %s (status=%s)",
-                    job_id,
-                    e.response.status_code,
-                )
-                return LINKEDIN_DETAIL_UNAVAILABLE
             raise LinkedInRequestFailed(
-                f"LinkedIn detail HTTP {e.response.status_code} failed for job {job_id}"
+                f"LinkedIn detail HTTP {status_code} failed for job {job_id}"
             ) from e
         except requests.exceptions.RequestException as e:
+            if durable_gate is not None and grant is not None:
+                durable_gate.finish(grant, "transport_error", None)
             raise LinkedInRequestFailed(
                 f"LinkedIn detail request failed for job {job_id}: {e}"
             ) from e
@@ -793,10 +858,21 @@ def _fetch_linkedin_job_details(
         if search_card:
             job_details["posted_at"] = search_card.get("posted_at")
             job_details["posted_relative_text"] = search_card.get("posted_relative_text")
-        
+        missing_fields = [field for field in required_fields if not job_details.get(field)]
+        if missing_fields:
+            raise ValueError(
+                "LinkedIn detail response omitted required fields: "
+                + ", ".join(missing_fields)
+            )
+        if durable_gate is not None and grant is not None:
+            durable_gate.finish(grant, "complete", resp.status_code)
         return job_details, detail_metadata
 
+    except LinkedInGrantRejected:
+         raise
     except Exception as e:
+         if durable_gate is not None and grant is not None:
+              durable_gate.finish(grant, "parser_error", getattr(resp, "status_code", None))
          
          logging.error(f"General Error processing details for job ID {job_id} after successful fetch: {e}")
          return None
@@ -825,6 +901,8 @@ def process_linkedin_query(
     relist_budget: int | None = None,
     run_context: supabase_utils.CanonicalRunContext | None = None,
     request_limiter: LinkedInRequestLimiter | None = None,
+    durable_gate: DurableLinkedInRequestGate | None = None,
+    user_agent: str | None = None,
 ) -> list[dict]:
     """
     Orchestrates scraping and detail fetching for a single query,
@@ -878,6 +956,10 @@ def process_linkedin_query(
         fetch_options["request_delay_ms"] = request_delay_ms
     if request_limiter is not None:
         fetch_options["request_limiter"] = request_limiter
+    if durable_gate is not None:
+        fetch_options["durable_gate"] = durable_gate
+    if user_agent is not None:
+        fetch_options["user_agent"] = user_agent
     empty_coverage = {
         "pages_attempted": 0,
         "pages_completed": 0,
@@ -1128,6 +1210,10 @@ def process_linkedin_query(
         detail_fetch_options = {"search_card": card_by_job_id.get(job_id)}
         if request_limiter is not None:
             detail_fetch_options["request_limiter"] = request_limiter
+        if durable_gate is not None:
+            detail_fetch_options["durable_gate"] = durable_gate
+        if user_agent is not None:
+            detail_fetch_options["user_agent"] = user_agent
         try:
             detail_result = _fetch_linkedin_job_details(job_id, **detail_fetch_options)
         except (LinkedInAccessDenied, LinkedInRequestFailed) as exc:
@@ -1517,12 +1603,63 @@ def _run_database_configured_linkedin(
     scrape_config: ScrapeConfiguration,
     saved_job_ids: list[str],
 ) -> bool:
-    global _relist_detail_fetches_used
     settings = scrape_config.settings
-    last_success_at = supabase_utils.get_last_successful_scrape_at() or config.LINKEDIN_LAST_SUCCESS_AT
     if not settings.scraping_enabled:
         logging.info("LinkedIn scraping disabled by scrape_settings.scraping_enabled")
         return False
+
+    if os.getenv("LINKEDIN_DISCOVERY_MODE", "adaptive_queue").strip().lower() == "adaptive_queue":
+        import linkedin_discovery
+
+        archetype_override = os.getenv("SCRAPE_ARCHETYPE")
+        executions = build_search_executions(
+            scrape_config,
+            archetype_override=archetype_override,
+        )
+        runtime_profiles = {
+            execution.lane.archetype: _lane_runtime_archetype_config(execution)
+            for execution in executions
+        }
+        run_context = supabase_utils.CanonicalRunContext()
+        previous_repost_dedup = config.ENABLE_REPOST_DEDUP
+        config.ENABLE_REPOST_DEDUP = settings.deduplicate_jobs
+
+        def save_adaptive_details(task, worker_id, job):
+            if not settings.fetch_descriptions:
+                job = {**job, "description": None}
+            lane = job.get("lane") or job.get("archetype")
+            if lane not in runtime_profiles:
+                raise ValueError(f"adaptive detail has unknown lane {lane!r}")
+            return supabase_utils.apply_linkedin_discovery_task_canonical(
+                task,
+                worker_id,
+                job,
+                run_context=run_context,
+                runtime_profiles=runtime_profiles,
+            )
+
+        try:
+            result = linkedin_discovery.run_discovery(
+                scrape_config,
+                executions,
+                parse_cards=_extract_linkedin_search_cards,
+                detail_fetch=_fetch_linkedin_job_details,
+                save_details=save_adaptive_details,
+                partial=bool(archetype_override and archetype_override.strip()),
+            )
+        finally:
+            config.ENABLE_REPOST_DEDUP = previous_repost_dedup
+        saved_job_ids.extend(result.canonical_job_ids)
+        os.environ["LINKEDIN_DISCOVERY_CYCLE_ID"] = str(result.cycle_id)
+        output_path = os.getenv("GITHUB_OUTPUT")
+        if output_path:
+            with open(output_path, "a", encoding="utf-8") as output:
+                output.write(f"discovery_cycle_id={result.cycle_id}\n")
+                output.write(f"discovery_sequence={result.discovery_sequence}\n")
+        return result.advance_watermark
+
+    global _relist_detail_fetches_used
+    last_success_at = supabase_utils.get_last_successful_scrape_at() or config.LINKEDIN_LAST_SUCCESS_AT
     configured_lookback_hours = max(
         settings.lookback_days * 24,
         config.LINKEDIN_LOOKBACK_HOURS,
@@ -1554,6 +1691,8 @@ def _run_database_configured_linkedin(
         ),
         jitter_ms=int(settings.options.get("request_jitter_ms", 1_500)),
     )
+    durable_gate = DurableLinkedInRequestGate("legacy-scraper")
+    user_agent = os.getenv("LINKEDIN_USER_AGENT") or user_agents.USER_AGENTS[0]
     archetype_override = os.getenv("SCRAPE_ARCHETYPE")
     executions = build_search_executions(
         scrape_config,
@@ -1609,6 +1748,8 @@ def _run_database_configured_linkedin(
             relist_budget=relist_budget,
             run_context=run_context,
             request_limiter=request_limiter,
+            durable_gate=durable_gate,
+            user_agent=user_agent,
         )
         return execution, runtime_profile, jobs
 
@@ -1715,7 +1856,13 @@ def main() -> list[str]:
     # --- End of Script ---
     logging.info(f"\n{'='*20} Job scraping script finished {'='*20}")
     logging.info(f"Total new jobs saved across all queries: {len(saved_job_ids)}")
-    if "linkedin" not in config.SCRAPING_SOURCES or complete_linkedin_coverage:
+    adaptive_linkedin = (
+        "linkedin" in config.SCRAPING_SOURCES
+        and os.getenv("LINKEDIN_DISCOVERY_MODE", "adaptive_queue").strip().lower() == "adaptive_queue"
+    )
+    if adaptive_linkedin:
+        logging.info("Discovery cycle sealing owns the LinkedIn operational watermark")
+    elif "linkedin" not in config.SCRAPING_SOURCES or complete_linkedin_coverage:
         if not supabase_utils.record_scrape_success():
             raise RuntimeError("Failed to persist scrape success watermark")
     else:

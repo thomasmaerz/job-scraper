@@ -51,3 +51,26 @@ def test_batched_listing_writes_request_minimal_responses(monkeypatch):
 
     assert db.calls[0][2]["returning"] is supabase_utils.ReturnMethod.minimal
     assert db.calls[1][2]["returning"] is supabase_utils.ReturnMethod.minimal
+
+
+def test_listing_writes_retain_cards_without_posted_dates(monkeypatch):
+    db = Db()
+    monkeypatch.setattr(supabase_utils, "supabase", db)
+    card = {
+        "job_id": "1",
+        "posted_at": None,
+        "page_number": 2,
+        "page_start": 10,
+        "position_on_page": 3,
+        "position_in_scope": 13,
+    }
+
+    result = supabase_utils.save_listing_observations([card], "run-1")
+    supabase_utils.save_listing_states([card], {})
+
+    assert result == {"attempted": 1, "skipped_missing_date": 0}
+    observation = db.calls[0][1][0]
+    state = db.calls[1][1][0]
+    assert observation["posted_at"] is None
+    assert observation["position_in_scope"] == 13
+    assert state["latest_trusted_posted_date"] is None

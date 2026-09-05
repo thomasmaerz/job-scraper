@@ -1,5 +1,6 @@
 from supabase import create_client, Client
 from postgrest.types import ReturnMethod
+import httpx
 import config # Import configuration
 from typing import Optional, Any, Dict
 from models import Resume
@@ -18,7 +19,7 @@ from difflib import SequenceMatcher
 from datetime import date, datetime, timezone, timedelta
 import relist_tracking
 import freehire_compat
-from lane_catalog import LANE_ALIASES, canonical_lane_slug
+from lane_catalog import CANONICAL_LANE_SLUGS, LANE_ALIASES, canonical_lane_slug
 
 
 # jobs.location_scope is generated from jobs.location. Configured search
@@ -38,6 +39,72 @@ GENERATED_JOB_FIELDS = frozenset({
     "location_metro",
     "listing_location_province_codes",
     "listing_location_scopes",
+})
+JOB_WRITE_FIELDS = frozenset({
+    "job_id",
+    "company",
+    "job_title",
+    "level",
+    "location",
+    "description",
+    "status",
+    "is_active",
+    "application_date",
+    "resume_score",
+    "notes",
+    "scraped_at",
+    "last_checked",
+    "job_state",
+    "resume_score_stage",
+    "is_interested",
+    "customized_resume_id",
+    "provider",
+    "posted_at",
+    "search_query",
+    "archetype",
+    "filter_profile",
+    "canonical_key",
+    "original_job_id",
+    "latest_job_id",
+    "first_seen_at",
+    "last_seen_at",
+    "last_seen_posted_at",
+    "seen_count",
+    "posting_wave_count",
+    "repost_count",
+    "listing_instances",
+    "description_fingerprint",
+    "same_id_relist_count",
+    "posted_relative_text",
+    "applicant_count",
+    "applicant_count_text",
+    "applicant_count_type",
+    "salary_text",
+    "salary_min",
+    "salary_max",
+    "salary_currency",
+    "recruiter_name",
+    "recruiter_profile_url",
+    "recruiter_identifier",
+    "detail_metadata_checked_at",
+    "freehire_category",
+    "freehire_seniority",
+    "is_remote",
+    "freehire_remote_evidence",
+    "freehire_compat_status",
+    "freehire_compat_input_hash",
+    "freehire_compat_import_hash",
+    "freehire_compat_model",
+    "freehire_compat_prompt_version",
+    "freehire_compat_schema_version",
+    "freehire_compat_confidence",
+    "freehire_compat_classified_at",
+    "freehire_compat_error",
+    "freehire_compat_attempts",
+    "freehire_compat_claimed_at",
+    "freehire_compat_claimed_by",
+    "freehire_compat_next_retry_at",
+    "freehire_compat_provenance",
 })
 
 
@@ -620,7 +687,7 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
         response = (
             supabase.table(config.SUPABASE_TABLE_NAME)
             .select(
-                "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
+                "job_id, canonical_revision, canonical_key, company, job_title, location, description, description_fingerprint, "
                 "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_at, last_seen_posted_at, "
                 "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
                 "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
@@ -631,6 +698,7 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
                 "freehire_compat_status, freehire_compat_input_hash, freehire_compat_import_hash"
             )
             .eq("provider", provider)
+            .order("job_id")
             .range(offset, offset + page_size - 1)
             .execute()
         )
@@ -671,7 +739,7 @@ def _membership_archetypes(job: dict) -> list[str]:
     raw_archetype = job.get("lane") or job.get("archetype")
     if raw_archetype:
         archetype = canonical_lane_slug(raw_archetype)
-        if archetype not in config.ARCHETYPE_CONFIGS:
+        if archetype not in CANONICAL_LANE_SLUGS:
             raise ValueError(f"Unknown membership archetype '{raw_archetype}'")
         return [archetype]
     # Migration compatibility: preserve legacy lane representation even when a
@@ -832,6 +900,415 @@ class CanonicalRunContext:
             self.candidates_by_provider[provider].append(candidate)
             self.refresh_candidate(provider, candidate)
 
+    def invalidate_provider(self, provider: str) -> None:
+        with self._load_lock:
+            self.candidates_by_provider.pop(provider, None)
+            self.existing_job_ids_by_provider.pop(provider, None)
+            self.company_title_keys_by_provider.pop(provider, None)
+            self.canonical_by_source_by_provider.pop(provider, None)
+
+
+class CanonicalTaskApplyAmbiguous(RuntimeError):
+    pass
+
+
+class CanonicalTaskLeaseLost(RuntimeError):
+    pass
+
+
+class CanonicalTaskReceiptConflict(RuntimeError):
+    pass
+
+
+def _provider_candidate_set_revision(candidates: Sequence[Mapping[str, Any]]) -> str:
+    canonical_revisions = {}
+    for candidate in candidates:
+        canonical_id = normalize_job_identifier(candidate.get("job_id"))
+        if canonical_id is None:
+            continue
+        revision = int(candidate.get("canonical_revision") or 0)
+        if revision < 0:
+            raise ValueError("canonical candidate revision must be non-negative")
+        canonical_revisions[canonical_id] = str(revision)
+    ordered_ids = sorted(canonical_revisions, key=lambda value: value.encode("utf-8"))
+    revision_input = "".join(
+        f"{len(job_id.encode('utf-8'))}:{job_id}"
+        f"{len(canonical_revisions[job_id].encode('utf-8'))}:{canonical_revisions[job_id]}"
+        for job_id in ordered_ids
+    )
+    return hashlib.sha256(revision_input.encode("utf-8")).hexdigest()
+
+
+def _exact_source_candidate(job_id: str, candidates: list[dict]) -> dict | None:
+    for candidate in sorted(candidates, key=lambda row: str(row.get("job_id") or "")):
+        if job_id in _candidate_source_ids(candidate):
+            return candidate
+    return None
+
+
+def _canonical_membership_provenances(
+    task: Mapping[str, Any], job: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    raw_provenances = task.get("membership_provenances")
+    if raw_provenances is None:
+        raw_provenances = []
+    if not isinstance(raw_provenances, list):
+        raise ValueError("adaptive discovery task membership provenances must be an array")
+    if not raw_provenances:
+        archetypes = _membership_archetypes(dict(job))
+        if len(archetypes) != 1:
+            raise ValueError("adaptive detail application requires membership provenance")
+        archetype = archetypes[0]
+        provenance = _membership_provenance(dict(job), archetype)
+        observed_at = _valid_membership_observed_at(dict(job), provenance)
+        if observed_at is None:
+            observed_at = str(
+                task.get("latest_observed_at")
+                or task.get("first_observed_at")
+                or datetime.now(timezone.utc).isoformat()
+            )
+        raw_provenances = [{
+            **provenance,
+            "lane": archetype,
+            "archetype": archetype,
+            "observed_at": observed_at,
+        }]
+
+    canonical_by_json: dict[str, dict[str, Any]] = {}
+    for raw_provenance in raw_provenances:
+        if not isinstance(raw_provenance, Mapping):
+            raise ValueError("adaptive discovery membership provenance must be an object")
+        provenance = dict(raw_provenance)
+        raw_archetype = provenance.get("lane") or provenance.get("archetype")
+        if not isinstance(raw_archetype, str) or not raw_archetype.strip():
+            raise ValueError("adaptive discovery membership provenance lacks a lane")
+        archetype = canonical_lane_slug(raw_archetype)
+        if archetype not in CANONICAL_LANE_SLUGS:
+            raise ValueError(f"Unknown membership archetype '{raw_archetype}'")
+        provenance["lane"] = archetype
+        provenance["archetype"] = archetype
+        observed_at = _valid_membership_observed_at({}, provenance)
+        if observed_at is None:
+            raise ValueError("adaptive discovery membership provenance has invalid observed_at")
+        provenance["observed_at"] = observed_at
+        encoded = json.dumps(
+            provenance, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        canonical_by_json[encoded] = provenance
+    return [canonical_by_json[key] for key in sorted(canonical_by_json)]
+
+
+def build_linkedin_discovery_task_application(
+    task: Mapping[str, Any],
+    job: Mapping[str, Any],
+    *,
+    run_context: CanonicalRunContext,
+    runtime_profile: dict | None = None,
+    runtime_profiles: Mapping[str, dict] | None = None,
+) -> dict[str, Any]:
+    source_job_id = normalize_job_identifier(job.get("job_id"))
+    task_source_job_id = normalize_job_identifier(task.get("source_job_id"))
+    if source_job_id is None or source_job_id != task_source_job_id:
+        raise ValueError("adaptive detail source does not match its discovery task")
+    provider = str(job.get("provider") or task.get("provider") or "linkedin")
+    if provider != "linkedin":
+        raise ValueError("adaptive canonical application requires provider linkedin")
+
+    prepared_job = dict(job)
+    prepared_job["job_id"] = source_job_id
+    prepared_job["provider"] = provider
+    ingestion_run_id = str(task.get("first_ingestion_run_id") or "").strip()
+    if not ingestion_run_id:
+        raise ValueError("adaptive discovery task is missing its ingestion run")
+    prepared_job["scrape_run_id"] = ingestion_run_id
+
+    candidates = run_context.candidates_for(provider)
+    match = (
+        find_canonical_match(prepared_job, candidates)
+        if getattr(config, "ENABLE_REPOST_DEDUP", True)
+        else _exact_source_candidate(source_job_id, candidates)
+    )
+    accepted_relist = False
+    if match is None:
+        action = "insert"
+        canonical_job_id = source_job_id
+        canonical_payload = prepare_canonical_insert_payload(prepared_job)
+        expected: dict[str, Any] = {}
+    else:
+        canonical_job_id = str(match["job_id"])
+        canonical_payload = prepare_repost_update_payload(match, prepared_job)
+        canonical_payload.pop("job_id", None)
+        accepted_relist = bool(
+            getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
+            and prepared_job.get("same_id_relist_candidate")
+            and int(canonical_payload.get("same_id_relist_count") or 0)
+            > int(match.get("same_id_relist_count") or 0)
+        )
+        action = "accepted_relist" if accepted_relist else "update"
+        expected = {"last_seen_at": match.get("last_seen_at")}
+        if accepted_relist:
+            expected["listing_instances"] = match.get("listing_instances") or []
+
+    provenances = _canonical_membership_provenances(task, prepared_job)
+    provenance_lanes = {str(provenance["archetype"]) for provenance in provenances}
+    if runtime_profiles is None and len(provenance_lanes) > 1:
+        raise ValueError("cross-lane adaptive membership requires runtime profiles by lane")
+    memberships = []
+    for provenance in provenances:
+        archetype = str(provenance["archetype"])
+        if runtime_profiles is not None:
+            if archetype not in runtime_profiles:
+                raise ValueError(f"adaptive detail has no runtime profile for lane {archetype!r}")
+            lane_runtime_profile = runtime_profiles[archetype]
+        else:
+            lane_runtime_profile = runtime_profile
+        filter_state = evaluate_lane_filter(
+            prepared_job,
+            archetype=archetype,
+            runtime_profile=lane_runtime_profile,
+        )
+        observed_at = str(provenance["observed_at"])
+        memberships.append({
+            "archetype": archetype,
+            "query_scope": provenance,
+            "query_id": provenance.get("query_id"),
+            "query": provenance.get("query") or provenance.get("search_query"),
+            "query_type": provenance.get("query_type") or provenance.get("query_kind"),
+            "language": provenance.get("language"),
+            "location_scope": provenance.get("location_scope"),
+            "geography_id": provenance.get("geography_id"),
+            "first_matched_at": observed_at,
+            "last_matched_at": observed_at,
+            "filter_status": filter_state["filter_status"],
+            "is_filtered": filter_state["is_filtered"],
+            "filter_reason": filter_state["filter_reason"],
+        })
+    memberships.sort(key=lambda value: json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ))
+    latest_membership_observed_at = max(
+        (str(membership["last_matched_at"]) for membership in memberships),
+        key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")),
+    )
+
+    content_version = None
+    content_hash = make_description_content_hash(prepared_job.get("description"))
+    if getattr(config, "ENABLE_LINKEDIN_RELIST_TRACKING", True) and content_hash:
+        content_version = {
+            "content_hash": content_hash,
+            "description": prepared_job.get("description"),
+            "description_fingerprint": make_description_fingerprint(
+                prepared_job.get("description")
+            ),
+            "observed_at": (
+                prepared_job.get("detail_metadata_checked_at")
+                or latest_membership_observed_at
+            ),
+            "ingestion_run_id": ingestion_run_id,
+        }
+
+    relist = None
+    if accepted_relist:
+        relist = {
+            "relisted_on": _date_part(
+                prepared_job.get("same_id_relist_date") or prepared_job.get("posted_at")
+            ),
+            "observed_at": (
+                prepared_job.get("detail_metadata_checked_at")
+                or latest_membership_observed_at
+            ),
+            "evidence": prepared_job.get("same_id_relist_evidence") or {},
+        }
+
+    membership_provenance_revision = int(task.get("membership_provenance_revision") or 0)
+    if membership_provenance_revision < 0:
+        raise ValueError("adaptive discovery membership provenance revision must be non-negative")
+
+    return {
+        "version": "linkedin-canonical-task-apply-v3",
+        "provider_candidate_set_revision": _provider_candidate_set_revision(candidates),
+        "membership_provenance_revision": membership_provenance_revision,
+        "source": {
+            "provider": provider,
+            "source_job_id": source_job_id,
+            "ingestion_run_id": ingestion_run_id,
+        },
+        "canonical": {
+            "action": action,
+            "canonical_job_id": canonical_job_id,
+            "payload": {
+                key: value for key, value in canonical_payload.items()
+                if key in JOB_WRITE_FIELDS
+            },
+            "expected": expected,
+        },
+        "content_version": content_version,
+        "memberships": memberships,
+        "relist": relist,
+    }
+
+
+def _is_ambiguous_canonical_apply_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, ConnectionError, httpx.TransportError)):
+        return True
+    status = getattr(error, "status_code", None)
+    if status in {502, 503, 504, 520}:
+        return True
+    if error.args and isinstance(error.args[0], Mapping):
+        status = error.args[0].get("status") or error.args[0].get("status_code")
+        if status in {502, 503, 504, 520, "502", "503", "504", "520"}:
+            return True
+    return False
+
+
+def _is_canonical_task_lease_error(error: Exception) -> bool:
+    codes = [getattr(error, "code", None)]
+    values: list[Any] = [str(error), getattr(error, "message", None)]
+    if error.args and isinstance(error.args[0], Mapping):
+        codes.append(error.args[0].get("code"))
+        values.append(error.args[0].get("message"))
+    text = " ".join(str(value or "") for value in values).lower()
+    normalized_codes = {str(code) for code in codes if code is not None}
+    return (
+        "40001" in normalized_codes
+        or ("55000" in normalized_codes and "lease" in text)
+        or "task lease lost" in text
+        or "task lease expired" in text
+    )
+
+
+def _is_canonical_task_receipt_conflict(error: Exception) -> bool:
+    values: list[Any] = [str(error)]
+    if error.args and isinstance(error.args[0], Mapping):
+        values.extend((error.args[0].get("code"), error.args[0].get("message")))
+    text = " ".join(str(value or "") for value in values).lower()
+    return "23505" in text and "receipt" in text
+
+
+def _refresh_context_after_task_apply(
+    run_context: CanonicalRunContext,
+    application: Mapping[str, Any],
+    returned_canonical_job_id: str,
+    returned_canonical_revision: Any,
+) -> None:
+    canonical = application["canonical"]
+    planned_id = str(canonical["canonical_job_id"])
+    if returned_canonical_job_id != planned_id:
+        run_context.invalidate_provider("linkedin")
+        return
+    payload = dict(canonical["payload"])
+    try:
+        canonical_revision = int(returned_canonical_revision)
+    except (TypeError, ValueError):
+        run_context.invalidate_provider("linkedin")
+        return
+    if canonical_revision < 0:
+        run_context.invalidate_provider("linkedin")
+        return
+    payload["canonical_revision"] = canonical_revision
+    if canonical["action"] == "insert":
+        payload["job_id"] = returned_canonical_job_id
+        run_context.add_candidate("linkedin", payload)
+        return
+    candidates = run_context.candidates_for("linkedin")
+    candidate = next(
+        (row for row in candidates if str(row.get("job_id")) == returned_canonical_job_id),
+        None,
+    )
+    if candidate is None:
+        run_context.invalidate_provider("linkedin")
+        return
+    candidate.update(payload)
+    run_context.refresh_candidate("linkedin", candidate)
+
+
+def apply_linkedin_discovery_task_canonical(
+    task: Mapping[str, Any],
+    worker_id: str,
+    job: Mapping[str, Any],
+    *,
+    run_context: CanonicalRunContext,
+    runtime_profile: dict | None = None,
+    runtime_profiles: Mapping[str, dict] | None = None,
+    db: Any = None,
+    max_stale_replans: int = 2,
+) -> str:
+    client = db or supabase
+    task_snapshot = dict(task)
+    for stale_attempt in range(max_stale_replans + 1):
+        application = build_linkedin_discovery_task_application(
+            task_snapshot,
+            job,
+            run_context=run_context,
+            runtime_profile=runtime_profile,
+            runtime_profiles=runtime_profiles,
+        )
+        response = None
+        for ambiguous_attempt in range(2):
+            try:
+                response = client.rpc("apply_linkedin_discovery_task_canonical", {
+                    "p_task_id": task_snapshot["id"],
+                    "p_worker_id": worker_id,
+                    "p_lease_token": task_snapshot["lease_token"],
+                    "p_application": application,
+                }).execute()
+                break
+            except Exception as error:
+                if _is_canonical_task_lease_error(error):
+                    raise CanonicalTaskLeaseLost(
+                        "adaptive discovery task lease was lost before publication"
+                    ) from error
+                if _is_canonical_task_receipt_conflict(error):
+                    raise CanonicalTaskReceiptConflict(
+                        "completed adaptive task has a conflicting canonical receipt"
+                    ) from error
+                if not _is_ambiguous_canonical_apply_error(error):
+                    raise
+                if ambiguous_attempt == 1:
+                    raise CanonicalTaskApplyAmbiguous(
+                        "canonical task application outcome is ambiguous"
+                    ) from error
+        if response is None:
+            raise CanonicalTaskApplyAmbiguous(
+                "canonical task application returned no response"
+            )
+        result = _single_rpc_record(
+            response.data, "apply_linkedin_discovery_task_canonical"
+        )
+        outcome = result.get("outcome")
+        if outcome == "stale_plan":
+            run_context.invalidate_provider("linkedin")
+            refreshed_provenances = result.get("task_membership_provenances")
+            refreshed_revision = result.get("task_membership_provenance_revision")
+            if isinstance(refreshed_provenances, list) and refreshed_revision is not None:
+                task_snapshot["membership_provenances"] = refreshed_provenances
+                task_snapshot["membership_provenance_revision"] = int(refreshed_revision)
+            if stale_attempt == max_stale_replans:
+                raise RuntimeError("canonical task application remained stale after replanning")
+            heartbeat_linkedin_discovery_task(
+                int(task_snapshot["id"]), worker_id,
+                str(task_snapshot["lease_token"]), db=client
+            )
+            continue
+        if outcome not in {"applied", "replayed"}:
+            raise RuntimeError(
+                f"apply_linkedin_discovery_task_canonical returned invalid outcome {outcome!r}"
+            )
+        canonical_job_id = normalize_job_identifier(result.get("canonical_job_id"))
+        if canonical_job_id is None:
+            raise RuntimeError(
+                "apply_linkedin_discovery_task_canonical returned no canonical job ID"
+            )
+        if outcome == "replayed":
+            run_context.invalidate_provider("linkedin")
+        else:
+            _refresh_context_after_task_apply(
+                run_context, application, canonical_job_id,
+                result.get("canonical_revision"),
+            )
+        return canonical_job_id
+    raise RuntimeError("canonical task application exhausted stale-plan retries")
+
 
 def save_jobs_canonicalized_with_mapping(
     jobs_data: list,
@@ -991,6 +1468,352 @@ def finish_ingestion_run(run_id: str, **metrics: Any) -> None:
         .eq("id", run_id)
         .execute()
     )
+
+
+def _single_rpc_record(data: Any, rpc_name: str) -> dict[str, Any]:
+    if isinstance(data, Mapping):
+        return dict(data)
+    if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        if len(data) == 1 and isinstance(data[0], Mapping):
+            return dict(data[0])
+    raise RuntimeError(f"{rpc_name} returned an invalid response")
+
+
+def create_linkedin_discovery_cycle(
+    *,
+    execution_id: str,
+    configuration_revision: int | None,
+    configuration_hash: str,
+    user_agent: str,
+    scopes: list[dict[str, Any]],
+    db: Any = None,
+) -> dict[str, Any]:
+    client = db or supabase
+    response = client.rpc("create_linkedin_discovery_cycle", {
+        "p_execution_id": execution_id,
+        "p_config_revision": configuration_revision,
+        "p_config_content_hash": configuration_hash,
+        "p_user_agent": user_agent,
+        "p_scopes": scopes,
+    }).execute()
+    record = _single_rpc_record(response.data, "create_linkedin_discovery_cycle")
+    if not isinstance(record.get("cycle_id"), int) or not isinstance(record.get("scopes"), list):
+        raise RuntimeError("create_linkedin_discovery_cycle returned an incomplete response")
+    return record
+
+
+def get_linkedin_scope_coverage_states(
+    scope_keys: list[str], *, db: Any = None
+) -> dict[str, dict[str, Any]]:
+    if not scope_keys:
+        return {}
+    client = db or supabase
+    response = (
+        client.table("linkedin_scope_coverage_state")
+        .select(
+            "scope_key,last_operational_success_at,recommended_pages,"
+            "coverage_debt,last_deep_sweep_at"
+        )
+        .in_("scope_key", scope_keys)
+        .execute()
+    )
+    rows = response.data or []
+    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+        raise RuntimeError("linkedin scope coverage state query returned an invalid response")
+    return {str(row["scope_key"]): dict(row) for row in rows}
+
+
+def get_pending_linkedin_coverage_debt(
+    scope_keys: list[str], *, db: Any = None
+) -> dict[str, dict[str, Any]]:
+    if not scope_keys:
+        return {}
+    client = db or supabase
+    response = (
+        client.table("linkedin_coverage_debt")
+        .select("scope_key,source_window_earliest_at,source_window_latest_at,created_at")
+        .in_("scope_key", scope_keys)
+        .eq("status", "pending")
+        .order("source_window_earliest_at")
+        .execute()
+    )
+    rows = response.data or []
+    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+        raise RuntimeError("linkedin coverage debt query returned an invalid response")
+    oldest_by_scope: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        oldest_by_scope.setdefault(str(row["scope_key"]), dict(row))
+    return oldest_by_scope
+
+
+def expire_linkedin_coverage_debt(
+    scope_key: str, recovery_floor: str, *, db: Any = None
+) -> int:
+    client = db or supabase
+    response = client.rpc("expire_linkedin_coverage_debt", {
+        "p_scope_key": scope_key,
+        "p_recovery_floor": recovery_floor,
+    }).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError("expire_linkedin_coverage_debt returned an invalid response")
+    return value
+
+
+def accept_linkedin_coverage_debt(
+    debt_id: int, reviewer: str, reason: str, *, db: Any = None
+) -> bool:
+    client = db or supabase
+    response = client.rpc("accept_linkedin_coverage_debt", {
+        "p_debt_id": debt_id,
+        "p_reviewer": reviewer,
+        "p_reason": reason,
+    }).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if value is not True:
+        raise RuntimeError("accept_linkedin_coverage_debt returned an invalid response")
+    return True
+
+
+def accept_linkedin_discovery_requirement(
+    requirement: Mapping[str, Any], reviewer: str, reason: str, *, db: Any = None
+) -> bool:
+    client = db or supabase
+    response = client.rpc("accept_linkedin_discovery_requirement", {
+        "p_discovery_cycle_id": requirement["discovery_cycle_id"],
+        "p_ingestion_run_id": requirement["ingestion_run_id"],
+        "p_provider": requirement["provider"],
+        "p_source_job_id": requirement["source_job_id"],
+        "p_task_kind": requirement["task_kind"],
+        "p_requirement_key": requirement["requirement_key"],
+        "p_reviewer": reviewer,
+        "p_reason": reason,
+    }).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if value is not True:
+        raise RuntimeError(
+            "accept_linkedin_discovery_requirement returned an invalid response"
+        )
+    return True
+
+
+def commit_linkedin_discovery_page(payload: dict[str, Any], db: Any = None) -> dict[str, Any]:
+    client = db or supabase
+    response = client.rpc("commit_linkedin_discovery_page", {"p_page": payload}).execute()
+    record = _single_rpc_record(response.data, "commit_linkedin_discovery_page")
+    required = {"cards", "new_source_ids", "new_workflow_source_ids", "tasks_created"}
+    if not required.issubset(record):
+        raise RuntimeError("commit_linkedin_discovery_page returned an incomplete response")
+    return record
+
+
+def finish_linkedin_discovery_scope(
+    ingestion_run_id: str,
+    coverage_status: str,
+    *,
+    coverage_reason: str,
+    db: Any = None,
+) -> dict[str, Any]:
+    client = db or supabase
+    response = client.rpc("finish_linkedin_discovery_scope", {
+        "p_ingestion_run_id": ingestion_run_id,
+        "p_coverage_status": coverage_status,
+        "p_coverage_reason": coverage_reason,
+    }).execute()
+    return _single_rpc_record(response.data, "finish_linkedin_discovery_scope")
+
+
+def fail_linkedin_discovery_cycle(cycle_id: int, reason: str, db: Any = None) -> None:
+    client = db or supabase
+    client.rpc("fail_linkedin_discovery_cycle", {
+        "p_cycle_id": cycle_id,
+        "p_reason": reason[:2000],
+    }).execute()
+
+
+def seal_linkedin_discovery_cycle(
+    cycle_id: int,
+    *,
+    advance_watermark: bool,
+    db: Any = None,
+) -> dict[str, Any]:
+    client = db or supabase
+    response = client.rpc("seal_linkedin_discovery_cycle", {
+        "p_cycle_id": cycle_id,
+        "p_advance_watermark": advance_watermark,
+    }).execute()
+    return _single_rpc_record(response.data, "seal_linkedin_discovery_cycle")
+
+
+def resolve_eligible_failed_linkedin_discovery_cycles(
+    resolving_cycle_id: int, *, db: Any = None
+) -> int:
+    client = db or supabase
+    response = client.rpc(
+        "resolve_eligible_failed_linkedin_discovery_cycles",
+        {"p_resolving_cycle_id": resolving_cycle_id},
+    ).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(
+            "resolve_eligible_failed_linkedin_discovery_cycles returned an invalid response"
+        )
+    return value
+
+
+def acquire_linkedin_request_grant(
+    producer: str,
+    request_kind: str,
+    request_key: str,
+    *,
+    db: Any = None,
+) -> dict[str, Any]:
+    client = db or supabase
+    response = client.rpc("acquire_linkedin_request_grant", {
+        "p_producer": producer,
+        "p_request_kind": request_kind,
+        "p_request_key": request_key,
+    }).execute()
+    return _single_rpc_record(response.data, "acquire_linkedin_request_grant")
+
+
+def consume_linkedin_request_grant(grant_id: str, producer: str, *, db: Any = None) -> dict[str, Any]:
+    client = db or supabase
+    response = client.rpc("consume_linkedin_request_grant", {
+        "p_grant_id": grant_id,
+        "p_producer": producer,
+    }).execute()
+    return _single_rpc_record(response.data, "consume_linkedin_request_grant")
+
+
+def finish_linkedin_request_grant(
+    grant_id: str,
+    producer: str,
+    response_class: str,
+    http_status: int | None,
+    *,
+    db: Any = None,
+) -> bool:
+    client = db or supabase
+    response = client.rpc("finish_linkedin_request_grant", {
+        "p_grant_id": grant_id,
+        "p_producer": producer,
+        "p_response_class": response_class,
+        "p_http_status": http_status,
+    }).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, bool):
+        raise RuntimeError("finish_linkedin_request_grant returned an invalid response")
+    return value
+
+
+def open_linkedin_source_circuit(
+    grant_id: str,
+    producer: str,
+    reason: str,
+    http_status: int | None,
+    *,
+    db: Any = None,
+) -> bool:
+    client = db or supabase
+    response = client.rpc("open_linkedin_source_circuit", {
+        "p_grant_id": grant_id,
+        "p_producer": producer,
+        "p_reason": reason[:1000],
+        "p_http_status": http_status,
+    }).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, bool):
+        raise RuntimeError("open_linkedin_source_circuit returned an invalid response")
+    return value
+
+
+def claim_linkedin_discovery_tasks(
+    worker_id: str,
+    *,
+    limit: int,
+    order_mode: str = "oldest",
+    db: Any = None,
+) -> list[dict[str, Any]]:
+    client = db or supabase
+    response = client.rpc("claim_linkedin_discovery_tasks", {
+        "p_worker_id": worker_id,
+        "p_limit": limit,
+        "p_order_mode": order_mode,
+    }).execute()
+    rows = response.data or []
+    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+        raise RuntimeError("claim_linkedin_discovery_tasks returned an invalid response")
+    return [dict(row) for row in rows]
+
+
+def transition_linkedin_discovery_task(
+    task_id: int,
+    worker_id: str,
+    lease_token: str,
+    status: str,
+    *,
+    canonical_job_id: str | None = None,
+    error_code: str | None = None,
+    db: Any = None,
+) -> dict[str, Any]:
+    client = db or supabase
+    try:
+        response = client.rpc("transition_linkedin_discovery_task", {
+            "p_task_id": task_id,
+            "p_worker_id": worker_id,
+            "p_lease_token": lease_token,
+            "p_status": status,
+            "p_canonical_job_id": canonical_job_id,
+            "p_error_code": error_code,
+        }).execute()
+    except Exception as error:
+        if _is_canonical_task_lease_error(error):
+            raise CanonicalTaskLeaseLost(
+                "adaptive discovery task lease was lost during transition"
+            ) from error
+        raise
+    return _single_rpc_record(response.data, "transition_linkedin_discovery_task")
+
+
+def heartbeat_linkedin_discovery_task(
+    task_id: int,
+    worker_id: str,
+    lease_token: str,
+    *,
+    db: Any = None,
+) -> str:
+    client = db or supabase
+    try:
+        response = client.rpc("heartbeat_linkedin_discovery_task", {
+            "p_task_id": task_id,
+            "p_worker_id": worker_id,
+            "p_lease_token": lease_token,
+        }).execute()
+    except Exception as error:
+        if _is_canonical_task_lease_error(error):
+            raise CanonicalTaskLeaseLost(
+                "adaptive discovery task lease was lost during heartbeat"
+            ) from error
+        raise
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("heartbeat_linkedin_discovery_task returned an invalid response")
+    return value
 
 
 SCRAPE_RUN_STATE_ID = 1
@@ -1250,7 +2073,7 @@ def save_listing_observations(
     for card in cards:
         source_id = card.get("job_id")
         posted_at = _date_part(card.get("posted_at"))
-        if source_id is None or posted_at is None:
+        if source_id is None:
             skipped_missing_date += 1
             continue
         payloads.append({
@@ -1266,6 +2089,10 @@ def save_listing_observations(
             "result": "seen",
             "query_scope": query_scope,
             "trigger_evidence": card.get("trigger_evidence") or {},
+            "page_number": card.get("page_number"),
+            "page_start": card.get("page_start"),
+            "position_on_page": card.get("position_on_page"),
+            "position_in_scope": card.get("position_in_scope"),
         })
     if payloads:
         (
@@ -1293,7 +2120,20 @@ def save_listing_states(
     for card in cards:
         source_id = str(card.get("job_id"))
         posted_at = _date_part(card.get("posted_at"))
-        if source_id == "None" or posted_at is None:
+        if source_id == "None":
+            continue
+        if posted_at is None:
+            prior = prior_context.get(source_id) or {}
+            payloads.append({
+                "provider": provider,
+                "source_job_id": source_id,
+                "canonical_job_id": canonical_by_source.get(source_id) or prior.get("canonical_job_id"),
+                "first_seen_at": prior.get("first_seen_at") or now_iso,
+                "last_seen_at": now_iso,
+                "latest_trusted_posted_date": prior.get("latest_trusted_posted_date"),
+                "pending_relist_on": prior.get("pending_relist_on"),
+                "same_id_relist_count": int(prior.get("same_id_relist_count") or 0),
+            })
             continue
         prior = prior_context.get(source_id) or {}
         fold = relist_tracking.fold_observations(
@@ -1640,72 +2480,6 @@ def save_jobs_to_supabase(jobs_data: list) -> list[str]:
 
     # Ensure job_id is present and potentially convert to the correct type if needed
     # (Assuming job_id in jobs_data is already the correct string type for your 'text' column)
-    allowed_fields = {
-        "job_id",
-        "company",
-        "job_title",
-        "level",
-        "location",
-        "description",
-        "status",
-        "is_active",
-        "application_date",
-        "resume_score",
-        "notes",
-        "scraped_at",
-        "last_checked",
-        "job_state",
-        "resume_score_stage",
-        "is_interested",
-        "customized_resume_id",
-        "provider",
-        "posted_at",
-        "search_query",
-        "archetype",
-        "filter_profile",
-        "canonical_key",
-        "original_job_id",
-        "latest_job_id",
-        "first_seen_at",
-        "last_seen_at",
-        "last_seen_posted_at",
-        "seen_count",
-        "posting_wave_count",
-        "repost_count",
-        "listing_instances",
-        "description_fingerprint",
-        "same_id_relist_count",
-        "posted_relative_text",
-        "applicant_count",
-        "applicant_count_text",
-        "applicant_count_type",
-        "salary_text",
-        "salary_min",
-        "salary_max",
-        "salary_currency",
-        "recruiter_name",
-        "recruiter_profile_url",
-        "recruiter_identifier",
-        "detail_metadata_checked_at",
-        "freehire_category",
-        "freehire_seniority",
-        "is_remote",
-        "freehire_remote_evidence",
-        "freehire_compat_status",
-        "freehire_compat_input_hash",
-        "freehire_compat_import_hash",
-        "freehire_compat_model",
-        "freehire_compat_prompt_version",
-        "freehire_compat_schema_version",
-        "freehire_compat_confidence",
-        "freehire_compat_classified_at",
-        "freehire_compat_error",
-        "freehire_compat_attempts",
-        "freehire_compat_claimed_at",
-        "freehire_compat_claimed_by",
-        "freehire_compat_next_retry_at",
-        "freehire_compat_provenance",
-    }
     processed_jobs_data = []
     for job in jobs_data:
         job_id = normalize_job_identifier(job.get('job_id'))
@@ -1717,7 +2491,7 @@ def save_jobs_to_supabase(jobs_data: list) -> list[str]:
              # except (ValueError, TypeError):
              #     print(f"Warning: Invalid job_id format found: {job.get('job_id')}. Skipping.")
              # Since it's text, just ensure it's a string (it likely already is)
-             filtered_job = {key: value for key, value in job.items() if key in allowed_fields}
+             filtered_job = {key: value for key, value in job.items() if key in JOB_WRITE_FIELDS}
              filtered_job['job_id'] = job_id
              processed_jobs_data.append(filtered_job)
         else:

@@ -41,6 +41,71 @@ def test_run_configuration_passes_exact_settings_and_query_provenance(monkeypatc
     assert len({id(call["request_limiter"]) for call in calls}) == 1
 
 
+def test_disabled_configuration_does_not_start_adaptive_discovery(monkeypatch):
+    configured = configuration().model_copy(update={
+        "settings": configuration().settings.model_copy(update={"scraping_enabled": False}),
+    })
+    monkeypatch.setenv("LINKEDIN_DISCOVERY_MODE", "adaptive_queue")
+    monkeypatch.setattr(
+        scraper,
+        "build_search_executions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled scraping must not build discovery scopes")
+        ),
+    )
+
+    assert scraper._run_database_configured_linkedin(configured, []) is False
+
+
+def test_adaptive_save_uses_atomic_task_application(monkeypatch):
+    configured = configuration()
+    execution = scraper.build_search_executions(configured)[0]
+    persisted = []
+    monkeypatch.setenv("LINKEDIN_DISCOVERY_MODE", "adaptive_queue")
+    monkeypatch.setattr(scraper, "build_search_executions", lambda *_args, **_kwargs: [execution])
+    monkeypatch.setattr(
+        scraper,
+        "_lane_runtime_archetype_config",
+        lambda _execution: {"filter_profile": "technology_delivery_v1"},
+    )
+    monkeypatch.setattr(
+        scraper.supabase_utils,
+        "apply_linkedin_discovery_task_canonical",
+        lambda task, worker_id, job, run_context, runtime_profiles: persisted.append(
+            (
+                task["id"], worker_id, job["filter_profile"],
+                runtime_profiles["technology_delivery"]["filter_profile"],
+            )
+        ) or "canonical-1",
+    )
+
+    def fake_run(*_args, save_details, **_kwargs):
+        saved = save_details({"id": 7}, "worker-1", {
+            "job_id": "source-1",
+            "lane": "technology_delivery",
+            "filter_profile": "technology_delivery_v1",
+            "description": "details",
+        })
+        return SimpleNamespace(
+            canonical_job_ids=(saved,),
+            cycle_id=9,
+            discovery_sequence=4,
+            advance_watermark=True,
+        )
+
+    monkeypatch.setattr("linkedin_discovery.run_discovery", fake_run)
+    saved_ids = []
+
+    assert scraper._run_database_configured_linkedin(configured, saved_ids) is True
+    assert saved_ids == ["canonical-1"]
+    assert persisted == [(
+        7,
+        "worker-1",
+        "technology_delivery_v1",
+        "technology_delivery_v1",
+    )]
+
+
 def test_configured_run_fails_when_any_query_reports_incomplete_processing(monkeypatch):
     configured = configuration()
     execution = SimpleNamespace(

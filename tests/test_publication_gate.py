@@ -214,3 +214,86 @@ def test_finalize_publication_uses_transactional_rpc_count():
     })
 
     assert publication["row_count"] == 10
+
+
+def test_cycle_publication_uses_queue_barrier_rpc():
+    class CycleDb(Db):
+        def rpc(self, name, params):
+            self.rpc_calls = getattr(self, "rpc_calls", []) + [(name, params)]
+            assert name == "finalize_freehire_publication_v2"
+            assert params == {"p_cycle_id": 12}
+            return SimpleNamespace(
+                execute=lambda: SimpleNamespace(data={
+                    "outcome": "published",
+                    "reason": None,
+                    "requested_cycle_id": 12,
+                    "eligible_cycle_id": 12,
+                    "generation": 8,
+                    "published_at": "2025-01-02T03:10:00+00:00",
+                    "source_scrape_watermark": "2025-01-02T03:04:05+00:00",
+                    "source_discovery_sequence": 10,
+                    "row_count": 10,
+                    "schema_version": "freehire-publication-v1",
+                })
+            )
+
+    publication = publication_gate.finalize_publication(
+        CycleDb(),
+        {"scrape_watermark": "2025-01-02T03:04:05+00:00"},
+        discovery_cycle_id=12,
+    )
+
+    assert publication["outcome"] == "published"
+    assert publication["requested_cycle_id"] == 12
+    assert publication["generation"] == 8
+
+
+def test_cycle_publication_deferral_is_a_successful_typed_result():
+    class DeferredDb:
+        def rpc(self, name, params):
+            assert name == "finalize_freehire_publication_v2"
+            assert params == {"p_cycle_id": 12}
+            return SimpleNamespace(
+                execute=lambda: SimpleNamespace(data={
+                    "outcome": "deferred",
+                    "reason": "unresolved discovery tasks",
+                    "requested_cycle_id": 12,
+                    "eligible_cycle_id": None,
+                    "blocking_count": 3,
+                })
+            )
+
+    publication = publication_gate.finalize_publication(
+        DeferredDb(),
+        {"scrape_watermark": "2025-01-02T03:04:05+00:00"},
+        discovery_cycle_id=12,
+    )
+
+    assert publication["outcome"] == "deferred"
+    assert publication["blocking_count"] == 3
+    assert publication["generation"] is None
+
+
+def test_cycle_publication_deferral_allows_initial_empty_state():
+    class DeferredDb:
+        def rpc(self, name, params):
+            assert name == "finalize_freehire_publication_v2"
+            assert params == {"p_cycle_id": 12}
+            return SimpleNamespace(
+                execute=lambda: SimpleNamespace(data={
+                    "outcome": "deferred",
+                    "reason": "unresolved discovery tasks",
+                    "requested_cycle_id": 12,
+                    "eligible_cycle_id": None,
+                    "blocking_count": 1,
+                })
+            )
+
+    state = {"current": 0, "published": 0, "scrape_watermark": None}
+    publication_gate.validate_publication_state(state, require_legacy_ready=False)
+    publication = publication_gate.finalize_publication(
+        DeferredDb(), state, discovery_cycle_id=12
+    )
+
+    assert publication["outcome"] == "deferred"
+    assert publication["source_scrape_watermark"] is None

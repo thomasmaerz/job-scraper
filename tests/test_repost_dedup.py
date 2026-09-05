@@ -31,6 +31,10 @@ class _RecordingQuery:
         self.filters.append(("range", start, end))
         return self
 
+    def order(self, field):
+        self.filters.append(("order", field))
+        return self
+
     def upsert(self, payload):
         self.upsert_payloads.append(payload)
         return self
@@ -763,7 +767,7 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
     supabase_utils.get_canonical_candidates(provider="linkedin")
 
     assert query.selected == (
-        "job_id, canonical_key, company, job_title, location, description, description_fingerprint, "
+        "job_id, canonical_revision, canonical_key, company, job_title, location, description, description_fingerprint, "
         "listing_instances, seen_count, posting_wave_count, repost_count, latest_job_id, last_seen_at, last_seen_posted_at, "
         "posted_relative_text, applicant_count, applicant_count_text, applicant_count_type, "
         "salary_text, salary_min, salary_max, salary_currency, recruiter_name, "
@@ -773,6 +777,7 @@ def test_get_canonical_candidates_selects_fields_needed_for_partial_repost_updat
         "freehire_category, freehire_seniority, is_remote, freehire_remote_evidence, "
         "freehire_compat_status, freehire_compat_input_hash, freehire_compat_import_hash"
     )
+    assert ("order", "job_id") in query.filters
 
 
 def test_find_canonical_match_does_not_merge_different_locations():

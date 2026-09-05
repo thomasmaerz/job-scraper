@@ -34,6 +34,9 @@ jobs:
     # Multi-lane searches are intentionally serialized around the synchronous
     # Supabase client; allow the configured query set to finish cleanly.
     timeout-minutes: 180
+    outputs:
+      discovery_cycle_id: ${{ steps.scraper.outputs.discovery_cycle_id }}
+      discovery_sequence: ${{ steps.scraper.outputs.discovery_sequence }}
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
@@ -45,20 +48,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Determine LinkedIn recovery window
+      - name: Configure manual LinkedIn recovery window
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          REQUESTED_LOOKBACK_HOURS: ${{ inputs.lookback_hours || '48' }}
+          REQUESTED_LOOKBACK_HOURS: ${{ inputs.lookback_hours }}
         run: |
-          last_success_at="$(gh run list --workflow scrape_jobs.yml --branch "$GITHUB_REF_NAME" --status success --limit 1 --json createdAt --jq '.[0].createdAt // empty')"
-          echo "LINKEDIN_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" >> "$GITHUB_ENV"
-          echo "LINKEDIN_LAST_SUCCESS_AT=${last_success_at}" >> "$GITHUB_ENV"
-          echo "Requested lookback: ${REQUESTED_LOOKBACK_HOURS}h; last successful run: ${last_success_at:-unavailable}"
+          echo "LINKEDIN_RECOVERY_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" >> "$GITHUB_ENV"
+          echo "Requested recovery lookback: ${REQUESTED_LOOKBACK_HOURS}h"
       - name: Run scraper script
+        id: scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SCRAPE_ARCHETYPE: ${{ inputs.archetype || '' }}
+          LINKEDIN_DISCOVERY_MODE: adaptive_queue
         run: python scraper.py
 
   freehire_compat:
@@ -96,6 +99,9 @@ jobs:
       scrape_watermark: ${{ steps.gate.outputs.scrape_watermark }}
       published: ${{ steps.gate.outputs.published }}
       generation: ${{ steps.gate.outputs.generation }}
+      outcome: ${{ steps.gate.outputs.outcome }}
+      requested_cycle_id: ${{ steps.gate.outputs.requested_cycle_id }}
+      eligible_cycle_id: ${{ steps.gate.outputs.eligible_cycle_id }}
       published_at: ${{ steps.gate.outputs.published_at }}
       row_count: ${{ steps.gate.outputs.row_count }}
       schema_version: ${{ steps.gate.outputs.schema_version }}
@@ -115,3 +121,4 @@ jobs:
           python publication_gate.py
           --scrape-result "${{ needs.scrape.result }}"
           --freehire-compat-result "${{ needs.freehire_compat.result }}"
+          --discovery-cycle-id "${{ needs.scrape.outputs.discovery_cycle_id }}"

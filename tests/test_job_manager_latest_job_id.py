@@ -89,3 +89,35 @@ def test_check_linkedin_job_activity_uses_latest_job_id_for_fetch_and_canonical_
     assert any("latest_job_id" in fields for fields in selected)
     assert checked_ids == ["linkedin-live-99"]
     assert updated_batches, "Expected update call for canonical row"
+
+
+def test_activity_check_consumes_durable_request_grant(monkeypatch):
+    events = []
+
+    class Gate:
+        def acquire(self, kind, key):
+            events.append(("acquire", kind, key))
+            return "grant-1"
+
+        def finish(self, grant, response_class, status):
+            events.append(("finish", grant, response_class, status))
+
+    class Client:
+        async def get(self, *_args, **_kwargs):
+            return type("Response", (), {
+                "status_code": 200,
+                "text": "active job",
+                "url": "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/source-1",
+            })()
+
+    monkeypatch.setattr(job_manager, "_linkedin_request_gate", Gate())
+
+    result = asyncio.run(
+        job_manager._check_single_linkedin_job_active("source-1", Client())
+    )
+
+    assert result is False
+    assert events == [
+        ("acquire", "activity_check", "source-1:0"),
+        ("finish", "grant-1", "complete", 200),
+    ]

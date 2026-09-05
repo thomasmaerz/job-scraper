@@ -60,8 +60,9 @@ The production path is GitHub Actions + Supabase. Local execution uses the same 
 2.  **Create and migrate a Supabase project:**
     - Go to [Supabase](https://supabase.com/) and create a new project.
     - Once your project is created, navigate to the "SQL Editor" section.
-    - Open the `supabase_setup/init.sql` file from this repository, copy its content, and run it in your Supabase SQL Editor. This will set up the necessary tables (like `jobs`, `customized_resumes`, `keyword_insights`, `job_keyword_insights`, and `base_resume`) and storage buckets (`resumes`, `personalized_resumes`).
-    - Apply the migrations in the companion `job-scraper-web/supabase/migrations` directory. The configurable-lane migration adds the lane registry, search configuration, job memberships, resume profiles, protected RPCs, and the explicit `software_tpm` → `technology_delivery` compatibility alias.
+    - Run `supabase_setup/init.sql` first. It creates the base schema, storage buckets, and adaptive LinkedIn objects in base-install mode while deferring the externally owned job-membership relation.
+    - Next, apply the migrations in the companion `job-scraper-web/supabase/migrations` directory. The configurable-lane migration adds `job_archetype_memberships`, the lane registry, search configuration, resume profiles, protected RPCs, and the explicit `software_tpm` → `technology_delivery` compatibility alias.
+    - Do not start scraping until those companion migrations have completed. Existing installations must have the companion membership schema in place before applying standalone `supabase_setup/add_adaptive_linkedin_discovery.sql`; that migration intentionally fails fast when the contract is absent.
     - For an older schema, apply outstanding migrations in order rather than editing production tables manually.
     - Scheduled `Analyze Job Insights` runs only process new unanalyzed jobs. Use the manual `replacement_backfill` workflow input only when you explicitly want a one-time reanalysis of previously analyzed jobs.
 

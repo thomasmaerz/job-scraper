@@ -7,6 +7,7 @@ import pytest
 import requests
 
 import scraper
+from linkedin_source_policy import ConsumedGrant, LinkedInCircuitOpen
 
 
 def _disable_relist_tracking(monkeypatch):
@@ -63,6 +64,59 @@ def test_fetch_linkedin_job_details_returns_content_and_metadata(monkeypatch):
     assert metadata["applicant_count"] == 26
     assert metadata["salary_min"] == 120000
     assert metadata["detail_metadata_checked_at"]
+
+
+def test_fetch_linkedin_details_uses_durable_gate_without_legacy_limiter(monkeypatch):
+    html = Path("tests/fixtures/linkedin_job_detail_recruiter.html").read_text()
+    events = []
+
+    class Response:
+        status_code = 200
+        text = html
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/4428124095"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Gate:
+        def acquire(self, kind, key):
+            events.append(("acquire", kind, key))
+            return ConsumedGrant("grant-1", datetime.now(timezone.utc))
+
+        def finish(self, grant, response_class, status):
+            events.append(("finish", grant.grant_id, response_class, status))
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+
+    result = scraper._fetch_linkedin_job_details(
+        "4428124095", durable_gate=Gate(), user_agent="ua"
+    )
+
+    assert result
+    assert events == [
+        ("acquire", "detail", "4428124095:0"),
+        ("finish", "grant-1", "complete", 200),
+    ]
+
+
+def test_durable_detail_challenge_raises_source_circuit(monkeypatch):
+    class Response:
+        status_code = 403
+        text = "blocked"
+        url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/123"
+
+    class Gate:
+        def acquire(self, *_args):
+            return ConsumedGrant("grant-1", datetime.now(timezone.utc))
+
+        def open_circuit(self, *_args):
+            return None
+
+    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(LinkedInCircuitOpen):
+        scraper._fetch_linkedin_job_details("123", durable_gate=Gate(), user_agent="ua")
 
 
 def test_global_request_limiter_spaces_requests_from_one_clock(monkeypatch):
@@ -145,7 +199,12 @@ def test_detail_not_found_is_a_terminal_unavailable_result(monkeypatch):
         def raise_for_status(self):
             raise requests.exceptions.HTTPError(response=self)
 
-    monkeypatch.setattr(scraper.requests, "get", lambda *_args, **_kwargs: Response())
+    requests_made = []
+    monkeypatch.setattr(
+        scraper.requests,
+        "get",
+        lambda *_args, **_kwargs: requests_made.append(True) or Response(),
+    )
     monkeypatch.setattr(scraper.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(scraper.random, "choice", lambda values: values[0])
 
@@ -153,6 +212,7 @@ def test_detail_not_found_is_a_terminal_unavailable_result(monkeypatch):
 
     assert result is scraper.LINKEDIN_DETAIL_UNAVAILABLE
     assert not result
+    assert len(requests_made) == 2
 
 
 def test_process_query_marks_zero_cards_incomplete(monkeypatch):

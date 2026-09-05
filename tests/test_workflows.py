@@ -29,16 +29,17 @@ def test_downstream_workflows_default_to_enabled_lanes_with_optional_override():
     assert scrape_step["env"]["SCRAPE_ARCHETYPE"] == "${{ inputs.archetype || '' }}"
 
 
-def test_scrape_workflow_exports_manual_recovery_lookback():
+def test_scrape_workflow_exports_only_manual_recovery_lookback():
     hourly = load_workflow("scrape_jobs.yml")
     recovery_step = next(
         step
         for step in hourly["jobs"]["scrape"]["steps"]
-        if step.get("name") == "Determine LinkedIn recovery window"
+        if step.get("name") == "Configure manual LinkedIn recovery window"
     )
 
-    assert recovery_step["env"]["REQUESTED_LOOKBACK_HOURS"] == "${{ inputs.lookback_hours || '48' }}"
-    assert "LINKEDIN_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" in recovery_step["run"]
+    assert recovery_step["if"] == "${{ github.event_name == 'workflow_dispatch' }}"
+    assert recovery_step["env"]["REQUESTED_LOOKBACK_HOURS"] == "${{ inputs.lookback_hours }}"
+    assert "LINKEDIN_RECOVERY_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" in recovery_step["run"]
 
 
 def test_scrape_workflow_allows_multi_lane_serial_runtime():
@@ -52,6 +53,14 @@ def test_scoring_and_resume_workflows_have_defense_in_depth_concurrency_groups()
     resume = load_workflow("hourly_resume_customization.yml")
     assert score["concurrency"] == {"group": "lane-scoring", "cancel-in-progress": False}
     assert resume["concurrency"] == {"group": "lane-resume-generation", "cancel-in-progress": False}
+
+
+def test_all_linkedin_producer_workflows_share_source_concurrency_group():
+    expected = {"group": "linkedin-freehire-pipeline", "cancel-in-progress": False}
+
+    assert load_workflow("scrape_jobs.yml")["concurrency"] == expected
+    assert load_workflow("job_manager.yml")["concurrency"] == expected
+    assert load_workflow("backfill_linkedin_metadata.yml")["concurrency"] == expected
 
 
 def load_workflow(name):
@@ -87,12 +96,12 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
     recovery_step = next(
         step
         for step in workflow["jobs"]["scrape"]["steps"]
-        if step["name"] == "Determine LinkedIn recovery window"
+        if step["name"] == "Configure manual LinkedIn recovery window"
     )
-    assert recovery_step["env"]["REQUESTED_LOOKBACK_HOURS"] == "${{ inputs.lookback_hours || '48' }}"
-    assert "--status success" in recovery_step["run"]
-    assert '--branch "$GITHUB_REF_NAME"' in recovery_step["run"]
-    assert "LINKEDIN_LAST_SUCCESS_AT" in recovery_step["run"]
+    assert recovery_step["env"]["REQUESTED_LOOKBACK_HOURS"] == "${{ inputs.lookback_hours }}"
+    assert "LINKEDIN_RECOVERY_LOOKBACK_HOURS" in recovery_step["run"]
+    scrape_step = next(step for step in workflow["jobs"]["scrape"]["steps"] if step.get("id") == "scraper")
+    assert scrape_step["env"]["LINKEDIN_DISCOVERY_MODE"] == "adaptive_queue"
 
 
 def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
@@ -133,10 +142,12 @@ def test_publication_gate_checks_results_and_production_contract():
     assert "python publication_gate.py" in run
     assert '--scrape-result "${{ needs.scrape.result }}"' in run
     assert '--freehire-compat-result "${{ needs.freehire_compat.result }}"' in run
+    assert '--discovery-cycle-id "${{ needs.scrape.outputs.discovery_cycle_id }}"' in run
     assert "--analyze-jobs-result" not in run
     assert gate["outputs"]["scrape_watermark"] == "${{ steps.gate.outputs.scrape_watermark }}"
     assert gate["outputs"]["generation"] == "${{ steps.gate.outputs.generation }}"
     assert gate["outputs"]["schema_version"] == "${{ steps.gate.outputs.schema_version }}"
+    assert gate["outputs"]["outcome"] == "${{ steps.gate.outputs.outcome }}"
 
 
 def test_source_pipeline_is_pull_only_and_ends_after_finalization():

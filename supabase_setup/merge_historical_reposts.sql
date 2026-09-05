@@ -289,7 +289,21 @@ DECLARE
     group_count integer := 0;
     deleted_count integer := 0;
     affected integer;
+    membership_table regclass;
+    membership_insert_columns text;
+    membership_select_columns text;
+    membership_transfer_nulls jsonb := '{}'::jsonb;
+    membership_resume_claim_nulls jsonb := '{}'::jsonb;
+    membership_resume_state_value text;
+    membership_has_resume_state boolean := false;
+    membership_unsafe_resume_transfer boolean;
+    customized_resume_table regclass;
+    customized_resume_has_job_id boolean := false;
 BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('linkedin-canonical-publication-v1', 0)
+    );
+
     -- Serialize execution with atomic plan replacement.
     PERFORM pg_advisory_xact_lock(
         hashtextextended('historical-repost-plan-global', 0)
@@ -299,6 +313,18 @@ BEGIN
     PERFORM pg_advisory_xact_lock(
         hashtextextended('keyword-insights-aggregate-global', 0)
     );
+
+    IF to_regclass('public.linkedin_discovery_tasks') IS NOT NULL THEN
+        EXECUTE $lock_tasks$
+            SELECT task.id
+            FROM public.linkedin_discovery_tasks task
+            WHERE task.canonical_job_id IN (
+                SELECT plan.source_job_id FROM public.job_repost_merge_plan plan
+            )
+            ORDER BY task.id
+            FOR UPDATE
+        $lock_tasks$;
+    END IF;
 
     -- Lock every source and survivor in one deterministic order before reading
     -- or deleting any merge inputs. Concurrent scraper updates then wait for
@@ -314,6 +340,30 @@ BEGIN
     )
     ORDER BY jobs.job_id
     FOR UPDATE OF jobs;
+
+    customized_resume_table := pg_catalog.to_regclass('public.customized_resumes');
+    IF customized_resume_table IS NOT NULL THEN
+        SELECT COUNT(*) = 2
+        INTO customized_resume_has_job_id
+        FROM pg_catalog.pg_attribute AS attribute
+        WHERE attribute.attrelid = customized_resume_table
+          AND attribute.attname IN ('id', 'job_id')
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped;
+        IF customized_resume_has_job_id THEN
+            EXECUTE $lock_customized_resumes$
+                SELECT resume.id
+                FROM public.customized_resumes AS resume
+                WHERE resume.job_id IN (
+                    SELECT source_job_id FROM public.job_repost_merge_plan
+                    UNION
+                    SELECT survivor_job_id FROM public.job_repost_merge_plan
+                )
+                ORDER BY resume.id
+                FOR UPDATE OF resume
+            $lock_customized_resumes$;
+        END IF;
+    END IF;
 
     IF EXISTS (
         SELECT 1
@@ -331,6 +381,197 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'Merge plan contains survivor chains';
     END IF;
+
+    PERFORM observation.id
+    FROM public.listing_observations AS observation
+    WHERE observation.canonical_job_id IN (
+        SELECT source_job_id FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id FROM public.job_repost_merge_plan
+    )
+    ORDER BY observation.id
+    FOR UPDATE OF observation;
+
+    PERFORM version.provider, version.source_job_id, version.content_hash
+    FROM public.listing_content_versions AS version
+    WHERE version.canonical_job_id IN (
+        SELECT source_job_id FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id FROM public.job_repost_merge_plan
+    )
+    ORDER BY version.provider, version.source_job_id, version.content_hash
+    FOR UPDATE OF version;
+
+    PERFORM relist.id
+    FROM public.listing_relist_events AS relist
+    WHERE relist.canonical_job_id IN (
+        SELECT source_job_id FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id FROM public.job_repost_merge_plan
+    )
+    ORDER BY relist.id
+    FOR UPDATE OF relist;
+
+    PERFORM state.provider, state.source_job_id
+    FROM public.listing_states AS state
+    WHERE state.canonical_job_id IN (
+        SELECT source_job_id FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id FROM public.job_repost_merge_plan
+    )
+    ORDER BY state.provider, state.source_job_id
+    FOR UPDATE OF state;
+
+    PERFORM resume_link.canonical_job_id, resume_link.customized_resume_id
+    FROM public.job_resume_links AS resume_link
+    WHERE resume_link.canonical_job_id IN (
+        SELECT source_job_id FROM public.job_repost_merge_plan
+        UNION
+        SELECT survivor_job_id FROM public.job_repost_merge_plan
+    )
+    ORDER BY resume_link.canonical_job_id, resume_link.customized_resume_id
+    FOR UPDATE OF resume_link;
+
+    membership_table := pg_catalog.to_regclass('public.job_archetype_memberships');
+    IF membership_table IS NOT NULL THEN
+        -- This table is externally owned, so all relation references stay
+        -- dynamic and transferable columns are discovered from its catalog.
+        EXECUTE $lock_memberships$
+            SELECT membership.job_id, membership.archetype
+            FROM public.job_archetype_memberships AS membership
+            WHERE membership.job_id IN (
+                SELECT source_job_id FROM public.job_repost_merge_plan
+                UNION
+                SELECT survivor_job_id FROM public.job_repost_merge_plan
+            )
+            ORDER BY membership.job_id, membership.archetype
+            FOR UPDATE OF membership
+        $lock_memberships$;
+
+        SELECT
+            pg_catalog.string_agg(pg_catalog.format('%I', attribute.attname), ', ' ORDER BY attribute.attnum),
+            pg_catalog.string_agg(
+                pg_catalog.format('(transferred.row_value).%I', attribute.attname),
+                ', ' ORDER BY attribute.attnum
+            )
+        INTO membership_insert_columns, membership_select_columns
+        FROM pg_catalog.pg_attribute AS attribute
+        WHERE attribute.attrelid = membership_table
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND attribute.attgenerated = ''
+          AND attribute.attidentity = '';
+
+        SELECT COALESCE(
+            pg_catalog.jsonb_object_agg(attribute.attname, 'null'::jsonb),
+            '{}'::jsonb
+        )
+        INTO membership_transfer_nulls
+        FROM pg_catalog.pg_attribute AS attribute
+        WHERE attribute.attrelid = membership_table
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND NOT attribute.attnotnull
+          AND attribute.attname IN ('customized_resume_id', 'base_resume_id')
+          AND EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_constraint AS constraint_row
+              JOIN pg_catalog.pg_attribute AS job_attribute
+                ON job_attribute.attrelid = membership_table
+               AND job_attribute.attname = 'job_id'
+               AND job_attribute.attnum > 0
+               AND NOT job_attribute.attisdropped
+              JOIN pg_catalog.pg_attribute AS resume_attribute
+                ON resume_attribute.attrelid = membership_table
+               AND resume_attribute.attname IN ('customized_resume_id', 'base_resume_id')
+               AND resume_attribute.attnum > 0
+               AND NOT resume_attribute.attisdropped
+              WHERE constraint_row.conrelid = membership_table
+                AND constraint_row.contype = 'f'
+                AND pg_catalog.cardinality(constraint_row.conkey) > 1
+                AND job_attribute.attnum = ANY (constraint_row.conkey)
+                AND resume_attribute.attnum = ANY (constraint_row.conkey)
+          );
+
+        IF membership_transfer_nulls ? 'customized_resume_id'
+           OR membership_transfer_nulls ? 'base_resume_id' THEN
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_attribute AS attribute
+                WHERE attribute.attrelid = membership_table
+                  AND attribute.attname = 'resume_state'
+                  AND attribute.attnum > 0
+                  AND NOT attribute.attisdropped
+                  AND attribute.attgenerated = ''
+                  AND attribute.attidentity = ''
+            )
+            INTO membership_has_resume_state;
+
+            SELECT candidate.state
+            INTO membership_resume_state_value
+            FROM pg_catalog.pg_attribute AS attribute
+            JOIN pg_catalog.pg_type AS type_row ON type_row.oid = attribute.atttypid
+            CROSS JOIN LATERAL (VALUES ('stale', 1), ('pending', 2)) AS candidate(state, priority)
+            WHERE attribute.attrelid = membership_table
+              AND attribute.attname = 'resume_state'
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+              AND attribute.attgenerated = ''
+              AND attribute.attidentity = ''
+              AND (
+                  (
+                      type_row.typtype = 'e'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_enum AS enum_value
+                          WHERE enum_value.enumtypid = attribute.atttypid
+                            AND enum_value.enumlabel = candidate.state
+                      )
+                  )
+                  OR (
+                      type_row.typcategory = 'S'
+                      AND (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM pg_catalog.pg_constraint AS state_constraint
+                              WHERE state_constraint.conrelid = membership_table
+                                AND state_constraint.contype = 'c'
+                                AND attribute.attnum = ANY (state_constraint.conkey)
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM pg_catalog.pg_constraint AS state_constraint
+                              WHERE state_constraint.conrelid = membership_table
+                                AND state_constraint.contype = 'c'
+                                AND attribute.attnum = ANY (state_constraint.conkey)
+                                AND pg_catalog.strpos(
+                                    pg_catalog.lower(
+                                        pg_catalog.pg_get_constraintdef(state_constraint.oid)
+                                    ),
+                                    pg_catalog.quote_literal(candidate.state)
+                                ) > 0
+                          )
+                      )
+                  )
+              )
+            ORDER BY candidate.priority
+            LIMIT 1;
+
+            SELECT COALESCE(
+                pg_catalog.jsonb_object_agg(attribute.attname, 'null'::jsonb),
+                '{}'::jsonb
+            )
+            INTO membership_resume_claim_nulls
+            FROM pg_catalog.pg_attribute AS attribute
+            WHERE attribute.attrelid = membership_table
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+              AND NOT attribute.attnotnull
+              AND attribute.attname ~ '^resume_.*(claim|claimed)_(by|at|expires_at|token|id)$';
+        END IF;
+    END IF;
+
+    PERFORM pg_catalog.set_config('app.historical_repost_merge', 'on', true);
 
     FOR survivor IN
         SELECT DISTINCT survivor_job_id FROM public.job_repost_merge_plan ORDER BY survivor_job_id
@@ -406,15 +647,81 @@ BEGIN
             observed_at = GREATEST(public.job_listing_archive.observed_at, EXCLUDED.observed_at),
             source_snapshot = public.job_listing_archive.source_snapshot || EXCLUDED.source_snapshot;
 
-        INSERT INTO public.job_resume_links (canonical_job_id, customized_resume_id, source_job_id)
-        SELECT survivor, j.customized_resume_id, j.job_id
+        INSERT INTO public.job_resume_links AS survivor_link (
+            canonical_job_id, customized_resume_id, source_job_id
+        )
+        SELECT
+            survivor,
+            resume_link.customized_resume_id,
+            min(NULLIF(btrim(resume_link.source_job_id), ''))
+        FROM public.job_resume_links AS resume_link
+        WHERE resume_link.canonical_job_id IN (
+            SELECT source_job_id
+            FROM public.job_repost_merge_plan
+            WHERE survivor_job_id = survivor
+        )
+        GROUP BY resume_link.customized_resume_id
+        ON CONFLICT (canonical_job_id, customized_resume_id) DO UPDATE SET
+            source_job_id = CASE
+                WHEN NULLIF(btrim(survivor_link.source_job_id), '') IS NULL
+                THEN NULLIF(btrim(EXCLUDED.source_job_id), '')
+                WHEN NULLIF(btrim(EXCLUDED.source_job_id), '') IS NULL
+                THEN NULLIF(btrim(survivor_link.source_job_id), '')
+                ELSE LEAST(
+                    btrim(survivor_link.source_job_id),
+                    btrim(EXCLUDED.source_job_id)
+                )
+            END;
+
+        IF customized_resume_has_job_id THEN
+            EXECUTE $archive_customized_resumes$
+                INSERT INTO public.job_resume_links AS survivor_link (
+                    canonical_job_id, customized_resume_id, source_job_id
+                )
+                SELECT $1, resume.id, min(resume.job_id)
+                FROM public.customized_resumes AS resume
+                WHERE resume.job_id = $1
+                   OR resume.job_id IN (
+                       SELECT source_job_id
+                       FROM public.job_repost_merge_plan
+                       WHERE survivor_job_id = $1
+                   )
+                GROUP BY resume.id
+                ON CONFLICT (canonical_job_id, customized_resume_id) DO UPDATE SET
+                    source_job_id = CASE
+                        WHEN NULLIF(btrim(survivor_link.source_job_id), '') IS NULL
+                        THEN NULLIF(btrim(EXCLUDED.source_job_id), '')
+                        WHEN NULLIF(btrim(EXCLUDED.source_job_id), '') IS NULL
+                        THEN NULLIF(btrim(survivor_link.source_job_id), '')
+                        ELSE LEAST(
+                            btrim(survivor_link.source_job_id),
+                            btrim(EXCLUDED.source_job_id)
+                        )
+                    END
+            $archive_customized_resumes$ USING survivor;
+        END IF;
+
+        INSERT INTO public.job_resume_links AS survivor_link (
+            canonical_job_id, customized_resume_id, source_job_id
+        )
+        SELECT survivor, j.customized_resume_id, min(j.job_id)
         FROM public.jobs j
         WHERE j.customized_resume_id IS NOT NULL
           AND (j.job_id = survivor OR j.job_id IN (
               SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
           ))
+        GROUP BY j.customized_resume_id
         ON CONFLICT (canonical_job_id, customized_resume_id) DO UPDATE SET
-            source_job_id = EXCLUDED.source_job_id;
+            source_job_id = CASE
+                WHEN NULLIF(btrim(survivor_link.source_job_id), '') IS NULL
+                THEN NULLIF(btrim(EXCLUDED.source_job_id), '')
+                WHEN NULLIF(btrim(EXCLUDED.source_job_id), '') IS NULL
+                THEN NULLIF(btrim(survivor_link.source_job_id), '')
+                ELSE LEAST(
+                    btrim(survivor_link.source_job_id),
+                    btrim(EXCLUDED.source_job_id)
+                )
+            END;
 
         INSERT INTO public.job_keyword_insights (
             job_id, keyword, category, analyzed_at, archetype, provider
@@ -573,6 +880,247 @@ BEGIN
             detail_metadata_checked_at = a.detail_metadata_checked_at
         FROM aggregate_values a, listing_values l, listing_waves w
         WHERE target.job_id = survivor;
+
+        UPDATE public.listing_observations
+        SET canonical_job_id = survivor
+        WHERE canonical_job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        );
+
+        UPDATE public.listing_content_versions
+        SET canonical_job_id = survivor
+        WHERE canonical_job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        );
+
+        UPDATE public.listing_relist_events
+        SET canonical_job_id = survivor
+        WHERE canonical_job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        );
+
+        UPDATE public.listing_states
+        SET canonical_job_id = survivor, updated_at = clock_timestamp()
+        WHERE canonical_job_id IN (
+            SELECT source_job_id FROM public.job_repost_merge_plan WHERE survivor_job_id = survivor
+        );
+
+        IF to_regclass('public.linkedin_discovery_tasks') IS NOT NULL THEN
+            EXECUTE $remap_tasks$
+                UPDATE public.linkedin_discovery_tasks
+                SET canonical_job_id = $1
+                WHERE canonical_job_id IN (
+                    SELECT source_job_id
+                    FROM public.job_repost_merge_plan
+                    WHERE survivor_job_id = $1
+                )
+            $remap_tasks$ USING survivor;
+        END IF;
+
+        IF membership_table IS NOT NULL THEN
+            EXECUTE $merge_memberships$
+                WITH membership_group AS (
+                    SELECT membership.*
+                    FROM public.job_archetype_memberships AS membership
+                    WHERE membership.job_id = $1
+                       OR membership.job_id IN (
+                           SELECT source_job_id
+                           FROM public.job_repost_merge_plan
+                           WHERE survivor_job_id = $1
+                       )
+                ), evidence AS (
+                    SELECT
+                        grouped.archetype,
+                        (
+                            SELECT COALESCE(
+                                pg_catalog.jsonb_agg(
+                                    distinct_queries.value ORDER BY distinct_queries.value::text
+                                ),
+                                '[]'::jsonb
+                            )
+                            FROM (
+                                SELECT DISTINCT query_value.value
+                                FROM membership_group AS source_membership
+                                CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(
+                                    source_membership.matched_queries
+                                ) AS query_value(value)
+                                WHERE source_membership.archetype = grouped.archetype
+                            ) AS distinct_queries
+                        ) AS matched_queries,
+                        min(grouped.first_matched_at) AS first_matched_at,
+                        max(grouped.last_matched_at) AS last_matched_at
+                    FROM membership_group AS grouped
+                    GROUP BY grouped.archetype
+                ), destinations AS (
+                    SELECT
+                        evidence.archetype,
+                        COALESCE(
+                            min(grouped.job_id) FILTER (WHERE grouped.job_id = $1),
+                            min(grouped.job_id)
+                        ) AS destination_job_id
+                    FROM evidence
+                    JOIN membership_group AS grouped USING (archetype)
+                    GROUP BY evidence.archetype
+                )
+                UPDATE public.job_archetype_memberships AS target
+                SET
+                    matched_queries = evidence.matched_queries,
+                    first_matched_at = evidence.first_matched_at,
+                    last_matched_at = evidence.last_matched_at,
+                    insights = COALESCE(
+                        (
+                            SELECT pg_catalog.jsonb_object_agg(
+                                insight.key,
+                                insight.value ORDER BY
+                                    (source_membership.job_id = destinations.destination_job_id),
+                                    source_membership.job_id,
+                                    insight.key
+                            )
+                            FROM membership_group AS source_membership
+                            CROSS JOIN LATERAL pg_catalog.jsonb_each(
+                                source_membership.insights
+                            ) AS insight(key, value)
+                            WHERE source_membership.archetype = evidence.archetype
+                        ),
+                        '{}'::jsonb
+                    ) || pg_catalog.jsonb_build_object(
+                        'matched_queries', evidence.matched_queries,
+                        'matched_query_provenance', evidence.matched_queries,
+                        'query_scopes', evidence.matched_queries,
+                        'last_matched_at', pg_catalog.to_jsonb(evidence.last_matched_at)
+                    ),
+                    updated_at = pg_catalog.clock_timestamp()
+                FROM evidence
+                JOIN destinations USING (archetype)
+                WHERE target.job_id = destinations.destination_job_id
+                  AND target.archetype = destinations.archetype
+            $merge_memberships$ USING survivor;
+
+            EXECUTE $delete_membership_duplicates$
+                WITH destinations AS (
+                    SELECT
+                        membership.archetype,
+                        COALESCE(
+                            min(membership.job_id) FILTER (WHERE membership.job_id = $1),
+                            min(membership.job_id)
+                        ) AS destination_job_id
+                    FROM public.job_archetype_memberships AS membership
+                    WHERE membership.job_id = $1
+                       OR membership.job_id IN (
+                           SELECT source_job_id
+                           FROM public.job_repost_merge_plan
+                           WHERE survivor_job_id = $1
+                       )
+                    GROUP BY membership.archetype
+                )
+                DELETE FROM public.job_archetype_memberships AS membership
+                USING destinations
+                WHERE membership.archetype = destinations.archetype
+                  AND membership.job_id IN (
+                      SELECT source_job_id
+                      FROM public.job_repost_merge_plan
+                      WHERE survivor_job_id = $1
+                  )
+                  AND membership.job_id <> destinations.destination_job_id
+            $delete_membership_duplicates$ USING survivor;
+
+            IF membership_has_resume_state
+               AND membership_resume_state_value IS NULL THEN
+                EXECUTE $detect_unsafe_resume_transfer$
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM public.job_archetype_memberships AS membership
+                        WHERE membership.job_id IN (
+                            SELECT source_job_id
+                            FROM public.job_repost_merge_plan
+                            WHERE survivor_job_id = $1
+                        )
+                          AND EXISTS (
+                              SELECT 1
+                              FROM pg_catalog.jsonb_each($2) AS identity_field(key, value)
+                              WHERE pg_catalog.to_jsonb(membership)->identity_field.key
+                                  IS DISTINCT FROM 'null'::jsonb
+                          )
+                    )
+                $detect_unsafe_resume_transfer$
+                INTO membership_unsafe_resume_transfer
+                USING survivor, membership_transfer_nulls;
+
+                IF membership_unsafe_resume_transfer THEN
+                    RAISE EXCEPTION
+                        'job_archetype_memberships.resume_state has no compatible regenerable state';
+                END IF;
+            END IF;
+
+            EXECUTE pg_catalog.format(
+                $insert_memberships$
+                    WITH source_rows AS (
+                        SELECT
+                            membership AS row_value,
+                            EXISTS (
+                                SELECT 1
+                                FROM pg_catalog.jsonb_each($2) AS identity_field(key, value)
+                                WHERE pg_catalog.to_jsonb(membership)->identity_field.key
+                                    IS DISTINCT FROM 'null'::jsonb
+                            ) AS resets_resume_identity
+                        FROM public.job_archetype_memberships AS membership
+                        WHERE membership.job_id IN (
+                            SELECT source_job_id
+                            FROM public.job_repost_merge_plan
+                            WHERE survivor_job_id = $1
+                        )
+                        ORDER BY membership.job_id, membership.archetype
+                    ), transferred AS (
+                        SELECT pg_catalog.jsonb_populate_record(
+                            source_rows.row_value,
+                            $2
+                            || CASE WHEN source_rows.resets_resume_identity
+                                THEN $3 ELSE '{}'::jsonb END
+                            || CASE
+                                WHEN source_rows.resets_resume_identity AND $4 IS NOT NULL
+                                THEN pg_catalog.jsonb_build_object('resume_state', $4)
+                                ELSE '{}'::jsonb
+                            END
+                            || pg_catalog.jsonb_build_object(
+                                'job_id', $1,
+                                'updated_at', pg_catalog.to_jsonb(pg_catalog.clock_timestamp())
+                            )
+                        ) AS row_value
+                        FROM source_rows
+                    )
+                    INSERT INTO public.job_archetype_memberships (%s)
+                    SELECT %s
+                    FROM transferred
+                $insert_memberships$,
+                membership_insert_columns,
+                membership_select_columns
+            ) USING
+                survivor,
+                membership_transfer_nulls,
+                membership_resume_claim_nulls,
+                membership_resume_state_value;
+
+            EXECUTE $delete_loser_memberships$
+                DELETE FROM public.job_archetype_memberships
+                WHERE job_id IN (
+                    SELECT source_job_id
+                    FROM public.job_repost_merge_plan
+                    WHERE survivor_job_id = $1
+                )
+            $delete_loser_memberships$ USING survivor;
+        END IF;
+
+        IF customized_resume_has_job_id THEN
+            EXECUTE $detach_loser_customized_resumes$
+                UPDATE public.customized_resumes
+                SET job_id = NULL
+                WHERE job_id IN (
+                    SELECT source_job_id
+                    FROM public.job_repost_merge_plan
+                    WHERE survivor_job_id = $1
+                )
+            $detach_loser_customized_resumes$ USING survivor;
+        END IF;
 
         DELETE FROM public.jobs
         WHERE job_id IN (

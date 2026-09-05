@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import config
 import scraper
 import supabase_utils
+from linkedin_source_policy import DurableLinkedInRequestGate
 
 
 METADATA_FIELDS = (
@@ -68,9 +69,13 @@ def build_metadata_payload(row: dict, details: dict) -> dict:
 
 def run(limit: int, apply: bool) -> dict:
     result = {"checked": 0, "available": 0, "updated": 0, "unavailable": 0}
+    gate = DurableLinkedInRequestGate("metadata-backfill")
+    user_agent = scraper.user_agents.USER_AGENTS[0]
     for row in fetch_candidates(limit):
         source_job_id = str(row.get("latest_job_id") or row["job_id"])
-        detail_result = scraper._fetch_linkedin_job_details(source_job_id)
+        detail_result = scraper._fetch_linkedin_job_details(
+            source_job_id, durable_gate=gate, user_agent=user_agent
+        )
         result["checked"] += 1
         if not detail_result:
             result["unavailable"] += 1

@@ -82,6 +82,7 @@ def test_adaptive_linkedin_migration_has_durable_discovery_barriers():
     assert "heartbeat_linkedin_discovery_task" in normalized
     assert "resolve_eligible_failed_linkedin_discovery_cycles" in normalized
     assert "accept_linkedin_discovery_requirement" in normalized
+    assert "set statement_timeout = '5min'" in normalized
     assert "only a failed-terminal requirement can be accepted" in normalized
     assert "advance_linkedin_discovery_watermark" in normalized
     assert "expire_linkedin_coverage_debt" in normalized

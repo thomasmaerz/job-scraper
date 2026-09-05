@@ -6223,7 +6223,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.finalize_freehire_publication_v2(p_cycle_id bigint)
-RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog SET statement_timeout = '5min' AS $$
 DECLARE
     cycle_row public.linkedin_discovery_cycles%ROWTYPE;
     current_publication public.freehire_publication_state%ROWTYPE;

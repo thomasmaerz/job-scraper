@@ -32,6 +32,37 @@ def test_adaptive_retry_after_accepts_http_dates():
     assert 28 <= linkedin_discovery._retry_after_seconds(response) <= 30
 
 
+def test_search_classifier_accepts_exact_linkedin_empty_results_body():
+    response = SimpleNamespace(
+        status_code=200,
+        url="https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        content=b"<!DOCTYPE html>\n\n<!---->  ",
+        text="<!DOCTYPE html>\n\n<!---->  ",
+    )
+
+    kind, _soup, elements = linkedin_discovery.classify_search_response(response)
+
+    assert kind == "no_results"
+    assert elements == []
+
+
+def test_search_classifier_rejects_unrecognized_empty_html():
+    response = SimpleNamespace(
+        status_code=200,
+        url="https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        content=b"<!DOCTYPE html><html></html>",
+        text="<!DOCTYPE html><html></html>",
+    )
+
+    with pytest.raises(
+        linkedin_discovery.DiscoveryError,
+        match="LinkedIn returned unrecognized zero-card HTML",
+    ):
+        linkedin_discovery.classify_search_response(response)
+
+
 def test_detail_drain_delegates_atomic_task_application(monkeypatch):
     transitions = []
     task = {

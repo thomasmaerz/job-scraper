@@ -28,13 +28,16 @@ from linkedin_source_policy import (
 )
 
 
-CLASSIFIER_VERSION = "linkedin-guest-search-v2"
+CLASSIFIER_VERSION = "linkedin-guest-search-v3"
 SCOPE_VERSION = "linkedin-scope-v1"
 EXPECTED_PAGE_SIZE = 10
 NO_RESULTS_SELECTORS = (
     ".jobs-search-no-results-banner",
     ".jobs-search-no-results-banner__image",
     "section.no-results",
+)
+NO_RESULTS_RESPONSE_BODIES = (
+    b"<!DOCTYPE html>\n\n<!---->  ",
 )
 
 
@@ -176,6 +179,8 @@ def classify_search_response(response: requests.Response) -> tuple[str, Beautifu
     elements = soup.find_all("li")
     if elements:
         return "cards", soup, elements
+    if response.content in NO_RESULTS_RESPONSE_BODIES:
+        return "no_results", soup, []
     if any(soup.select_one(selector) is not None for selector in NO_RESULTS_SELECTORS):
         return "no_results", soup, []
     raise DiscoveryError("LinkedIn returned unrecognized zero-card HTML")

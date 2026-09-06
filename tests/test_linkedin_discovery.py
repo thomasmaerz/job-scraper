@@ -6,7 +6,11 @@ import pytest
 
 import linkedin_discovery
 import supabase_utils
-from linkedin_source_policy import ConsumedGrant, LinkedInCircuitOpen
+from linkedin_source_policy import (
+    ConsumedGrant,
+    LinkedInCircuitOpen,
+    LinkedInRequestDeadlineExceeded,
+)
 
 
 def settings(**options):
@@ -347,6 +351,34 @@ def test_transient_search_failure_preserves_resumable_cycle(monkeypatch):
                 "job_type": "F",
                 "work_types": "1,2,3",
                 "geo_id": 101174742,
+                "source_window_earliest_at": "2026-09-04T11:00:00+00:00",
+            },
+            1,
+            user_agent="ua",
+            gate=Gate(),
+            parse_cards=lambda _elements: [],
+            physical_attempts=[0],
+            physical_limit=1,
+        )
+
+
+def test_search_grant_deadline_preserves_resumable_cycle():
+    class Gate:
+        def acquire(self, *_args, **_kwargs):
+            raise LinkedInRequestDeadlineExceeded("deadline elapsed")
+
+    with pytest.raises(
+        linkedin_discovery.RetryableDiscoveryInterruption,
+        match="deadline elapsed",
+    ):
+        linkedin_discovery._request_page(
+            {
+                "scope_key": "scope-1",
+                "query": "TPM",
+                "location": "Canada",
+                "job_type": "F",
+                "work_types": "1,2,3",
+                "geo_id": None,
                 "source_window_earliest_at": "2026-09-04T11:00:00+00:00",
             },
             1,

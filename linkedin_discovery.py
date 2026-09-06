@@ -243,11 +243,14 @@ def _request_page(
             raise RetryableDiscoveryInterruption(
                 "LinkedIn physical HTTP-attempt budget exhausted"
             )
-        grant = gate.acquire(
-            "search",
-            f"{scope['scope_key']}:{page_number}:{attempt}",
-            deadline=deadline,
-        )
+        try:
+            grant = gate.acquire(
+                "search",
+                f"{scope['scope_key']}:{page_number}:{attempt}",
+                deadline=deadline,
+            )
+        except LinkedInRequestDeadlineExceeded as exc:
+            raise RetryableDiscoveryInterruption(str(exc)) from exc
         lookback_seconds = max(1, math.ceil((grant.started_at - anchor).total_seconds()))
         if (maximum_lookback_seconds is not None
                 and lookback_seconds > maximum_lookback_seconds):

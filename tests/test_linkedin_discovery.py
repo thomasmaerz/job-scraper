@@ -440,7 +440,7 @@ def test_pending_debt_uses_hard_depth_and_original_window(monkeypatch):
     assert datetime.fromisoformat(manifest["source_window_earliest_at"]) <= debt_earliest
 
 
-def test_long_gap_is_represented_as_recoverable_and_expired_debt(monkeypatch):
+def test_long_gap_uses_recovery_cap_and_records_only_the_expired_boundary(monkeypatch):
     execution = SimpleNamespace(
         lane=SimpleNamespace(archetype="technology_delivery"),
         query=SimpleNamespace(
@@ -472,10 +472,51 @@ def test_long_gap_is_represented_as_recoverable_and_expired_debt(monkeypatch):
         linkedin_discovery.adaptive_options(settings()),
     )[0]
 
-    assert manifest["truncated_window_earliest_at"] is not None
-    assert manifest["truncated_window_latest_at"] is not None
+    assert manifest["truncated_window_earliest_at"] is None
+    assert manifest["truncated_window_latest_at"] is None
     assert manifest["expired_window_earliest_at"] is not None
     assert manifest["expired_window_latest_at"] is not None
+
+
+def test_recoverable_gap_is_not_artificially_truncated(monkeypatch):
+    execution = SimpleNamespace(
+        lane=SimpleNamespace(archetype="technology_delivery"),
+        query=SimpleNamespace(
+            query="TPM", query_type=SimpleNamespace(value="precision"),
+            language="en", query_id="q1",
+        ),
+        geography=SimpleNamespace(
+            location="Canada", location_scope=SimpleNamespace(value="canada"),
+            geography_id="CA", geo_id=None,
+        ),
+    )
+    monkeypatch.setattr(
+        linkedin_discovery.supabase_utils,
+        "prepare_linkedin_discovery_scope_state",
+        lambda keys, _floor: {
+            "states": {keys[0]: {
+                "last_operational_success_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=30)
+                ).isoformat(),
+                "recommended_pages": 6,
+            }},
+            "debt": {},
+        },
+    )
+
+    manifest = linkedin_discovery._scope_manifest(
+        SimpleNamespace(settings=SimpleNamespace(lookback_days=2)),
+        [execution],
+        linkedin_discovery.adaptive_options(settings()),
+    )[0]
+
+    covered_hours = (
+        datetime.fromisoformat(manifest["source_window_latest_at"])
+        - datetime.fromisoformat(manifest["source_window_earliest_at"])
+    ).total_seconds() / 3600
+    assert covered_hours >= 36
+    assert manifest["truncated_window_earliest_at"] is None
+    assert manifest["expired_window_earliest_at"] is None
 
 
 def test_cycle_replay_uses_persisted_window(monkeypatch):

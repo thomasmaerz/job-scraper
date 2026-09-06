@@ -398,15 +398,12 @@ def _scope_manifest(configuration: Any, executions: Sequence[Any], options: dict
             )
             if manual_recovery_hours is not None:
                 desired_hours = max(desired_hours, manual_recovery_hours)
-            window_hours = min(options["maximum_window"], desired_hours)
+            if desired_hours > options["recovery_cap"]:
+                expired_earliest = (now - timedelta(hours=desired_hours)).isoformat()
+                expired_latest = recovery_floor.isoformat()
+            window_hours = min(options["recovery_cap"], desired_hours)
             desired_earliest = now - timedelta(hours=desired_hours)
             selected_earliest = now - timedelta(hours=window_hours)
-            if desired_earliest < selected_earliest:
-                truncated_earliest = max(desired_earliest, recovery_floor).isoformat()
-                truncated_latest = selected_earliest.isoformat()
-                if desired_earliest < recovery_floor:
-                    expired_earliest = desired_earliest.isoformat()
-                    expired_latest = recovery_floor.isoformat()
         else:
             window_hours = configured_hours
         earliest = now - timedelta(hours=window_hours)

@@ -3264,10 +3264,15 @@ BEGIN
     PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('linkedin-canonical-publication-v1', 0));
     SELECT * INTO STRICT cycle_row FROM public.linkedin_discovery_cycles WHERE id = p_cycle_id FOR SHARE;
     IF cycle_row.search_status <> 'sealed' THEN
+        SELECT COUNT(*) INTO blocking_count
+        FROM public.linkedin_discovery_cycle_scopes scope
+        JOIN public.ingestion_runs run ON run.id = scope.ingestion_run_id
+        WHERE scope.discovery_cycle_id = p_cycle_id
+          AND run.coverage_status <> 'exhausted';
         RETURN pg_catalog.jsonb_build_object(
             'outcome', 'deferred', 'reason', 'coverage work remains',
             'requested_cycle_id', p_cycle_id, 'eligible_cycle_id', NULL,
-            'blocking_count', cycle_row.required_scope_count - cycle_row.completed_scope_count
+            'blocking_count', blocking_count
         );
     END IF;
     SELECT * INTO STRICT current_publication
@@ -3395,12 +3400,17 @@ WITH latest AS (
     SELECT COUNT(*) AS scopes,
            COUNT(*) FILTER (WHERE run.coverage_status = 'exhausted') AS exhausted,
            COUNT(*) FILTER (WHERE scope.status = 'running') AS running,
-           COALESCE(SUM(run.pages_completed), 0) AS pages,
-           COALESCE(SUM(run.cards_seen), 0) AS cards
+           COALESCE(SUM(page.pages), 0) AS pages,
+           COALESCE(SUM(page.cards), 0) AS cards
     FROM latest
     LEFT JOIN public.linkedin_discovery_cycle_scopes scope
       ON scope.discovery_cycle_id = latest.id
     LEFT JOIN public.ingestion_runs run ON run.id = scope.ingestion_run_id
+    LEFT JOIN (
+        SELECT ingestion_run_id, COUNT(*) AS pages, SUM(card_count) AS cards
+        FROM public.linkedin_ingestion_pages
+        GROUP BY ingestion_run_id
+    ) page ON page.ingestion_run_id = scope.ingestion_run_id
 ), debt_summary AS (
     SELECT COUNT(*) FILTER (WHERE debt.status = 'pending') AS pending,
            COUNT(*) FILTER (WHERE debt.status = 'expired_unresolved') AS expired,
@@ -3428,14 +3438,19 @@ WITH latest AS (
         SELECT state.archetype, COUNT(*) AS scopes,
                COUNT(*) FILTER (WHERE run.coverage_status = 'exhausted') AS exhausted,
                COUNT(*) FILTER (WHERE scope.status = 'running') AS running,
-               COALESCE(SUM(run.pages_completed), 0) AS pages,
-               COALESCE(SUM(run.cards_seen), 0) AS cards
+               COALESCE(SUM(page.pages), 0) AS pages,
+               COALESCE(SUM(page.cards), 0) AS cards
         FROM latest
         JOIN public.linkedin_discovery_cycle_scopes scope
           ON scope.discovery_cycle_id = latest.id
         JOIN public.linkedin_scope_coverage_state state
           ON state.scope_key = scope.scope_key
         JOIN public.ingestion_runs run ON run.id = scope.ingestion_run_id
+        LEFT JOIN (
+            SELECT ingestion_run_id, COUNT(*) AS pages, SUM(card_count) AS cards
+            FROM public.linkedin_ingestion_pages
+            GROUP BY ingestion_run_id
+        ) page ON page.ingestion_run_id = scope.ingestion_run_id
         GROUP BY state.archetype
     ) grouped
 )

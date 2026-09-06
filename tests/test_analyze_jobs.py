@@ -376,16 +376,20 @@ def test_fetch_jobs_for_replacement_backfill_selects_previously_analyzed_jobs():
     assert ("is_", "description", None) in db.query.calls
 
 
-def test_extract_keywords_from_batch_raises_if_any_job_id_missing_from_response():
+def test_extract_keywords_from_batch_retries_only_missing_job_ids(monkeypatch):
+    calls = []
+
     class FakeClient:
         def generate_content(self, **kwargs):
+            calls.append(kwargs["prompt"])
+            job_id = "1" if len(calls) == 1 else "2"
             return json.dumps(
                 {
                     "jobs": [
                         {
-                            "job_id": "1",
+                            "job_id": job_id,
                             "keywords": [
-                                {"keyword": "Python", "category": "technology"},
+                                {"keyword": "Python", "category": "technology"}
                             ],
                         }
                     ]
@@ -397,12 +401,45 @@ def test_extract_keywords_from_batch_raises_if_any_job_id_missing_from_response(
         {"job_id": "2", "job_title": "B", "description": "Needs SQL"},
     ]
 
-    try:
-        analyze_jobs.extract_keywords_from_batch(batch, client=FakeClient(), max_retries=1)
-    except ValueError as exc:
-        assert "Missing keyword results for job_ids: 2" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for omitted job_id")
+    monkeypatch.setattr(analyze_jobs.time, "sleep", lambda _seconds: None)
+
+    result = analyze_jobs.extract_keywords_from_batch(
+        batch, client=FakeClient(), max_retries=2
+    )
+
+    assert set(result) == {"1", "2"}
+    assert "Job ID: 1" in calls[0]
+    assert "Job ID: 2" in calls[0]
+    assert "Job ID: 1" not in calls[1]
+    assert "Job ID: 2" in calls[1]
+
+
+def test_extract_keywords_from_batch_returns_completed_partial_results():
+    class FakeClient:
+        def generate_content(self, **kwargs):
+            return json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "job_id": "1",
+                            "keywords": [
+                                {"keyword": "Python", "category": "technology"}
+                            ],
+                        }
+                    ]
+                }
+            )
+
+    batch = [
+        {"job_id": "1", "job_title": "A", "description": "Needs Python"},
+        {"job_id": "2", "job_title": "B", "description": "Needs SQL"},
+    ]
+
+    result = analyze_jobs.extract_keywords_from_batch(
+        batch, client=FakeClient(), max_retries=1
+    )
+
+    assert set(result) == {"1"}
 
 
 def test_mark_jobs_analyzed_updates_timestamp_for_ids():
@@ -1166,6 +1203,62 @@ def test_run_backfill_loops_until_no_unanalyzed_jobs_remain(monkeypatch):
     assert processed == 2
     assert len(fact_calls) == 2
     assert marked == [["1"], ["2"]]
+
+
+def test_run_persists_completed_jobs_and_stops_before_refetching_omissions(monkeypatch):
+    jobs = [
+        {
+            "job_id": "1",
+            "job_title": "A",
+            "description": "Needs AWS",
+            "archetype": "software_tpm",
+            "provider": "greenhouse",
+        },
+        {
+            "job_id": "2",
+            "job_title": "B",
+            "description": "Needs SQL",
+            "archetype": "software_tpm",
+            "provider": "greenhouse",
+        },
+    ]
+    fetch_calls = []
+    replaced = []
+    marked = []
+    monkeypatch.setattr(analyze_jobs, "_get_db", lambda: object())
+
+    def fake_fetch(**_kwargs):
+        fetch_calls.append(True)
+        return jobs
+
+    monkeypatch.setattr(analyze_jobs, "fetch_unanalyzed_jobs", fake_fetch)
+    monkeypatch.setattr(
+        analyze_jobs,
+        "extract_keywords_from_batch",
+        lambda _batch, client=None, max_retries=None: {
+            "1": [analyze_jobs.KeywordItem(keyword="AWS", category="technology")]
+        },
+    )
+    monkeypatch.setattr(
+        analyze_jobs,
+        "replace_job_keyword_facts",
+        lambda job_ids, facts, archetype=None, db=None: replaced.append(
+            (job_ids, facts)
+        ),
+    )
+    monkeypatch.setattr(
+        analyze_jobs,
+        "mark_jobs_analyzed",
+        lambda job_ids, db=None, replacement_backfill=False,
+        archetype=analyze_jobs.config.DEFAULT_ARCHETYPE: marked.append(job_ids),
+    )
+
+    processed = analyze_jobs.run(backfill_all=True)
+
+    assert processed == 1
+    assert len(fetch_calls) == 1
+    assert replaced[0][0] == ["1"]
+    assert marked == [["1"]]
 
 
 def test_run_retries_idempotent_fact_replacement_after_crash_before_mark(monkeypatch):

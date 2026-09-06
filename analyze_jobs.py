@@ -18,8 +18,9 @@ VALID_CATEGORIES = {"skill", "technology", "certification", "attribute"}
 SYSTEM_PROMPT = """You extract high-signal job market keywords from batches of job postings.
 
 Return JSON only using the provided schema. Include concise keywords that appear explicitly in the postings.
+Return exactly one jobs entry for every supplied Job ID, using an empty keywords list when no keywords apply.
 Use only these categories: skill, technology, certification, attribute.
-Avoid duplicates within the same batch unless they are distinct keywords.
+Avoid duplicates within each job. The same keyword may appear for different jobs.
 """
 
 
@@ -113,45 +114,59 @@ def fetch_unanalyzed_jobs(
 def extract_keywords_from_batch(batch, client=None, max_retries=None) -> dict[str, list[KeywordItem]]:
     client = client or job_insights_client
     max_retries = config.JOB_INSIGHTS_MAX_RETRIES if max_retries is None else max_retries
-
-    prompt_lines = [
-        "Extract keywords for each job posting individually.",
-        "Return only structured JSON.",
-    ]
-    for job in batch:
-        prompt_lines.append(f"Job ID: {job.get('job_id', '')}")
-        prompt_lines.append(f"Title: {job.get('job_title', '')}")
-        prompt_lines.append(f"Description: {job.get('description', '')}")
-        prompt_lines.append("")
-
-    prompt = "\n".join(prompt_lines)
-
+    jobs_by_id = {
+        str(job["job_id"]): job for job in batch if job.get("job_id") is not None
+    }
+    pending_job_ids = list(jobs_by_id)
+    extracted: dict[str, list[KeywordItem]] = {}
     last_error = None
+    received_valid_response = False
     for attempt in range(max_retries):
+        prompt_lines = [
+            "Extract keywords for each job posting individually.",
+            "Return only structured JSON.",
+        ]
+        for job_id in pending_job_ids:
+            job = jobs_by_id[job_id]
+            prompt_lines.append(f"Job ID: {job_id}")
+            prompt_lines.append(f"Title: {job.get('job_title', '')}")
+            prompt_lines.append(f"Description: {job.get('description', '')}")
+            prompt_lines.append("")
         try:
             raw_response = client.generate_content(
-                prompt=prompt,
+                prompt="\n".join(prompt_lines),
                 system_prompt=SYSTEM_PROMPT,
                 reasoning_effort="low",
                 response_format=JobKeywordResultList,
             )
             parsed = parse_keyword_response(raw_response)
-            expected_job_ids = {str(job.get("job_id")) for job in batch if job.get("job_id") is not None}
-            missing_job_ids = sorted(job_id for job_id in expected_job_ids if job_id not in parsed)
-            if missing_job_ids:
-                raise ValueError(
-                    f"Missing keyword results for job_ids: {', '.join(missing_job_ids)}"
-                )
-            return parsed
+            received_valid_response = True
+            extracted.update(
+                (job_id, keywords)
+                for job_id, keywords in parsed.items()
+                if job_id in jobs_by_id
+            )
+            pending_job_ids = [job_id for job_id in jobs_by_id if job_id not in extracted]
+            if not pending_job_ids:
+                return extracted
+            last_error = ValueError(
+                f"Missing keyword results for job_ids: {', '.join(pending_job_ids)}"
+            )
         except Exception as exc:
             last_error = exc
-            logger.warning("Keyword extraction failed on attempt %s: %s", attempt + 1, exc)
-            if attempt < max_retries - 1:
-                time.sleep(config.JOB_INSIGHTS_SLEEP_SECONDS)
+        logger.warning("Keyword extraction failed on attempt %s: %s", attempt + 1, last_error)
+        if attempt < max_retries - 1:
+            time.sleep(config.JOB_INSIGHTS_SLEEP_SECONDS)
 
+    if received_valid_response:
+        logger.error(
+            "Leaving jobs unanalyzed after bounded keyword retries: %s",
+            ", ".join(pending_job_ids),
+        )
+        return extracted
     if last_error is not None:
         raise last_error
-    return []
+    return extracted
 
 
 def aggregate_keywords(all_keywords: list[KeywordItem]) -> dict:
@@ -297,16 +312,22 @@ def run(archetype: str = config.DEFAULT_ARCHETYPE, backfill_all: bool = False, r
             return processed_jobs
 
         batch_size = config.JOB_INSIGHTS_BATCH_SIZE
+        incomplete_batch = False
         for start in range(0, len(jobs), batch_size):
             batch = jobs[start : start + batch_size]
             extracted = extract_keywords_from_batch(batch)
             facts = build_job_keyword_facts(batch, extracted)
-            analyzed_job_ids = [str(job["job_id"]) for job in batch if job.get("job_id") is not None]
-            replace_job_keyword_facts(analyzed_job_ids, facts, archetype=archetype, db=db)
-            mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill, archetype=archetype)
+            expected_job_ids = [
+                str(job["job_id"]) for job in batch if job.get("job_id") is not None
+            ]
+            analyzed_job_ids = [job_id for job_id in expected_job_ids if job_id in extracted]
+            incomplete_batch = incomplete_batch or len(analyzed_job_ids) < len(expected_job_ids)
+            if analyzed_job_ids:
+                replace_job_keyword_facts(analyzed_job_ids, facts, archetype=archetype, db=db)
+                mark_jobs_analyzed(analyzed_job_ids, db=db, replacement_backfill=replacement_backfill, archetype=archetype)
             processed_jobs += len(analyzed_job_ids)
 
-        if not backfill_all and not replacement_backfill:
+        if incomplete_batch or (not backfill_all and not replacement_backfill):
             return processed_jobs
 
 

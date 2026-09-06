@@ -16,6 +16,10 @@ class LinkedInGrantRejected(RuntimeError):
     pass
 
 
+class LinkedInRequestDeadlineExceeded(TimeoutError):
+    pass
+
+
 @dataclass(frozen=True)
 class ConsumedGrant:
     grant_id: str
@@ -27,8 +31,18 @@ class DurableLinkedInRequestGate:
         self.producer = producer
         self.db = db
 
-    def acquire(self, request_kind: str, request_key: str) -> ConsumedGrant:
+    def acquire(
+        self,
+        request_kind: str,
+        request_key: str,
+        *,
+        deadline: float | None = None,
+    ) -> ConsumedGrant:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise LinkedInRequestDeadlineExceeded(
+                    "LinkedIn request deadline elapsed before grant acquisition"
+                )
             grant = supabase_utils.acquire_linkedin_request_grant(
                 self.producer,
                 request_kind,
@@ -42,10 +56,27 @@ class DurableLinkedInRequestGate:
                 wait_ms = grant.get("wait_ms")
                 if not isinstance(wait_ms, int) or wait_ms < 0:
                     raise LinkedInGrantRejected("request grant returned an invalid wait")
-                time.sleep(min(wait_ms / 1000, 60))
+                wait_seconds = min(wait_ms / 1000, 60)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or wait_seconds >= remaining:
+                        raise LinkedInRequestDeadlineExceeded(
+                            "LinkedIn request deadline elapsed while waiting for a grant"
+                        )
+                time.sleep(wait_seconds)
                 continue
             if outcome != "grant" or not grant.get("grant_id"):
                 raise LinkedInGrantRejected("request grant was rejected")
+            if grant.get("consumed") is True:
+                started_at = grant.get("started_at")
+                if not isinstance(started_at, str):
+                    raise LinkedInGrantRejected("consumed grant omitted started_at")
+                return ConsumedGrant(
+                    grant_id=str(grant["grant_id"]),
+                    started_at=datetime.fromisoformat(
+                        started_at.replace("Z", "+00:00")
+                    ),
+                )
             consumed = supabase_utils.consume_linkedin_request_grant(
                 str(grant["grant_id"]), self.producer, db=self.db
             )

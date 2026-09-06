@@ -252,12 +252,12 @@ def test_dry_run_never_calls_llm_or_updates():
     assert db.updates == 0
 
 
-def test_incremental_query_is_bounded_eligible_and_newest_first():
+def test_incremental_query_is_bounded_eligible_and_oldest_first():
     db = Db([])
 
     backfill_freehire_compat.fetch_incremental_candidates(db, 300)
 
-    assert db.orders == [("last_seen_at", True), ("job_id", True)]
+    assert db.orders == [("last_seen_at", False), ("job_id", False)]
     assert len(db.or_filters) == 1
     eligibility = db.or_filters[0]
     assert "freehire_compat_status.eq.pending" in eligibility

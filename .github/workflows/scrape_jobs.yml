@@ -31,9 +31,9 @@ jobs:
       actions: read
       contents: read
     runs-on: ubuntu-latest
-    # Multi-lane searches are intentionally serialized around the synchronous
-    # Supabase client; allow the configured query set to finish cleanly.
-    timeout-minutes: 180
+    # Logical coverage resumes across runs; this execution has a strict budget
+    # so the next hourly slot cannot be blocked by excess source volume.
+    timeout-minutes: 40
     outputs:
       discovery_cycle_id: ${{ steps.scraper.outputs.discovery_cycle_id }}
       discovery_sequence: ${{ steps.scraper.outputs.discovery_sequence }}
@@ -68,7 +68,7 @@ jobs:
     if: ${{ inputs.archetype == '' || inputs.archetype == null }}
     needs: scrape
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -87,14 +87,14 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FREEHIRE_DRAIN_BACKLOG: "false"
-          FREEHIRE_CLASSIFY_LIMIT: "300"
+          FREEHIRE_CLASSIFY_LIMIT: "100"
         run: python incremental_freehire_compat.py
 
   publication_gate:
     if: ${{ always() && (inputs.archetype == '' || inputs.archetype == null) }}
     needs: [scrape, freehire_compat]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     outputs:
       scrape_watermark: ${{ steps.gate.outputs.scrape_watermark }}
       published: ${{ steps.gate.outputs.published }}

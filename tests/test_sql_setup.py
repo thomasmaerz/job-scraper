@@ -83,6 +83,15 @@ def test_adaptive_linkedin_migration_has_durable_discovery_barriers():
     assert "resolve_eligible_failed_linkedin_discovery_cycles" in normalized
     assert "accept_linkedin_discovery_requirement" in normalized
     assert "set statement_timeout = '5min'" in normalized
+    assert "get_resumable_linkedin_discovery_cycle" in normalized
+    assert "prepare_linkedin_discovery_scope_state" in normalized
+    assert "get_linkedin_discovery_status" in normalized
+    assert "run.coverage_status <> 'exhausted'" in normalized
+    assert "unresolved coverage debt" in normalized
+    assert "adaptive detail request requires an active task lease" in normalized
+    assert "grant_id, 'started', 'linkedin-detail-v1', v_now" in normalized
+    assert "min(cycle.discovery_sequence)" in normalized
+    assert "left join latest on true" in normalized
     assert "only a failed-terminal requirement can be accepted" in normalized
     assert "advance_linkedin_discovery_watermark" in normalized
     assert "expire_linkedin_coverage_debt" in normalized
@@ -120,6 +129,27 @@ def test_init_snapshot_contains_current_adaptive_linkedin_migration():
     assert snapshot == migration_body
 
 
+def test_resumable_discovery_has_a_forward_production_migration():
+    sql = (ROOT / "supabase_setup" / "resume_exhaustive_linkedin_discovery.sql").read_text().lower()
+
+    for function in (
+        "get_canonical_provider_revision",
+        "acquire_linkedin_request_grant",
+        "get_resumable_linkedin_discovery_cycle",
+        "prepare_linkedin_discovery_scope_state",
+        "seal_linkedin_discovery_cycle",
+        "claim_linkedin_discovery_tasks",
+        "apply_linkedin_discovery_task_canonical",
+        "finalize_freehire_publication_v2",
+        "get_linkedin_discovery_status",
+    ):
+        assert f"create or replace function public.{function}" in sql
+    assert "create table if not exists public.canonical_provider_revisions" in sql
+    assert "from public, anon, authenticated" in sql
+    assert "to service_role" in sql
+    assert sql.rstrip().endswith("commit;")
+
+
 def test_adaptive_canonical_task_apply_is_atomic_fenced_and_private():
     sql = (ROOT / "supabase_setup" / "add_adaptive_linkedin_discovery.sql").read_text()
     normalized = re.sub(r"\s+", " ", sql.lower())
@@ -128,6 +158,7 @@ def test_adaptive_canonical_task_apply_is_atomic_fenced_and_private():
     assert "canonical_applied_lease_token uuid" in normalized
     assert "canonical_application_hash text" in normalized
     assert "linkedin-canonical-task-apply-v3" in body
+    assert "linkedin-canonical-task-apply-v4" in body
     assert "jsonb_typeof(memberships)<>'array'" in body
     assert "jsonb_array_length(memberships)=0" in body
     assert "canonicaltaskapplicationcontainsduplicatememberships" in body
@@ -139,14 +170,18 @@ def test_adaptive_canonical_task_apply_is_atomic_fenced_and_private():
     )
     assert "extensions.digest(p_application::text,'sha256')" in body
     assert "candidate_set_revision!~'^[0-9a-f]{64}$'" in body
-    assert "octet_length(job.job_id)::text||':'||job.job_id" in body
-    assert "octet_length(job.canonical_revision::text)::text||':'||job.canonical_revision::text" in body
-    assert "orderbypg_catalog.convert_to(job.job_id,'utf8')" in body
+    assert "create table if not exists public.canonical_provider_revisions" in normalized
+    assert "create trigger maintain_canonical_provider_revision" in normalized
+    assert "for each statement execute function public.bump_canonical_provider_revision()" in normalized
+    assert "p_application->>'version'='linkedin-canonical-task-apply-v3'" in body
+    assert "locktablepublic.jobsinsharerowexclusivemode" in body
+    assert "forupdate;" in body
     assert "candidate_set_revisionisdistinctfromcurrent_candidate_set_revision" in body
     assert "canonical_action='insert'andcandidate_set_revision" not in body
     assert "expected_membership_provenance_revisionisdistinctfromtask_row.membership_provenance_revision" in body
     assert "'task_membership_provenances',task_row.membership_provenances" in body
     assert "'canonical_revision',applied_canonical_revision" in body
+    assert "'provider_candidate_set_revision',current_candidate_set_revision" in body
     membership_write = body.index("insertintopublic.job_archetype_memberships")
     membership_loop_end = body.index("endloop;", membership_write)
     revision_refresh = body.index(

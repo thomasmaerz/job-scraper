@@ -36,6 +36,7 @@ DROP TABLE IF EXISTS "public"."linkedin_discovery_cycles" CASCADE;
 DROP TABLE IF EXISTS "public"."linkedin_scope_coverage_state" CASCADE;
 DROP TABLE IF EXISTS "public"."linkedin_source_request_grants" CASCADE;
 DROP TABLE IF EXISTS "public"."linkedin_source_request_policy" CASCADE;
+DROP TABLE IF EXISTS "public"."canonical_provider_revisions" CASCADE;
 DROP TABLE IF EXISTS "public"."listing_relist_events" CASCADE;
 DROP TABLE IF EXISTS "public"."listing_content_versions" CASCADE;
 DROP TABLE IF EXISTS "public"."listing_observations" CASCADE;
@@ -68,16 +69,20 @@ DROP FUNCTION IF EXISTS "public"."merge_historical_repost_plan"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."calculate_listing_posting_waves"(jsonb) CASCADE;
 DROP FUNCTION IF EXISTS "public"."prevent_listing_observation_mutation"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."increment_job_canonical_revision"() CASCADE;
+DROP FUNCTION IF EXISTS "public"."bump_canonical_provider_revision"() CASCADE;
+DROP FUNCTION IF EXISTS "public"."get_canonical_provider_revision"(text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."acquire_linkedin_request_grant"(text, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."consume_linkedin_request_grant"(uuid, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."finish_linkedin_request_grant"(uuid, text, text, integer) CASCADE;
 DROP FUNCTION IF EXISTS "public"."open_linkedin_source_circuit"(uuid, text, text, integer) CASCADE;
 DROP FUNCTION IF EXISTS "public"."reset_linkedin_source_circuit"(text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."create_linkedin_discovery_cycle"(uuid, bigint, text, text, jsonb) CASCADE;
+DROP FUNCTION IF EXISTS "public"."get_resumable_linkedin_discovery_cycle"(boolean, text[]) CASCADE;
 DROP FUNCTION IF EXISTS "public"."commit_linkedin_discovery_page"(jsonb) CASCADE;
 DROP FUNCTION IF EXISTS "public"."finish_linkedin_discovery_scope"(uuid, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."fail_linkedin_discovery_cycle"(bigint, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."expire_linkedin_coverage_debt"(text, timestamptz) CASCADE;
+DROP FUNCTION IF EXISTS "public"."prepare_linkedin_discovery_scope_state"(text[], timestamptz) CASCADE;
 DROP FUNCTION IF EXISTS "public"."accept_linkedin_coverage_debt"(bigint, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."advance_linkedin_discovery_watermark"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."resolve_failed_linkedin_discovery_cycle"(bigint, bigint, text, text, text) CASCADE;
@@ -90,6 +95,7 @@ DROP FUNCTION IF EXISTS "public"."apply_linkedin_discovery_task_canonical"(bigin
 DROP FUNCTION IF EXISTS "public"."reject_linkedin_requirement_provenance_change"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."transition_linkedin_discovery_task"(bigint, text, uuid, text, text, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."finalize_freehire_publication_v2"(bigint) CASCADE;
+DROP FUNCTION IF EXISTS "public"."get_linkedin_discovery_status"() CASCADE;
 
 -- Step 4: Drop storage bucket for personalized_resumes
 DELETE FROM storage.objects WHERE bucket_id = 'personalized_resumes';

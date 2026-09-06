@@ -65,3 +65,17 @@ def test_gate_rejects_invalidated_finish(monkeypatch):
             "complete",
             200,
         )
+
+
+def test_gate_does_not_sleep_past_request_deadline(monkeypatch):
+    monkeypatch.setattr(
+        linkedin_source_policy.supabase_utils,
+        "acquire_linkedin_request_grant",
+        lambda *_args, **_kwargs: {"outcome": "wait", "wait_ms": 1000},
+    )
+    monkeypatch.setattr(linkedin_source_policy.time, "monotonic", lambda: 10.0)
+
+    with pytest.raises(linkedin_source_policy.LinkedInRequestDeadlineExceeded):
+        linkedin_source_policy.DurableLinkedInRequestGate("test").acquire(
+            "search", "scope-1", deadline=10.5
+        )

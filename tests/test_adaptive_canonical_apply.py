@@ -1,4 +1,3 @@
-import hashlib
 from types import SimpleNamespace
 
 import httpx
@@ -9,6 +8,8 @@ import supabase_utils
 
 RUN_ID = "00000000-0000-0000-0000-000000000001"
 LEASE_TOKEN = "00000000-0000-0000-0000-000000000002"
+PROVIDER_REVISION = "0" * 64
+NEXT_PROVIDER_REVISION = "0" * 63 + "1"
 FILTER_PROFILE = {
     "company_blocklist": [],
     "title_entry_level_blocklist": [],
@@ -55,6 +56,7 @@ def empty_context():
         existing_job_ids_by_provider={"linkedin": set()},
         company_title_keys_by_provider={"linkedin": set()},
         canonical_by_source_by_provider={"linkedin": {}},
+        candidate_set_revision_by_provider={"linkedin": PROVIDER_REVISION},
     )
 
 
@@ -87,6 +89,7 @@ def context_with_existing():
         canonical_by_source_by_provider={
             "linkedin": {"canonical-1": "canonical-1", "source-1": "canonical-1"}
         },
+        candidate_set_revision_by_provider={"linkedin": PROVIDER_REVISION},
     )
 
 
@@ -98,8 +101,8 @@ def test_application_is_versioned_and_contains_all_atomic_side_effects(monkeypat
         task(), job(), run_context=empty_context(), runtime_profile=FILTER_PROFILE
     )
 
-    assert application["version"] == "linkedin-canonical-task-apply-v3"
-    assert application["provider_candidate_set_revision"] == hashlib.sha256(b"").hexdigest()
+    assert application["version"] == "linkedin-canonical-task-apply-v4"
+    assert application["provider_candidate_set_revision"] == PROVIDER_REVISION
     assert application["membership_provenance_revision"] == 0
     assert application["source"] == {
         "provider": "linkedin",
@@ -208,26 +211,63 @@ def test_relist_application_carries_cas_and_evidence(monkeypatch):
     assert application["canonical"]["payload"]["recruiter_name"] == "Casey Recruiter"
 
 
-def test_candidate_set_revision_is_sorted_distinct_and_utf8_length_framed():
-    candidates = [
-        {"job_id": "z"},
-        {"job_id": "a"},
-        {"job_id": "z"},
-        {"job_id": "é"},
-    ]
-
-    assert supabase_utils._provider_candidate_set_revision(candidates) == hashlib.sha256(
-        "1:a1:01:z1:02:é1:0".encode("utf-8")
-    ).hexdigest()
-
-
-def test_candidate_set_revision_changes_when_a_candidate_changes():
-    original = [{"job_id": "canonical-1", "canonical_revision": 4}]
-    changed = [{"job_id": "canonical-1", "canonical_revision": 5}]
-
-    assert supabase_utils._provider_candidate_set_revision(original) != (
-        supabase_utils._provider_candidate_set_revision(changed)
+def test_consistent_candidate_snapshot_is_fenced_by_provider_revision(monkeypatch):
+    revisions = iter([PROVIDER_REVISION, PROVIDER_REVISION])
+    monkeypatch.setattr(
+        supabase_utils, "get_canonical_provider_revision", lambda _provider: next(revisions)
     )
+    monkeypatch.setattr(
+        supabase_utils, "get_canonical_candidates", lambda **_kwargs: [{"job_id": "a"}]
+    )
+
+    candidates, revision = supabase_utils.CanonicalRunContext().consistent_candidates_for(
+        "linkedin"
+    )
+
+    assert candidates == [{"job_id": "a"}]
+    assert revision == PROVIDER_REVISION
+
+
+def test_consistent_candidate_snapshot_reloads_after_concurrent_write(monkeypatch):
+    revisions = iter([
+        PROVIDER_REVISION,
+        NEXT_PROVIDER_REVISION,
+        NEXT_PROVIDER_REVISION,
+        NEXT_PROVIDER_REVISION,
+    ])
+    loads = []
+    monkeypatch.setattr(
+        supabase_utils, "get_canonical_provider_revision", lambda _provider: next(revisions)
+    )
+    monkeypatch.setattr(
+        supabase_utils,
+        "get_canonical_candidates",
+        lambda **_kwargs: loads.append(True) or [{"job_id": "a"}],
+    )
+
+    _candidates, revision = supabase_utils.CanonicalRunContext().consistent_candidates_for(
+        "linkedin"
+    )
+
+    assert revision == NEXT_PROVIDER_REVISION
+    assert len(loads) == 2
+
+
+def test_successful_apply_advances_the_in_memory_provider_revision():
+    context = empty_context()
+    application = supabase_utils.build_linkedin_discovery_task_application(
+        task(), job(), run_context=context, runtime_profile=FILTER_PROFILE
+    )
+
+    supabase_utils._refresh_context_after_task_apply(
+        context,
+        application,
+        "source-1",
+        0,
+        NEXT_PROVIDER_REVISION,
+    )
+
+    assert context.candidate_set_revision_by_provider["linkedin"] == NEXT_PROVIDER_REVISION
 
 
 class RpcSequence:
@@ -253,7 +293,7 @@ def test_ambiguous_transport_retry_reuses_the_exact_application(monkeypatch):
     monkeypatch.setattr(supabase_utils.config, "ENABLE_LINKEDIN_RELIST_TRACKING", True)
     db = RpcSequence([
         httpx.ReadTimeout("timed out"),
-        {"outcome": "applied", "canonical_job_id": "source-1", "canonical_revision": 0},
+        {"outcome": "applied", "canonical_job_id": "source-1", "canonical_revision": 0, "provider_candidate_set_revision": NEXT_PROVIDER_REVISION},
     ])
 
     result = supabase_utils.apply_linkedin_discovery_task_canonical(
@@ -293,10 +333,15 @@ def test_stale_plan_invalidates_snapshot_heartbeats_and_replans(monkeypatch):
     monkeypatch.setattr(supabase_utils.config, "ENABLE_REPOST_DEDUP", True)
     monkeypatch.setattr(supabase_utils.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
     monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [])
+    monkeypatch.setattr(
+        supabase_utils,
+        "get_canonical_provider_revision",
+        lambda _provider: NEXT_PROVIDER_REVISION,
+    )
     db = RpcSequence([
         {"outcome": "stale_plan", "canonical_job_id": "canonical-1"},
         "2026-09-04T12:10:00+00:00",
-        {"outcome": "applied", "canonical_job_id": "source-1", "canonical_revision": 0},
+        {"outcome": "applied", "canonical_job_id": "source-1", "canonical_revision": 0, "provider_candidate_set_revision": NEXT_PROVIDER_REVISION},
     ])
 
     result = supabase_utils.apply_linkedin_discovery_task_canonical(
@@ -322,6 +367,11 @@ def test_stale_provenance_replan_uses_the_locked_task_snapshot(monkeypatch):
     monkeypatch.setattr(supabase_utils.config, "ENABLE_REPOST_DEDUP", True)
     monkeypatch.setattr(supabase_utils.config, "ENABLE_LINKEDIN_RELIST_TRACKING", False)
     monkeypatch.setattr(supabase_utils, "get_canonical_candidates", lambda provider: [])
+    monkeypatch.setattr(
+        supabase_utils,
+        "get_canonical_provider_revision",
+        lambda _provider: NEXT_PROVIDER_REVISION,
+    )
     first_provenance = {
         "lane": "technology_delivery",
         "archetype": "technology_delivery",
@@ -352,7 +402,7 @@ def test_stale_provenance_replan_uses_the_locked_task_snapshot(monkeypatch):
             "task_membership_provenance_revision": 1,
         },
         "2026-09-04T12:10:00+00:00",
-        {"outcome": "applied", "canonical_job_id": "source-1", "canonical_revision": 0},
+        {"outcome": "applied", "canonical_job_id": "source-1", "canonical_revision": 0, "provider_candidate_set_revision": NEXT_PROVIDER_REVISION},
     ])
 
     result = supabase_utils.apply_linkedin_discovery_task_canonical(

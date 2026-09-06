@@ -168,25 +168,29 @@ def _resolve_archetype_config(
 
 def _lane_runtime_archetype_config(execution: LinkedInSearchExecution) -> dict:
     """Translate typed lane context to the existing filter interface."""
-    base_profile = config.ARCHETYPE_CONFIGS.get(execution.lane.archetype)
-    if base_profile is None and execution.lane.archetype == "technology_delivery":
+    return _career_lane_runtime_profile(execution.lane, execution.geography.location)
+
+
+def _career_lane_runtime_profile(lane, location: str) -> dict:
+    base_profile = config.ARCHETYPE_CONFIGS.get(lane.archetype)
+    if base_profile is None and lane.archetype == "technology_delivery":
         base_profile = config.ARCHETYPE_CONFIGS.get("software_tpm")
     profile = dict(base_profile or {})
     profile.update({
         "provider": "linkedin",
-        "location": execution.geography.location,
-        "filter_profile": f"{execution.lane.archetype}_v1",
-        "definition": execution.lane.description,
-        "route_when": execution.lane.routing_guidance,
-        "title_context": list(execution.lane.title_include),
-        "description_context": list(execution.lane.description_include),
-        "positive_signals": list(execution.lane.description_include),
+        "location": location,
+        "filter_profile": f"{lane.archetype}_v1",
+        "definition": lane.description,
+        "route_when": lane.routing_guidance,
+        "title_context": list(lane.title_include),
+        "description_context": list(lane.description_include),
+        "positive_signals": list(lane.description_include),
         "exclude_signals": [
-            *execution.lane.title_exclude,
-            *execution.lane.description_exclude,
+            *lane.title_exclude,
+            *lane.description_exclude,
         ],
-        "title_blocklist": list(execution.lane.title_exclude),
-        "desc_blocklist": list(execution.lane.description_exclude),
+        "title_blocklist": list(lane.title_exclude),
+        "desc_blocklist": list(lane.description_exclude),
     })
     for key in ("company_blocklist", "title_blocklist", "title_entry_level_blocklist", "desc_blocklist"):
         profile.setdefault(key, [])
@@ -315,11 +319,17 @@ def _extract_linkedin_search_cards(job_elements: list) -> list[dict]:
         time_el = job_element.find("time")
         posted_at = time_el.get("datetime").strip() if time_el and time_el.get("datetime") else None
         posted_relative_text = time_el.get_text(" ", strip=True) if time_el else None
+        title_el = job_element.select_one(".base-search-card__title")
+        company_el = job_element.select_one(".base-search-card__subtitle")
+        location_el = job_element.select_one(".job-search-card__location")
 
         results.append({
             "job_id": job_id,
             "posted_at": posted_at,
             "posted_relative_text": posted_relative_text,
+            "job_title": title_el.get_text(" ", strip=True) if title_el else None,
+            "company": company_el.get_text(" ", strip=True) if company_el else None,
+            "location": location_el.get_text(" ", strip=True) if location_el else None,
         })
     return results
 
@@ -643,6 +653,7 @@ def _fetch_linkedin_job_details(
     physical_attempts: list[int] | None = None,
     physical_limit: int | None = None,
     required_fields: tuple[str, ...] = (),
+    deadline: float | None = None,
 ) -> tuple[dict, dict] | _LinkedInDetailUnavailable | None:
     """Fetch job content and detail metadata, returned as separate dictionaries."""
 
@@ -676,9 +687,14 @@ def _fetch_linkedin_job_details(
                 physical_attempts[0] += 1
             if durable_gate is not None:
                 grant = durable_gate.acquire(
-                    "detail", f"{request_key or job_id}:{retries}"
+                    "detail", f"{request_key or job_id}:{retries}", deadline=deadline
                 )
-            resp = requests.get(job_detail_url, headers=headers, timeout=config.REQUEST_TIMEOUT)
+            request_timeout = config.REQUEST_TIMEOUT
+            if deadline is not None:
+                request_timeout = min(
+                    request_timeout, max(0.1, deadline - time.monotonic())
+                )
+            resp = requests.get(job_detail_url, headers=headers, timeout=request_timeout)
             if _linkedin_response_is_challenge(resp):
                 if durable_gate is not None and grant is not None:
                     durable_gate.open_circuit(
@@ -700,6 +716,10 @@ def _fetch_linkedin_job_details(
                 if durable_gate is not None and grant is not None:
                     durable_gate.finish(grant, "not_found_unconfirmed", status_code)
                 retries += 1
+                if deadline is not None and time.monotonic() + config.RETRY_DELAY_SECONDS >= deadline:
+                    raise LinkedInRequestFailed(
+                        f"LinkedIn detail deadline exhausted for job {job_id}"
+                    ) from e
                 time.sleep(config.RETRY_DELAY_SECONDS)
                 continue
             if status_code in (404, 410):
@@ -730,6 +750,10 @@ def _fetch_linkedin_job_details(
                     config.MAX_RETRIES,
                     wait_time,
                 )
+                if deadline is not None and time.monotonic() + wait_time >= deadline:
+                    raise LinkedInRequestFailed(
+                        f"LinkedIn detail deadline exhausted for job {job_id}"
+                    ) from e
                 time.sleep(wait_time)
                 logging.info(
                     "Retrying job %s after LinkedIn cooldown with the same request identity",
@@ -1616,9 +1640,15 @@ def _run_database_configured_linkedin(
             scrape_config,
             archetype_override=archetype_override,
         )
-        runtime_profiles = {
-            execution.lane.archetype: _lane_runtime_archetype_config(execution)
+        execution_locations = {
+            execution.lane.archetype: execution.geography.location
             for execution in executions
+        }
+        runtime_profiles = {
+            lane.archetype: _career_lane_runtime_profile(
+                lane, execution_locations.get(lane.archetype, "")
+            )
+            for lane in scrape_config.lanes
         }
         run_context = supabase_utils.CanonicalRunContext()
         previous_repost_dedup = config.ENABLE_REPOST_DEDUP

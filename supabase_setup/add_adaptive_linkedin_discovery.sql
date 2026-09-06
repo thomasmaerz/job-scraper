@@ -154,6 +154,53 @@ CREATE TRIGGER maintain_job_canonical_revision
 BEFORE UPDATE ON public.jobs
 FOR EACH ROW EXECUTE FUNCTION public.increment_job_canonical_revision();
 
+CREATE TABLE IF NOT EXISTS public.canonical_provider_revisions (
+    provider text PRIMARY KEY,
+    revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+
+INSERT INTO public.canonical_provider_revisions (provider)
+VALUES ('linkedin')
+ON CONFLICT (provider) DO NOTHING;
+
+INSERT INTO public.canonical_provider_revisions (provider)
+SELECT DISTINCT job.provider
+FROM public.jobs job
+WHERE job.provider IS NOT NULL
+ON CONFLICT (provider) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION public.bump_canonical_provider_revision()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = pg_catalog
+AS $$
+BEGIN
+    INSERT INTO public.canonical_provider_revisions AS provider_revision (
+        provider, revision, updated_at
+    ) VALUES ('linkedin', 1, pg_catalog.clock_timestamp())
+    ON CONFLICT (provider) DO UPDATE SET
+        revision = provider_revision.revision + 1,
+        updated_at = EXCLUDED.updated_at;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS maintain_canonical_provider_revision ON public.jobs;
+CREATE TRIGGER maintain_canonical_provider_revision
+AFTER INSERT OR UPDATE OR DELETE ON public.jobs
+FOR EACH STATEMENT EXECUTE FUNCTION public.bump_canonical_provider_revision();
+
+CREATE OR REPLACE FUNCTION public.get_canonical_provider_revision(p_provider text)
+RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+SELECT pg_catalog.lpad(pg_catalog.to_hex(COALESCE((
+    SELECT provider_revision.revision
+    FROM public.canonical_provider_revisions provider_revision
+    WHERE provider_revision.provider = p_provider
+), 0)), 64, '0');
+$$;
+
 CREATE TABLE IF NOT EXISTS public.linkedin_source_request_policy (
     source text PRIMARY KEY CHECK (source = 'linkedin'),
     minimum_interval_ms integer NOT NULL CHECK (minimum_interval_ms BETWEEN 2500 AND 60000),
@@ -880,15 +927,51 @@ BEGIN
     IF EXISTS (SELECT 1 FROM public.linkedin_source_request_grants WHERE source = 'linkedin' AND status = 'pending') THEN
         RETURN pg_catalog.jsonb_build_object('outcome', 'wait', 'wait_ms', 250);
     END IF;
+    IF p_producer = 'adaptive-detail'
+       AND p_request_key !~ '^task:[0-9]+:[0-9a-f-]{36}:[^:]+:[0-9]+$' THEN
+        RAISE EXCEPTION 'adaptive detail request key is invalid'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_producer = 'adaptive-detail'
+       AND NOT EXISTS (
+           SELECT 1
+           FROM public.linkedin_discovery_tasks task
+           WHERE task.id = pg_catalog.split_part(p_request_key, ':', 2)::bigint
+             AND task.lease_token = pg_catalog.split_part(p_request_key, ':', 3)::uuid
+             AND task.status = 'leased'
+             AND task.lease_expires_at > v_now
+       ) THEN
+        RAISE EXCEPTION 'adaptive detail request requires an active task lease'
+            USING ERRCODE = '55000';
+    END IF;
     INSERT INTO public.linkedin_source_request_grants (
         source, producer, request_kind, request_key, requested_at, expires_at,
-        circuit_generation, status
+        circuit_generation, status, started_at
     ) VALUES (
         'linkedin', p_producer, p_request_kind, p_request_key, v_now,
         v_now + pg_catalog.make_interval(secs => policy.grant_ttl_ms / 1000.0),
-        policy.circuit_generation, 'pending'
+        policy.circuit_generation, 'consumed', v_now
     ) RETURNING id INTO grant_id;
-    RETURN pg_catalog.jsonb_build_object('outcome', 'grant', 'grant_id', grant_id);
+    UPDATE public.linkedin_source_request_policy
+    SET next_allowed_at = v_now + pg_catalog.make_interval(secs => minimum_interval_ms / 1000.0),
+        updated_at = v_now
+    WHERE source = 'linkedin';
+    IF p_producer = 'adaptive-detail'
+       AND p_request_key ~ '^task:[0-9]+:[0-9a-f-]{36}:[^:]+:[0-9]+$' THEN
+        INSERT INTO public.linkedin_discovery_task_attempts (
+            task_id, lease_token, request_attempt, request_grant_id,
+            response_class, parser_version, started_at
+        ) VALUES (
+            pg_catalog.split_part(p_request_key, ':', 2)::bigint,
+            pg_catalog.split_part(p_request_key, ':', 3)::uuid,
+            pg_catalog.split_part(p_request_key, ':', 5)::integer,
+            grant_id, 'started', 'linkedin-detail-v1', v_now
+        );
+    END IF;
+    RETURN pg_catalog.jsonb_build_object(
+        'outcome', 'grant', 'grant_id', grant_id, 'started_at', v_now,
+        'consumed', true
+    );
 END;
 $$;
 
@@ -1196,6 +1279,83 @@ BEGIN
     RETURN pg_catalog.jsonb_build_object(
         'cycle_id', cycle_id, 'discovery_sequence', sequence_value,
         'search_status', 'running', 'scopes', scope_rows, 'replayed', false
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.get_resumable_linkedin_discovery_cycle(
+    p_partial boolean, p_scope_keys text[] DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    cycle_row public.linkedin_discovery_cycles%ROWTYPE;
+    scope_rows jsonb;
+BEGIN
+    SELECT cycle.* INTO cycle_row
+    FROM public.linkedin_discovery_cycles cycle
+    WHERE cycle.search_status = 'running'
+      AND EXISTS (
+          SELECT 1
+          FROM public.linkedin_discovery_cycle_scopes scope
+          WHERE scope.discovery_cycle_id = cycle.id
+            AND COALESCE((scope.query_scope::jsonb->>'partial')::boolean, false) = p_partial
+      )
+      AND (
+          NOT p_partial
+          OR ARRAY(
+              SELECT scope.scope_key
+              FROM public.linkedin_discovery_cycle_scopes scope
+              WHERE scope.discovery_cycle_id = cycle.id
+              ORDER BY scope.scope_key
+          ) = ARRAY(
+              SELECT requested.scope_key
+              FROM pg_catalog.unnest(p_scope_keys) AS requested(scope_key)
+              ORDER BY requested.scope_key
+          )
+      )
+    ORDER BY cycle.discovery_sequence
+    LIMIT 1;
+    IF cycle_row.id IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'scope_key', manifest.scope_key,
+        'scope_definition', state.scope_definition,
+        'ingestion_run_id', manifest.ingestion_run_id,
+        'next_page', COALESCE(page.next_page, 1),
+        'status', manifest.status,
+        'query_scope', manifest.query_scope,
+        'request_anchor_at', manifest.request_anchor_at,
+        'source_window_earliest_at', manifest.source_window_earliest_at,
+        'source_window_latest_at', manifest.source_window_latest_at,
+        'truncated_window_earliest_at', manifest.truncated_window_earliest_at,
+        'truncated_window_latest_at', manifest.truncated_window_latest_at,
+        'expired_window_earliest_at', manifest.expired_window_earliest_at,
+        'expired_window_latest_at', manifest.expired_window_latest_at,
+        'minimum_pages', manifest.minimum_pages,
+        'target_pages', manifest.target_pages,
+        'committed_page_count', COALESCE(page.committed_page_count, 0),
+        'latest_page_result', page.latest_page_result
+    ) ORDER BY manifest.scope_key), '[]'::jsonb)
+    INTO scope_rows
+    FROM public.linkedin_discovery_cycle_scopes manifest
+    JOIN public.linkedin_scope_coverage_state state
+      ON state.scope_key = manifest.scope_key
+    LEFT JOIN (
+        SELECT ingestion_run_id, MAX(page_number) + 1 AS next_page,
+               COUNT(*) AS committed_page_count,
+               (ARRAY_AGG(result ORDER BY page_number DESC))[1] AS latest_page_result
+        FROM public.linkedin_ingestion_pages
+        GROUP BY ingestion_run_id
+    ) page ON page.ingestion_run_id = manifest.ingestion_run_id
+    WHERE manifest.discovery_cycle_id = cycle_row.id;
+    RETURN pg_catalog.jsonb_build_object(
+        'cycle_id', cycle_row.id,
+        'discovery_sequence', cycle_row.discovery_sequence,
+        'search_status', cycle_row.search_status,
+        'pinned_user_agent', cycle_row.pinned_user_agent,
+        'scopes', scope_rows,
+        'resumed', true
     );
 END;
 $$;
@@ -1855,6 +2015,53 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.prepare_linkedin_discovery_scope_state(
+    p_scope_keys text[], p_recovery_floor timestamptz
+) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    scope_key_value text;
+    states jsonb;
+    debt_rows jsonb;
+BEGIN
+    IF p_scope_keys IS NULL OR pg_catalog.array_length(p_scope_keys, 1) IS NULL
+       OR p_recovery_floor IS NULL THEN
+        RAISE EXCEPTION 'scope keys and recovery floor are required' USING ERRCODE = '22023';
+    END IF;
+    FOREACH scope_key_value IN ARRAY p_scope_keys LOOP
+        PERFORM public.expire_linkedin_coverage_debt(
+            scope_key_value, p_recovery_floor
+        );
+    END LOOP;
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'scope_key', state.scope_key,
+        'last_operational_success_at', state.last_operational_success_at,
+        'recommended_pages', state.recommended_pages,
+        'coverage_debt', state.coverage_debt,
+        'last_deep_sweep_at', state.last_deep_sweep_at
+    ) ORDER BY state.scope_key), '[]'::jsonb)
+    INTO states
+    FROM public.linkedin_scope_coverage_state state
+    WHERE state.scope_key = ANY(p_scope_keys);
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'scope_key', selected.scope_key,
+        'source_window_earliest_at', selected.source_window_earliest_at,
+        'source_window_latest_at', selected.source_window_latest_at,
+        'created_at', selected.created_at
+    ) ORDER BY selected.scope_key), '[]'::jsonb)
+    INTO debt_rows
+    FROM (
+        SELECT DISTINCT ON (debt.scope_key)
+               debt.scope_key, debt.source_window_earliest_at,
+               debt.source_window_latest_at, debt.created_at
+        FROM public.linkedin_coverage_debt debt
+        WHERE debt.scope_key = ANY(p_scope_keys) AND debt.status = 'pending'
+        ORDER BY debt.scope_key, debt.source_window_earliest_at, debt.id
+    ) selected;
+    RETURN pg_catalog.jsonb_build_object('states', states, 'debt', debt_rows);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.accept_linkedin_coverage_debt(
     p_debt_id bigint, p_reviewer text, p_reason text
 ) RETURNS boolean
@@ -2239,7 +2446,7 @@ BEGIN
             WHERE scope.discovery_cycle_id = p_cycle_id AND scope.required
               AND (scope.status <> 'complete' OR scope.enqueue_committed_at IS NULL
                    OR run.status <> 'complete'
-                   OR run.coverage_status NOT IN ('exhausted', 'right_censored'))
+                    OR run.coverage_status <> 'exhausted')
        )
        OR EXISTS (
             SELECT 1
@@ -2344,11 +2551,20 @@ BEGIN
         FROM picked WHERE task.id = picked.id RETURNING task.*;
     ELSE
         RETURN QUERY WITH picked AS (
-            SELECT id FROM public.linkedin_discovery_tasks
-            WHERE status IN ('pending', 'failed_retryable')
-              AND attempt_count < max_attempts
-              AND available_at <= pg_catalog.clock_timestamp()
-            ORDER BY priority DESC, first_observed_at, id FOR UPDATE SKIP LOCKED LIMIT p_limit
+            SELECT task.id FROM public.linkedin_discovery_tasks task
+            WHERE task.status IN ('pending', 'failed_retryable')
+              AND task.attempt_count < task.max_attempts
+              AND task.available_at <= pg_catalog.clock_timestamp()
+            ORDER BY COALESCE((
+                SELECT MIN(cycle.discovery_sequence)
+                FROM public.linkedin_discovery_requirements requirement
+                JOIN public.linkedin_discovery_cycles cycle
+                  ON cycle.id = requirement.discovery_cycle_id
+                WHERE requirement.task_id = task.id
+                  AND requirement.required
+            ), 9223372036854775807),
+            task.priority DESC, task.first_observed_at, task.id
+            FOR UPDATE OF task SKIP LOCKED LIMIT p_limit
         ) UPDATE public.linkedin_discovery_tasks task SET status = 'leased', leased_by = p_worker_id,
             leased_at = pg_catalog.clock_timestamp(), lease_expires_at = pg_catalog.clock_timestamp() + interval '10 minutes',
             lease_token = extensions.gen_random_uuid(), attempt_count = task.attempt_count + 1
@@ -2449,7 +2665,10 @@ BEGIN
 
     IF p_application IS NULL
        OR pg_catalog.jsonb_typeof(p_application) <> 'object'
-       OR p_application->>'version' <> 'linkedin-canonical-task-apply-v3' THEN
+       OR p_application->>'version' NOT IN (
+           'linkedin-canonical-task-apply-v3',
+           'linkedin-canonical-task-apply-v4'
+       ) THEN
         RAISE EXCEPTION 'invalid canonical task application' USING ERRCODE = '22023';
     END IF;
     candidate_set_revision := p_application->>'provider_candidate_set_revision';
@@ -2480,6 +2699,8 @@ BEGIN
                     FROM public.jobs job
                     WHERE job.job_id = task_row.canonical_job_id
                 ),
+                'provider_candidate_set_revision',
+                    public.get_canonical_provider_revision('linkedin'),
                 'application_hash', application_hash,
                 'completed_at', task_row.completed_at, 'replayed', true
             );
@@ -2615,17 +2836,26 @@ BEGIN
     ELSIF canonical_payload ? 'job_id' THEN
         RAISE EXCEPTION 'canonical update payload must not contain job_id' USING ERRCODE = '22023';
     END IF;
-    SELECT pg_catalog.encode(extensions.digest(pg_catalog.convert_to(COALESCE(
-        pg_catalog.string_agg(
-            pg_catalog.octet_length(job.job_id)::text || ':' || job.job_id
-                || pg_catalog.octet_length(job.canonical_revision::text)::text || ':'
-                || job.canonical_revision::text,
-            '' ORDER BY pg_catalog.convert_to(job.job_id, 'UTF8')
-        ), ''
-    ), 'UTF8'), 'sha256'), 'hex')
-    INTO current_candidate_set_revision
-    FROM public.jobs job
-    WHERE job.provider = 'linkedin';
+    LOCK TABLE public.jobs IN SHARE ROW EXCLUSIVE MODE;
+    IF p_application->>'version' = 'linkedin-canonical-task-apply-v3' THEN
+        SELECT pg_catalog.encode(extensions.digest(pg_catalog.convert_to(COALESCE(
+            pg_catalog.string_agg(
+                pg_catalog.octet_length(job.job_id)::text || ':' || job.job_id
+                    || pg_catalog.octet_length(job.canonical_revision::text)::text || ':'
+                    || job.canonical_revision::text,
+                '' ORDER BY pg_catalog.convert_to(job.job_id, 'UTF8')
+            ), ''
+        ), 'UTF8'), 'sha256'), 'hex')
+        INTO current_candidate_set_revision
+        FROM public.jobs job
+        WHERE job.provider = 'linkedin';
+    ELSE
+        SELECT pg_catalog.lpad(pg_catalog.to_hex(provider_revision.revision), 64, '0')
+        INTO STRICT current_candidate_set_revision
+        FROM public.canonical_provider_revisions provider_revision
+        WHERE provider_revision.provider = 'linkedin'
+        FOR UPDATE;
+    END IF;
     IF candidate_set_revision IS DISTINCT FROM current_candidate_set_revision THEN
         RETURN pg_catalog.jsonb_build_object(
             'outcome', 'stale_plan', 'task_id', task_row.id,
@@ -2913,6 +3143,7 @@ BEGIN
     SELECT job.canonical_revision INTO STRICT applied_canonical_revision
     FROM public.jobs job
     WHERE job.job_id = target_job_id;
+    current_candidate_set_revision := public.get_canonical_provider_revision('linkedin');
 
     application_completed_at := pg_catalog.clock_timestamp();
     UPDATE public.linkedin_discovery_tasks
@@ -2931,6 +3162,7 @@ BEGIN
         'outcome', 'applied', 'task_id', p_task_id,
         'canonical_job_id', target_job_id, 'action', canonical_action,
         'canonical_revision', applied_canonical_revision,
+        'provider_candidate_set_revision', current_candidate_set_revision,
         'application_hash', application_hash, 'completed_at', application_completed_at,
         'replayed', false
     );
@@ -3032,7 +3264,11 @@ BEGIN
     PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('linkedin-canonical-publication-v1', 0));
     SELECT * INTO STRICT cycle_row FROM public.linkedin_discovery_cycles WHERE id = p_cycle_id FOR SHARE;
     IF cycle_row.search_status <> 'sealed' THEN
-        RAISE EXCEPTION 'cycle is not sealed' USING ERRCODE = '55000';
+        RETURN pg_catalog.jsonb_build_object(
+            'outcome', 'deferred', 'reason', 'coverage work remains',
+            'requested_cycle_id', p_cycle_id, 'eligible_cycle_id', NULL,
+            'blocking_count', cycle_row.required_scope_count - cycle_row.completed_scope_count
+        );
     END IF;
     SELECT * INTO STRICT current_publication
     FROM public.freehire_publication_state WHERE id = 1 FOR UPDATE;
@@ -3067,6 +3303,19 @@ BEGIN
             'outcome', 'deferred', 'reason', 'predecessor discovery cycle is incomplete',
             'requested_cycle_id', p_cycle_id, 'eligible_cycle_id', NULL,
             'blocking_count', predecessor_count
+        );
+    END IF;
+    SELECT COUNT(*) INTO blocking_count
+    FROM public.linkedin_coverage_debt debt
+    JOIN public.linkedin_discovery_cycles origin
+      ON origin.id = debt.origin_discovery_cycle_id
+    WHERE origin.discovery_sequence <= cycle_row.discovery_sequence
+      AND debt.status IN ('pending', 'expired_unresolved');
+    IF blocking_count > 0 THEN
+        RETURN pg_catalog.jsonb_build_object(
+            'outcome', 'deferred', 'reason', 'unresolved coverage debt',
+            'requested_cycle_id', p_cycle_id, 'eligible_cycle_id', NULL,
+            'blocking_count', blocking_count
         );
     END IF;
     SELECT COUNT(*) INTO blocking_count
@@ -3134,7 +3383,97 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.get_linkedin_discovery_status()
+RETURNS jsonb
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+WITH latest AS (
+    SELECT cycle.*
+    FROM public.linkedin_discovery_cycles cycle
+    ORDER BY cycle.discovery_sequence DESC
+    LIMIT 1
+), scope_summary AS (
+    SELECT COUNT(*) AS scopes,
+           COUNT(*) FILTER (WHERE run.coverage_status = 'exhausted') AS exhausted,
+           COUNT(*) FILTER (WHERE scope.status = 'running') AS running,
+           COALESCE(SUM(run.pages_completed), 0) AS pages,
+           COALESCE(SUM(run.cards_seen), 0) AS cards
+    FROM latest
+    LEFT JOIN public.linkedin_discovery_cycle_scopes scope
+      ON scope.discovery_cycle_id = latest.id
+    LEFT JOIN public.ingestion_runs run ON run.id = scope.ingestion_run_id
+), debt_summary AS (
+    SELECT COUNT(*) FILTER (WHERE debt.status = 'pending') AS pending,
+           COUNT(*) FILTER (WHERE debt.status = 'expired_unresolved') AS expired,
+           MIN(debt.created_at) FILTER (
+               WHERE debt.status IN ('pending', 'expired_unresolved')
+           ) AS oldest
+    FROM public.linkedin_coverage_debt debt
+), task_summary AS (
+    SELECT COUNT(*) FILTER (WHERE task.status = 'pending') AS pending,
+           COUNT(*) FILTER (WHERE task.status = 'leased') AS leased,
+           COUNT(*) FILTER (WHERE task.status = 'failed_retryable') AS retryable,
+           COUNT(*) FILTER (WHERE task.status = 'failed_terminal') AS terminal,
+           COUNT(*) FILTER (WHERE task.status = 'complete') AS complete
+    FROM public.linkedin_discovery_tasks task
+), lane_summary AS (
+    SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'archetype', grouped.archetype,
+        'scopes', grouped.scopes,
+        'exhausted', grouped.exhausted,
+        'running', grouped.running,
+        'pages', grouped.pages,
+        'cards', grouped.cards
+    ) ORDER BY grouped.archetype), '[]'::jsonb) AS lanes
+    FROM (
+        SELECT state.archetype, COUNT(*) AS scopes,
+               COUNT(*) FILTER (WHERE run.coverage_status = 'exhausted') AS exhausted,
+               COUNT(*) FILTER (WHERE scope.status = 'running') AS running,
+               COALESCE(SUM(run.pages_completed), 0) AS pages,
+               COALESCE(SUM(run.cards_seen), 0) AS cards
+        FROM latest
+        JOIN public.linkedin_discovery_cycle_scopes scope
+          ON scope.discovery_cycle_id = latest.id
+        JOIN public.linkedin_scope_coverage_state state
+          ON state.scope_key = scope.scope_key
+        JOIN public.ingestion_runs run ON run.id = scope.ingestion_run_id
+        GROUP BY state.archetype
+    ) grouped
+)
+SELECT pg_catalog.jsonb_build_object(
+    'latest_cycle', CASE WHEN latest.id IS NULL THEN NULL ELSE pg_catalog.jsonb_build_object(
+        'id', latest.id,
+        'sequence', latest.discovery_sequence,
+        'started_at', latest.started_at,
+        'completed_at', latest.search_completed_at,
+        'search_status', latest.search_status,
+        'canonical_status', latest.canonical_status,
+        'required_scopes', latest.required_scope_count,
+        'completed_scopes', scope_summary.exhausted,
+        'running_scopes', scope_summary.running,
+        'pages', scope_summary.pages,
+        'cards', scope_summary.cards
+    ) END,
+    'coverage_debt', pg_catalog.jsonb_build_object(
+        'pending', debt_summary.pending,
+        'expired', debt_summary.expired,
+        'oldest_at', debt_summary.oldest
+    ),
+    'tasks', to_jsonb(task_summary),
+    'publication', COALESCE((
+        SELECT to_jsonb(publication) FROM public.freehire_publication_state publication
+        WHERE publication.id = 1
+    ), '{}'::jsonb),
+    'lanes', lane_summary.lanes
+)
+FROM scope_summary
+CROSS JOIN debt_summary
+CROSS JOIN task_summary
+CROSS JOIN lane_summary
+LEFT JOIN latest ON true;
+$$;
+
 ALTER TABLE public.linkedin_source_request_policy ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.canonical_provider_revisions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.linkedin_source_request_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.linkedin_scope_coverage_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.linkedin_discovery_cycles ENABLE ROW LEVEL SECURITY;
@@ -3150,7 +3489,8 @@ ALTER TABLE public.linkedin_coverage_debt_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.linkedin_discovery_requirement_acceptances ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.linkedin_discovery_task_attempts ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON TABLE public.linkedin_source_request_policy, public.linkedin_source_request_grants,
+REVOKE ALL ON TABLE public.canonical_provider_revisions,
+    public.linkedin_source_request_policy, public.linkedin_source_request_grants,
     public.linkedin_scope_coverage_state, public.linkedin_discovery_cycles,
     public.linkedin_discovery_cycle_scopes, public.linkedin_ingestion_pages,
     public.linkedin_ingestion_page_sources, public.linkedin_discovery_cycle_sources,
@@ -3165,7 +3505,8 @@ REVOKE ALL ON SEQUENCE public.linkedin_discovery_cycles_id_seq,
     public.linkedin_coverage_debt_id_seq,
     public.linkedin_discovery_task_attempts_id_seq
 FROM PUBLIC, anon, authenticated, service_role;
-GRANT SELECT ON TABLE public.linkedin_source_request_policy, public.linkedin_source_request_grants,
+GRANT SELECT ON TABLE public.canonical_provider_revisions,
+    public.linkedin_source_request_policy, public.linkedin_source_request_grants,
     public.linkedin_scope_coverage_state, public.linkedin_discovery_cycles,
     public.linkedin_discovery_cycle_scopes, public.linkedin_ingestion_pages,
     public.linkedin_ingestion_page_sources, public.linkedin_discovery_cycle_sources,
@@ -3176,16 +3517,20 @@ GRANT SELECT ON TABLE public.linkedin_source_request_policy, public.linkedin_sou
     public.linkedin_discovery_task_attempts
 TO service_role;
 
-REVOKE ALL ON FUNCTION public.acquire_linkedin_request_grant(text, text, text),
+REVOKE ALL ON FUNCTION public.bump_canonical_provider_revision(),
+    public.get_canonical_provider_revision(text),
+    public.acquire_linkedin_request_grant(text, text, text),
     public.consume_linkedin_request_grant(uuid, text),
     public.finish_linkedin_request_grant(uuid, text, text, integer),
     public.open_linkedin_source_circuit(uuid, text, text, integer),
     public.reset_linkedin_source_circuit(text, text),
     public.create_linkedin_discovery_cycle(uuid, bigint, text, text, jsonb),
+    public.get_resumable_linkedin_discovery_cycle(boolean, text[]),
     public.commit_linkedin_discovery_page(jsonb),
     public.finish_linkedin_discovery_scope(uuid, text, text),
     public.fail_linkedin_discovery_cycle(bigint, text),
     public.expire_linkedin_coverage_debt(text, timestamptz),
+    public.prepare_linkedin_discovery_scope_state(text[], timestamptz),
     public.accept_linkedin_coverage_debt(bigint, text, text),
     public.advance_linkedin_discovery_watermark(),
     public.resolve_failed_linkedin_discovery_cycle(bigint, bigint, text, text, text),
@@ -3195,18 +3540,22 @@ REVOKE ALL ON FUNCTION public.acquire_linkedin_request_grant(text, text, text),
     public.claim_linkedin_discovery_tasks(text, integer, text),
     public.heartbeat_linkedin_discovery_task(bigint, text, uuid),
     public.transition_linkedin_discovery_task(bigint, text, uuid, text, text, text),
-    public.finalize_freehire_publication_v2(bigint)
+    public.finalize_freehire_publication_v2(bigint),
+    public.get_linkedin_discovery_status()
 FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.acquire_linkedin_request_grant(text, text, text),
+GRANT EXECUTE ON FUNCTION public.get_canonical_provider_revision(text),
+    public.acquire_linkedin_request_grant(text, text, text),
     public.consume_linkedin_request_grant(uuid, text),
     public.finish_linkedin_request_grant(uuid, text, text, integer),
     public.open_linkedin_source_circuit(uuid, text, text, integer),
     public.reset_linkedin_source_circuit(text, text),
     public.create_linkedin_discovery_cycle(uuid, bigint, text, text, jsonb),
+    public.get_resumable_linkedin_discovery_cycle(boolean, text[]),
     public.commit_linkedin_discovery_page(jsonb),
     public.finish_linkedin_discovery_scope(uuid, text, text),
     public.fail_linkedin_discovery_cycle(bigint, text),
     public.expire_linkedin_coverage_debt(text, timestamptz),
+    public.prepare_linkedin_discovery_scope_state(text[], timestamptz),
     public.accept_linkedin_coverage_debt(bigint, text, text),
     public.advance_linkedin_discovery_watermark(),
     public.resolve_failed_linkedin_discovery_cycle(bigint, bigint, text, text, text),
@@ -3216,7 +3565,8 @@ GRANT EXECUTE ON FUNCTION public.acquire_linkedin_request_grant(text, text, text
     public.claim_linkedin_discovery_tasks(text, integer, text),
     public.heartbeat_linkedin_discovery_task(bigint, text, uuid),
     public.transition_linkedin_discovery_task(bigint, text, uuid, text, text, text),
-    public.finalize_freehire_publication_v2(bigint)
+    public.finalize_freehire_publication_v2(bigint),
+    public.get_linkedin_discovery_status()
 TO service_role;
 REVOKE ALL ON FUNCTION public.apply_linkedin_discovery_task_canonical(bigint, text, uuid, jsonb)
 FROM PUBLIC, anon, authenticated;

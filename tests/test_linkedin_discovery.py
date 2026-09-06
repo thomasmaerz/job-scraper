@@ -25,6 +25,20 @@ def test_adaptive_options_reject_non_strict_integers():
         linkedin_discovery.adaptive_options(settings(max_detail_tasks_per_run=True))
 
 
+def test_adaptive_runtime_budget_fits_hourly_workflow():
+    options = linkedin_discovery.adaptive_options(settings())
+
+    assert options["search_runtime"] == 1_620
+    assert options["detail_runtime"] == 300
+    assert options["search_runtime"] + options["detail_runtime"] <= 1_920
+
+    with pytest.raises(linkedin_discovery.DiscoveryError, match="runtime budgets"):
+        linkedin_discovery.adaptive_options(settings(
+            max_search_runtime_seconds=1_620,
+            max_detail_runtime_seconds=301,
+        ))
+
+
 def test_adaptive_retry_after_accepts_http_dates():
     retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
     response = SimpleNamespace(headers={"Retry-After": format_datetime(retry_at, usegmt=True)})
@@ -262,7 +276,7 @@ def test_page_window_is_computed_after_durable_grant(monkeypatch):
     started_at = datetime(2026, 9, 4, 12, 0, 1, 250000, tzinfo=timezone.utc)
 
     class Gate:
-        def acquire(self, *_args):
+        def acquire(self, *_args, **_kwargs):
             return ConsumedGrant("grant-1", started_at)
 
         def finish(self, *_args):
@@ -302,11 +316,49 @@ def test_page_window_is_computed_after_durable_grant(monkeypatch):
     assert page["lookback_seconds"] == 3602
 
 
-def test_scope_window_uses_per_scope_success_and_persisted_depth(monkeypatch):
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "expire_linkedin_coverage_debt",
-        lambda *_args, **_kwargs: 0,
+def test_transient_search_failure_preserves_resumable_cycle(monkeypatch):
+    class Gate:
+        def acquire(self, *_args, **_kwargs):
+            return ConsumedGrant(
+                "grant-1", datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+            )
+
+        def finish(self, *_args):
+            return None
+
+    response = SimpleNamespace(
+        status_code=503,
+        url="https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+        headers={"Content-Type": "text/html"},
+        text="unavailable",
+        content=b"unavailable",
     )
+    monkeypatch.setattr(linkedin_discovery.config, "MAX_RETRIES", 0)
+    monkeypatch.setattr(
+        linkedin_discovery.requests, "get", lambda *_args, **_kwargs: response
+    )
+
+    with pytest.raises(linkedin_discovery.RetryableDiscoveryInterruption):
+        linkedin_discovery._request_page(
+            {
+                "scope_key": "scope-1",
+                "query": "TPM",
+                "location": "Canada",
+                "job_type": "F",
+                "work_types": "1,2,3",
+                "geo_id": 101174742,
+                "source_window_earliest_at": "2026-09-04T11:00:00+00:00",
+            },
+            1,
+            user_agent="ua",
+            gate=Gate(),
+            parse_cards=lambda _elements: [],
+            physical_attempts=[0],
+            physical_limit=1,
+        )
+
+
+def test_scope_window_uses_per_scope_success_and_persisted_depth(monkeypatch):
     execution = SimpleNamespace(
         lane=SimpleNamespace(archetype="technology_delivery"),
         query=SimpleNamespace(
@@ -325,18 +377,14 @@ def test_scope_window_uses_per_scope_success_and_persisted_depth(monkeypatch):
     prior_success = datetime.now(timezone.utc) - timedelta(hours=10)
     monkeypatch.setattr(
         linkedin_discovery.supabase_utils,
-        "get_linkedin_scope_coverage_states",
-        lambda keys: {
-            keys[0]: {
+        "prepare_linkedin_discovery_scope_state",
+        lambda keys, _floor: {
+            "states": {keys[0]: {
                 "last_operational_success_at": prior_success.isoformat(),
                 "recommended_pages": 5,
-            }
+            }},
+            "debt": {},
         },
-    )
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils,
-        "get_pending_linkedin_coverage_debt",
-        lambda _keys: {},
     )
     configuration = SimpleNamespace(
         settings=SimpleNamespace(lookback_days=2)
@@ -354,10 +402,6 @@ def test_scope_window_uses_per_scope_success_and_persisted_depth(monkeypatch):
 
 
 def test_pending_debt_uses_hard_depth_and_original_window(monkeypatch):
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "expire_linkedin_coverage_debt",
-        lambda *_args, **_kwargs: 0,
-    )
     execution = SimpleNamespace(
         lane=SimpleNamespace(archetype="technology_delivery"),
         query=SimpleNamespace(
@@ -376,14 +420,12 @@ def test_pending_debt_uses_hard_depth_and_original_window(monkeypatch):
     debt_earliest = datetime.now(timezone.utc) - timedelta(hours=72)
     monkeypatch.setattr(
         linkedin_discovery.supabase_utils,
-        "get_linkedin_scope_coverage_states",
-        lambda _keys: {},
-    )
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils,
-        "get_pending_linkedin_coverage_debt",
-        lambda keys: {
-            keys[0]: {"source_window_earliest_at": debt_earliest.isoformat()}
+        "prepare_linkedin_discovery_scope_state",
+        lambda keys, _floor: {
+            "states": {},
+            "debt": {
+                keys[0]: {"source_window_earliest_at": debt_earliest.isoformat()}
+            },
         },
     )
     options = linkedin_discovery.adaptive_options(settings(hard_max_pages_per_query=20))
@@ -411,23 +453,17 @@ def test_long_gap_is_represented_as_recoverable_and_expired_debt(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "expire_linkedin_coverage_debt",
-        lambda *_args, **_kwargs: 0,
-    )
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "get_linkedin_scope_coverage_states",
-        lambda keys: {
-            keys[0]: {
+        linkedin_discovery.supabase_utils,
+        "prepare_linkedin_discovery_scope_state",
+        lambda keys, _floor: {
+            "states": {keys[0]: {
                 "last_operational_success_at": (
                     datetime.now(timezone.utc) - timedelta(hours=200)
                 ).isoformat(),
                 "recommended_pages": 6,
-            }
+            }},
+            "debt": {},
         },
-    )
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "get_pending_linkedin_coverage_debt",
-        lambda _keys: {},
     )
 
     manifest = linkedin_discovery._scope_manifest(
@@ -443,10 +479,6 @@ def test_long_gap_is_represented_as_recoverable_and_expired_debt(monkeypatch):
 
 
 def test_cycle_replay_uses_persisted_window(monkeypatch):
-    monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "expire_linkedin_coverage_debt",
-        lambda *_args, **_kwargs: 0,
-    )
     execution = SimpleNamespace(
         lane=SimpleNamespace(archetype="technology_delivery"),
         query=SimpleNamespace(
@@ -469,12 +501,14 @@ def test_cycle_replay_uses_persisted_window(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "get_linkedin_scope_coverage_states",
-        lambda _keys: {},
+        linkedin_discovery.supabase_utils,
+        "get_resumable_linkedin_discovery_cycle",
+        lambda **_kwargs: None,
     )
     monkeypatch.setattr(
-        linkedin_discovery.supabase_utils, "get_pending_linkedin_coverage_debt",
-        lambda _keys: {},
+        linkedin_discovery.supabase_utils,
+        "prepare_linkedin_discovery_scope_state",
+        lambda _keys, _floor: {"states": {}, "debt": {}},
     )
     monkeypatch.setattr(
         linkedin_discovery, "configuration_hash", lambda _configuration: "a" * 64,

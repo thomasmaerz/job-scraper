@@ -55,6 +55,34 @@ def test_lane_include_terms_are_or_routing_signals_and_excludes_win():
     assert excluded["filter_status"] == "filtered"
 
 
+@pytest.mark.parametrize(("title", "pattern"), [
+    ("Process Project Manager", r"\bprocess project manager\b"),
+    ("Backend Engineer", r"\bbackend (?:software )?engineer\b"),
+    ("Network Software Engineer", r"\bnetwork software engineer\b"),
+    ("Software Engineer", r"\bsoftware engineer\b"),
+    ("Senior Software Developer, Brokerage", r"\bsoftware (?:developer|engineer)\b.*\bbrokerage\b"),
+    ("Maintenance Electrician", r"\bmaintenance electrician\b"),
+    ("Senior Data Scientist", r"\bdata scientist\b"),
+    ("Robotics Engineer", r"\brobotics engineer\b"),
+])
+def test_reviewed_cross_lane_false_positive_titles_are_excluded(title, pattern):
+    profile = {
+        "company_blocklist": [],
+        "title_entry_level_blocklist": [],
+        "title_blocklist": [pattern],
+        "desc_blocklist": [],
+        "title_include": [],
+        "description_include": [],
+    }
+
+    result = supabase_utils.evaluate_lane_filter(
+        {"job_title": title, "description": ""},
+        runtime_profile=profile,
+    )
+
+    assert result["filter_status"] == "filtered"
+
+
 def test_persist_lane_filter_state_keys_update_by_job_and_lane(monkeypatch):
     calls = []
     class Query:

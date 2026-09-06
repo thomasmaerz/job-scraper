@@ -70,7 +70,7 @@ def fetch_candidates(
 
 
 def fetch_incremental_candidates(db, limit: int, now: datetime | None = None) -> list[dict]:
-    """Fetch only a bounded, actionable newest-first hourly work set."""
+    """Fetch a bounded, actionable oldest-first work set without starvation."""
     now = now or datetime.now(timezone.utc)
     retry_cutoff = now.isoformat()
     lease_cutoff = (now - timedelta(minutes=30)).isoformat()
@@ -99,8 +99,8 @@ def fetch_incremental_candidates(db, limit: int, now: datetime | None = None) ->
         .eq("provider", "linkedin")
         .not_.is_("description", None)
         .or_(eligibility)
-        .order("last_seen_at", desc=True, nullsfirst=False)
-        .order("job_id", desc=True)
+        .order("last_seen_at", desc=False, nullsfirst=True)
+        .order("job_id", desc=False)
         .limit(limit)
         .execute()
         .data

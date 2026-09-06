@@ -80,7 +80,7 @@ def test_fetch_linkedin_details_uses_durable_gate_without_legacy_limiter(monkeyp
             return None
 
     class Gate:
-        def acquire(self, kind, key):
+        def acquire(self, kind, key, **_kwargs):
             events.append(("acquire", kind, key))
             return ConsumedGrant("grant-1", datetime.now(timezone.utc))
 
@@ -107,7 +107,7 @@ def test_durable_detail_challenge_raises_source_circuit(monkeypatch):
         url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/123"
 
     class Gate:
-        def acquire(self, *_args):
+        def acquire(self, *_args, **_kwargs):
             return ConsumedGrant("grant-1", datetime.now(timezone.utc))
 
         def open_circuit(self, *_args):

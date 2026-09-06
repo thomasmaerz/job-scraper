@@ -25,6 +25,7 @@ from linkedin_source_policy import (
     DurableLinkedInRequestGate,
     LinkedInCircuitOpen,
     LinkedInGrantRejected,
+    LinkedInRequestDeadlineExceeded,
 )
 
 
@@ -42,6 +43,10 @@ NO_RESULTS_RESPONSE_BODIES = (
 
 
 class DiscoveryError(RuntimeError):
+    pass
+
+
+class RetryableDiscoveryInterruption(DiscoveryError):
     pass
 
 
@@ -112,6 +117,8 @@ def adaptive_options(settings: Any) -> dict[str, int]:
     overlap = integer_option("indexing_overlap_hours", 6)
     maximum_window = integer_option("maximum_normal_window_hours", 24)
     recovery_cap = integer_option("outage_recovery_cap_hours", 168)
+    search_runtime = integer_option("max_search_runtime_seconds", 1_620)
+    detail_runtime = integer_option("max_detail_runtime_seconds", 300)
     if not 1 <= minimum <= soft <= hard <= 100:
         raise DiscoveryError("adaptive page limits must satisfy 1 <= minimum <= soft <= hard <= 100")
     if (extra < 0 or detail < 0 or detail > 10_000 or attempts < minimum
@@ -119,6 +126,9 @@ def adaptive_options(settings: Any) -> dict[str, int]:
         raise DiscoveryError("adaptive request budgets are invalid")
     if not 1 <= minimum_window <= maximum_window <= recovery_cap <= 8_760 or overlap < 0:
         raise DiscoveryError("adaptive lookback options are invalid")
+    if (not 60 <= search_runtime <= 1_920 or not 0 <= detail_runtime <= 1_200
+            or search_runtime + detail_runtime > 1_920):
+        raise DiscoveryError("adaptive runtime budgets are invalid")
     return {
         "minimum": minimum,
         "soft": soft,
@@ -131,6 +141,8 @@ def adaptive_options(settings: Any) -> dict[str, int]:
         "overlap": overlap,
         "maximum_window": maximum_window,
         "recovery_cap": recovery_cap,
+        "search_runtime": search_runtime,
+        "detail_runtime": detail_runtime,
     }
 
 
@@ -221,14 +233,21 @@ def _request_page(
     physical_attempts: list[int],
     physical_limit: int,
     maximum_lookback_seconds: int | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     page_start = (page_number - 1) * EXPECTED_PAGE_SIZE
     anchor = datetime.fromisoformat(scope["source_window_earliest_at"].replace("Z", "+00:00"))
     last_error: Exception | None = None
     for attempt in range(config.MAX_RETRIES + 1):
         if physical_attempts[0] >= physical_limit:
-            raise DiscoveryError("LinkedIn physical HTTP-attempt budget exhausted")
-        grant = gate.acquire("search", f"{scope['scope_key']}:{page_number}:{attempt}")
+            raise RetryableDiscoveryInterruption(
+                "LinkedIn physical HTTP-attempt budget exhausted"
+            )
+        grant = gate.acquire(
+            "search",
+            f"{scope['scope_key']}:{page_number}:{attempt}",
+            deadline=deadline,
+        )
         lookback_seconds = max(1, math.ceil((grant.started_at - anchor).total_seconds()))
         if (maximum_lookback_seconds is not None
                 and lookback_seconds > maximum_lookback_seconds):
@@ -252,7 +271,14 @@ def _request_page(
         started = time.monotonic()
         response = None
         try:
-            response = requests.get(url, headers={"User-Agent": user_agent}, timeout=config.REQUEST_TIMEOUT)
+            request_timeout = config.REQUEST_TIMEOUT
+            if deadline is not None:
+                request_timeout = min(
+                    request_timeout, max(0.1, deadline - time.monotonic())
+                )
+            response = requests.get(
+                url, headers={"User-Agent": user_agent}, timeout=request_timeout
+            )
             kind, _soup, elements = classify_search_response(response)
             if kind == "challenge":
                 gate.open_circuit(grant, "LinkedIn denied or challenged search access", response.status_code)
@@ -262,12 +288,18 @@ def _request_page(
                 if response.status_code == 429 or 500 <= response.status_code < 600:
                     last_error = DiscoveryError(f"LinkedIn search HTTP {response.status_code}")
                     if attempt < config.MAX_RETRIES:
-                        time.sleep(max(
+                        retry_delay = max(
                             _retry_after_seconds(response) or 0,
                             config.RETRY_DELAY_SECONDS,
-                        ))
+                        )
+                        if deadline is not None and time.monotonic() + retry_delay >= deadline:
+                            raise RetryableDiscoveryInterruption(str(last_error))
+                        time.sleep(retry_delay)
                         continue
-                raise DiscoveryError(f"LinkedIn search HTTP {response.status_code}")
+                error = f"LinkedIn search HTTP {response.status_code}"
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    raise RetryableDiscoveryInterruption(error)
+                raise DiscoveryError(error)
             cards = [] if kind == "no_results" else _position_cards(
                 parse_cards(elements), page_number, page_start
             )
@@ -296,13 +328,21 @@ def _request_page(
             raise
         except LinkedInGrantRejected:
             raise
+        except LinkedInRequestDeadlineExceeded as exc:
+            raise RetryableDiscoveryInterruption(str(exc)) from exc
+        except RetryableDiscoveryInterruption:
+            raise
         except requests.RequestException as exc:
             gate.finish(grant, "transport_error", None)
             last_error = exc
             if attempt < config.MAX_RETRIES:
+                if deadline is not None and time.monotonic() + config.RETRY_DELAY_SECONDS >= deadline:
+                    raise RetryableDiscoveryInterruption(str(exc)) from exc
                 time.sleep(config.RETRY_DELAY_SECONDS)
                 continue
-            raise DiscoveryError(f"LinkedIn search transport failed: {exc}") from exc
+            raise RetryableDiscoveryInterruption(
+                f"LinkedIn search transport failed: {exc}"
+            ) from exc
         except Exception:
             gate.finish(grant, "parser_error", getattr(response, "status_code", None))
             raise
@@ -317,18 +357,23 @@ def _scope_manifest(configuration: Any, executions: Sequence[Any], options: dict
     ]
     keys = [scope_key(definition) for definition in definitions]
     recovery_floor = now - timedelta(hours=options["recovery_cap"])
-    for key in keys:
-        supabase_utils.expire_linkedin_coverage_debt(key, recovery_floor.isoformat())
-    prior_states = supabase_utils.get_linkedin_scope_coverage_states(keys)
-    pending_debt = supabase_utils.get_pending_linkedin_coverage_debt(keys)
+    prepared = supabase_utils.prepare_linkedin_discovery_scope_state(
+        keys, recovery_floor.isoformat()
+    )
+    prior_states = prepared["states"]
+    pending_debt = prepared["debt"]
     configured_hours = min(
         options["recovery_cap"],
         max(configuration.settings.lookback_days * 24, config.LINKEDIN_LOOKBACK_HOURS),
     )
     manual_recovery = os.getenv("LINKEDIN_RECOVERY_LOOKBACK_HOURS")
+    manual_recovery_hours = None
     if manual_recovery:
         try:
-            configured_hours = min(options["recovery_cap"], max(1, int(manual_recovery)))
+            manual_recovery_hours = min(
+                options["recovery_cap"], max(1, int(manual_recovery))
+            )
+            configured_hours = manual_recovery_hours
         except ValueError as exc:
             raise DiscoveryError("LINKEDIN_RECOVERY_LOOKBACK_HOURS must be an integer") from exc
     manifests = []
@@ -351,6 +396,8 @@ def _scope_manifest(configuration: Any, executions: Sequence[Any], options: dict
             desired_hours = max(
                 options["minimum_window"], elapsed_hours + options["overlap"]
             )
+            if manual_recovery_hours is not None:
+                desired_hours = max(desired_hours, manual_recovery_hours)
             window_hours = min(options["maximum_window"], desired_hours)
             desired_earliest = now - timedelta(hours=desired_hours)
             selected_earliest = now - timedelta(hours=window_hours)
@@ -411,6 +458,33 @@ def _scope_manifest(configuration: Any, executions: Sequence[Any], options: dict
     return manifests
 
 
+def _resumable_scope_manifest(scope: dict[str, Any]) -> dict[str, Any]:
+    definition = scope.get("scope_definition")
+    if not isinstance(definition, dict):
+        raise DiscoveryError("resumable discovery scope omitted its definition")
+    work_types = definition.get("work_types")
+    if not isinstance(work_types, list):
+        raise DiscoveryError("resumable discovery scope has invalid work types")
+    return {
+        **scope,
+        "scope_definition": definition,
+        "archetype": definition["lane"],
+        "query_id": json.loads(scope["query_scope"])["query_id"],
+        "query": definition["query"],
+        "query_type": definition["query_type"],
+        "language": definition["language"],
+        "location": definition["location"],
+        "location_scope": definition["location_scope"],
+        "geography_id": definition["geography_id"],
+        "geo_id": definition.get("geo_id"),
+        "job_type": definition["job_type"],
+        "work_types": ",".join(str(value) for value in work_types),
+        "next_page": int(scope.get("next_page") or 1),
+        "status": "exhausted" if scope.get("latest_page_result") == "no_results" else scope.get("status", "running"),
+        "tail_yield": 0,
+    }
+
+
 def _drain_tasks(
     cycle_id: int,
     limit: int,
@@ -419,6 +493,7 @@ def _drain_tasks(
     detail_fetch: Callable[..., Any],
     save_details: Callable[[dict, str, dict], str],
     physical_limit: int | None = None,
+    deadline: float | None = None,
 ) -> list[str]:
     if limit <= 0 or (physical_limit is not None and physical_limit <= 0):
         return []
@@ -429,6 +504,8 @@ def _drain_tasks(
     newest_remaining = min(limit, 1 + math.ceil(max(0, limit - 1) * 0.2))
     physical_attempts = [0]
     while remaining > 0:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         if physical_limit is not None and physical_attempts[0] >= physical_limit:
             break
         order_mode = "newest" if newest_remaining > 0 else "oldest"
@@ -452,6 +529,7 @@ def _drain_tasks(
                     physical_attempts=physical_attempts,
                     physical_limit=physical_limit,
                     required_fields=("company", "job_title"),
+                    deadline=deadline,
                 )
                 if result is None:
                     supabase_utils.transition_linkedin_discovery_task(
@@ -534,13 +612,35 @@ def run_discovery(
     save_details: Callable[[dict, str, dict], str],
     partial: bool,
 ) -> DiscoveryResult:
+    run_started = time.monotonic()
     options = adaptive_options(configuration.settings)
     user_agent = os.getenv("LINKEDIN_USER_AGENT") or user_agents.USER_AGENTS[0]
-    manifests = _scope_manifest(configuration, executions, options)
-    if options["attempts"] < len(manifests) * options["minimum"]:
-        raise DiscoveryError(
-            "max_source_http_attempts_per_run cannot fund every required minimum page"
-        )
+    requested_scope_keys = [
+        scope_key(scope_definition(execution, config.LINKEDIN_JOB_TYPE, config.LINKEDIN_F_WT))
+        for execution in executions
+    ]
+    resumable = supabase_utils.get_resumable_linkedin_discovery_cycle(
+        partial=partial,
+        scope_keys=requested_scope_keys if partial else None,
+    )
+    if resumable:
+        cycle = resumable
+        user_agent = str(cycle["pinned_user_agent"])
+        manifests = [
+            _resumable_scope_manifest(scope) for scope in cycle["scopes"]
+        ]
+    else:
+        manifests = _scope_manifest(configuration, executions, options)
+        if options["attempts"] < len(manifests) * options["minimum"]:
+            raise DiscoveryError(
+                "max_source_http_attempts_per_run cannot fund every required minimum page"
+            )
+        for scope in manifests:
+            query_scope = json.loads(scope["query_scope"])
+            query_scope["partial"] = partial
+            scope["query_scope"] = json.dumps(
+                query_scope, sort_keys=True, separators=(",", ":")
+            )
     execution_key = (
         os.getenv("LINKEDIN_DISCOVERY_EXECUTION_ID")
         or os.getenv("GITHUB_RUN_ID")
@@ -550,23 +650,24 @@ def run_discovery(
         execution_id = str(uuid.UUID(execution_key))
     except ValueError:
         execution_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linkedin-discovery:{execution_key}"))
-    config_hash = configuration_hash(configuration)
-    for _ in range(10):
-        cycle = supabase_utils.create_linkedin_discovery_cycle(
-            execution_id=execution_id,
-            configuration_revision=configuration.revision,
-            configuration_hash=config_hash,
-            user_agent=user_agent,
-            scopes=manifests,
-        )
-        if cycle.get("search_status", "running") != "failed":
-            break
-        execution_id = str(uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"linkedin-discovery-recovery:{execution_id}:{cycle['cycle_id']}",
-        ))
-    else:
-        raise DiscoveryError("discovery recovery chain exceeded 10 failed executions")
+    if not resumable:
+        config_hash = configuration_hash(configuration)
+        for _ in range(10):
+            cycle = supabase_utils.create_linkedin_discovery_cycle(
+                execution_id=execution_id,
+                configuration_revision=configuration.revision,
+                configuration_hash=config_hash,
+                user_agent=user_agent,
+                scopes=manifests,
+            )
+            if cycle.get("search_status", "running") != "failed":
+                break
+            execution_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"linkedin-discovery-recovery:{execution_id}:{cycle['cycle_id']}",
+            ))
+        else:
+            raise DiscoveryError("discovery recovery chain exceeded 10 failed executions")
     cycle_id = cycle["cycle_id"]
     sequence = int(cycle["discovery_sequence"])
     cycle_status = cycle.get("search_status", "running")
@@ -592,6 +693,7 @@ def run_discovery(
             physical_attempts=physical_attempts,
             physical_limit=options["attempts"],
             maximum_lookback_seconds=options["recovery_cap"] * 3600,
+            deadline=run_started + options["search_runtime"],
         )
         receipt = supabase_utils.commit_linkedin_discovery_page({
             **page,
@@ -627,77 +729,76 @@ def run_discovery(
                 detail_fetch=detail_fetch,
                 save_details=save_details,
                 physical_limit=options["detail_attempts"],
+                deadline=(
+                    run_started
+                    + options["search_runtime"]
+                    + options["detail_runtime"]
+                ),
             )
             if not partial:
                 supabase_utils.resolve_eligible_failed_linkedin_discovery_cycles(cycle_id)
             return DiscoveryResult(cycle_id, sequence, tuple(saved), not partial)
-        while True:
-            minimum_round = [
-                scope for scope in manifests
-                if scope["status"] == "running"
-                and scope["next_page"] <= scope["minimum_pages"]
-            ]
-            if not minimum_round:
-                break
-            for scope in minimum_round:
-                fetch_commit(scope)
-        committed_extensions = sum(
-            max(0, int(scope.get("committed_page_count") or 0) - scope["minimum_pages"])
-            for scope in manifests
-        )
-        extras = max(0, options["extra"] - committed_extensions)
-        while extras > 0:
-            eligible = [
-                scope for scope in manifests
-                if scope["status"] == "running"
-                and scope["next_page"] <= scope["target_pages"]
-            ]
+        for scope in manifests:
+            if scope["status"] == "exhausted":
+                supabase_utils.finish_linkedin_discovery_scope(
+                    scope["ingestion_run_id"],
+                    "exhausted",
+                    coverage_reason="positive no-results response",
+                )
+                scope["status"] = "complete"
+        search_deadline = run_started + options["search_runtime"]
+        search_interrupted = False
+        while (
+            physical_attempts[0] < options["attempts"]
+            and time.monotonic() < search_deadline
+        ):
+            eligible = [scope for scope in manifests if scope["status"] == "running"]
             if not eligible:
                 break
-            eligible.sort(key=lambda row: (
-                row["coverage_debt_created_at"] is None,
-                row["last_deep_sweep_at"] is not None,
-                row["last_deep_sweep_at"] or "",
-                row["coverage_debt_created_at"] or "",
-                -row["tail_yield"],
-                row["scope_key"],
-            ))
-            recovery_pages_needed = (
-                eligible[0]["target_pages"] - eligible[0]["next_page"] + 1
-            )
-            if (eligible[0]["coverage_debt_created_at"] is not None
-                    and extras >= recovery_pages_needed):
-                scope = eligible[0]
-                while (
-                    extras > 0
-                    and scope["status"] == "running"
-                    and scope["next_page"] <= scope["target_pages"]
-                ):
-                    fetch_commit(scope)
-                    extras -= 1
-                continue
+            eligible.sort(key=lambda row: (row["next_page"], row["scope_key"]))
+            made_progress = False
             for scope in eligible:
-                if extras <= 0:
+                if (
+                    physical_attempts[0] >= options["attempts"]
+                    or time.monotonic() >= search_deadline
+                ):
                     break
-                fetch_commit(scope)
-                extras -= 1
-        for scope in manifests:
-            if scope["status"] == "complete":
-                continue
-            coverage = scope["status"] if scope["status"] == "exhausted" else "right_censored"
-            supabase_utils.finish_linkedin_discovery_scope(
-                scope["ingestion_run_id"],
-                coverage,
-                coverage_reason=(
-                    "positive no-results response"
-                    if coverage == "exhausted"
-                    else "adaptive target or global extension budget reached"
-                ),
+                try:
+                    fetch_commit(scope)
+                except (RetryableDiscoveryInterruption, LinkedInCircuitOpen) as exc:
+                    logging.warning(
+                        "Discovery cycle %s remains resumable after source interruption: %s",
+                        cycle_id,
+                        exc,
+                    )
+                    search_interrupted = True
+                    break
+                made_progress = True
+                if scope["status"] == "exhausted":
+                    supabase_utils.finish_linkedin_discovery_scope(
+                        scope["ingestion_run_id"],
+                        "exhausted",
+                        coverage_reason="positive no-results response",
+                    )
+                    scope["status"] = "complete"
+            if search_interrupted or not made_progress:
+                break
+        coverage_complete = all(scope["status"] == "complete" for scope in manifests)
+        if coverage_complete:
+            sealed = supabase_utils.seal_linkedin_discovery_cycle(
+                cycle_id, advance_watermark=not partial
             )
-        supabase_utils.seal_linkedin_discovery_cycle(
-            cycle_id, advance_watermark=not partial
-        )
-        if not partial:
+        else:
+            sealed = {"watermark_advanced": False}
+            logging.info(
+                "Discovery cycle %s remains resumable: completed_scopes=%s/%s "
+                "pages_this_run=%s",
+                cycle_id,
+                sum(scope["status"] == "complete" for scope in manifests),
+                len(manifests),
+                physical_attempts[0],
+            )
+        if coverage_complete and not partial:
             supabase_utils.resolve_eligible_failed_linkedin_discovery_cycles(cycle_id)
     except Exception as exc:
         supabase_utils.fail_linkedin_discovery_cycle(cycle_id, str(exc))
@@ -710,7 +811,15 @@ def run_discovery(
         detail_fetch=detail_fetch,
         save_details=save_details,
         physical_limit=options["detail_attempts"],
+        deadline=(
+            run_started + options["search_runtime"] + options["detail_runtime"]
+        ),
     )
-    if not partial:
+    if coverage_complete and not partial:
         supabase_utils.resolve_eligible_failed_linkedin_discovery_cycles(cycle_id)
-    return DiscoveryResult(cycle_id, sequence, tuple(saved), not partial)
+    return DiscoveryResult(
+        cycle_id,
+        sequence,
+        tuple(saved),
+        bool(sealed.get("watermark_advanced")) if coverage_complete else False,
+    )

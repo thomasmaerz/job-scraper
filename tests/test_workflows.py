@@ -42,10 +42,15 @@ def test_scrape_workflow_exports_only_manual_recovery_lookback():
     assert "LINKEDIN_RECOVERY_LOOKBACK_HOURS=${REQUESTED_LOOKBACK_HOURS}" in recovery_step["run"]
 
 
-def test_scrape_workflow_allows_multi_lane_serial_runtime():
+def test_hourly_pipeline_has_a_bounded_total_runtime():
     hourly = load_workflow("scrape_jobs.yml")
 
-    assert hourly["jobs"]["scrape"]["timeout-minutes"] == 180
+    timeouts = [
+        hourly["jobs"][name]["timeout-minutes"]
+        for name in ("scrape", "freehire_compat", "publication_gate")
+    ]
+    assert timeouts == [40, 12, 5]
+    assert sum(timeouts) < 60
 
 
 def test_scoring_and_resume_workflows_have_defense_in_depth_concurrency_groups():
@@ -91,7 +96,7 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
         "actions": "read",
         "contents": "read",
     }
-    assert workflow["jobs"]["scrape"]["timeout-minutes"] == 180
+    assert workflow["jobs"]["scrape"]["timeout-minutes"] == 40
 
     recovery_step = next(
         step
@@ -118,11 +123,11 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
         "${{ inputs.archetype == '' || inputs.archetype == null }}"
     )
     assert jobs["publication_gate"]["needs"] == ["scrape", "freehire_compat"]
-    assert jobs["freehire_compat"]["timeout-minutes"] == 45
-    assert jobs["publication_gate"]["timeout-minutes"] == 10
+    assert jobs["freehire_compat"]["timeout-minutes"] == 12
+    assert jobs["publication_gate"]["timeout-minutes"] == 5
 
     compat_step = jobs["freehire_compat"]["steps"][-1]
-    assert compat_step["env"]["FREEHIRE_CLASSIFY_LIMIT"] == "300"
+    assert compat_step["env"]["FREEHIRE_CLASSIFY_LIMIT"] == "100"
     assert compat_step["env"]["FREEHIRE_DRAIN_BACKLOG"] == "false"
     assert compat_step["run"] == "python incremental_freehire_compat.py"
 

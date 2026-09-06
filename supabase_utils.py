@@ -709,6 +709,19 @@ def get_canonical_candidates(provider: str, page_size: int = 1000) -> list[dict]
         offset += page_size
 
 
+def get_canonical_provider_revision(provider: str, *, db: Any = None) -> str:
+    client = db or supabase
+    response = client.rpc("get_canonical_provider_revision", {
+        "p_provider": provider,
+    }).execute()
+    value = response.data
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise RuntimeError("get_canonical_provider_revision returned an invalid response")
+    return value
+
+
 def _membership_provenance(job: dict, archetype: str) -> dict:
     query_scope = job.get("query_scope")
     if isinstance(query_scope, str):
@@ -832,37 +845,57 @@ class CanonicalRunContext:
     existing_job_ids_by_provider: dict[str, set[str]] = field(default_factory=dict)
     company_title_keys_by_provider: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
     canonical_by_source_by_provider: dict[str, dict[str, str]] = field(default_factory=dict)
+    candidate_set_revision_by_provider: dict[str, str] = field(default_factory=dict)
     _load_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def _install_candidates(self, provider: str, candidates: list[dict]) -> None:
+        existing_job_ids: set[str] = set()
+        company_title_keys: set[tuple[str, str]] = set()
+        canonical_by_source: dict[str, str] = {}
+        for candidate in candidates:
+            canonical_id = normalize_job_identifier(candidate.get("job_id"))
+            source_ids = _candidate_source_ids(candidate)
+            existing_job_ids.update(source_ids)
+            if canonical_id is not None:
+                canonical_by_source.update(
+                    {source_id: canonical_id for source_id in source_ids}
+                )
+            company = candidate.get("company")
+            job_title = candidate.get("job_title")
+            if company and job_title:
+                company_title_keys.add(
+                    (company.strip().lower(), job_title.strip().lower())
+                )
+        self.existing_job_ids_by_provider[provider] = existing_job_ids
+        self.company_title_keys_by_provider[provider] = company_title_keys
+        self.canonical_by_source_by_provider[provider] = canonical_by_source
+        self.candidates_by_provider[provider] = candidates
 
     def candidates_for(self, provider: str) -> list[dict]:
         if provider not in self.candidates_by_provider:
             with self._load_lock:
                 if provider not in self.candidates_by_provider:
                     candidates = get_canonical_candidates(provider=provider)
-                    existing_job_ids: set[str] = set()
-                    company_title_keys: set[tuple[str, str]] = set()
-                    canonical_by_source: dict[str, str] = {}
-                    for candidate in candidates:
-                        canonical_id = normalize_job_identifier(candidate.get("job_id"))
-                        source_ids = _candidate_source_ids(candidate)
-                        existing_job_ids.update(source_ids)
-                        if canonical_id is not None:
-                            canonical_by_source.update(
-                                {source_id: canonical_id for source_id in source_ids}
-                            )
-                        company = candidate.get("company")
-                        job_title = candidate.get("job_title")
-                        if company and job_title:
-                            company_title_keys.add(
-                                (company.strip().lower(), job_title.strip().lower())
-                            )
-                    self.existing_job_ids_by_provider[provider] = existing_job_ids
-                    self.company_title_keys_by_provider[provider] = company_title_keys
-                    self.canonical_by_source_by_provider[provider] = canonical_by_source
-                    # Publish last so racing readers cannot observe an
-                    # initialized snapshot with incomplete derived indexes.
-                    self.candidates_by_provider[provider] = candidates
+                    self._install_candidates(provider, candidates)
         return self.candidates_by_provider[provider]
+
+    def consistent_candidates_for(self, provider: str) -> tuple[list[dict], str]:
+        with self._load_lock:
+            if provider not in self.candidate_set_revision_by_provider:
+                for _attempt in range(3):
+                    before = get_canonical_provider_revision(provider)
+                    candidates = get_canonical_candidates(provider=provider)
+                    after = get_canonical_provider_revision(provider)
+                    if before == after:
+                        self._install_candidates(provider, candidates)
+                        self.candidate_set_revision_by_provider[provider] = after
+                        break
+                else:
+                    raise RuntimeError("canonical candidate snapshot changed while loading")
+            return (
+                self.candidates_by_provider[provider],
+                self.candidate_set_revision_by_provider[provider],
+            )
 
     def existing_indexes(self, provider: str) -> tuple[set[str], set[tuple[str, str]]]:
         self.candidates_for(provider)
@@ -906,6 +939,7 @@ class CanonicalRunContext:
             self.existing_job_ids_by_provider.pop(provider, None)
             self.company_title_keys_by_provider.pop(provider, None)
             self.canonical_by_source_by_provider.pop(provider, None)
+            self.candidate_set_revision_by_provider.pop(provider, None)
 
 
 class CanonicalTaskApplyAmbiguous(RuntimeError):
@@ -918,25 +952,6 @@ class CanonicalTaskLeaseLost(RuntimeError):
 
 class CanonicalTaskReceiptConflict(RuntimeError):
     pass
-
-
-def _provider_candidate_set_revision(candidates: Sequence[Mapping[str, Any]]) -> str:
-    canonical_revisions = {}
-    for candidate in candidates:
-        canonical_id = normalize_job_identifier(candidate.get("job_id"))
-        if canonical_id is None:
-            continue
-        revision = int(candidate.get("canonical_revision") or 0)
-        if revision < 0:
-            raise ValueError("canonical candidate revision must be non-negative")
-        canonical_revisions[canonical_id] = str(revision)
-    ordered_ids = sorted(canonical_revisions, key=lambda value: value.encode("utf-8"))
-    revision_input = "".join(
-        f"{len(job_id.encode('utf-8'))}:{job_id}"
-        f"{len(canonical_revisions[job_id].encode('utf-8'))}:{canonical_revisions[job_id]}"
-        for job_id in ordered_ids
-    )
-    return hashlib.sha256(revision_input.encode("utf-8")).hexdigest()
 
 
 def _exact_source_candidate(job_id: str, candidates: list[dict]) -> dict | None:
@@ -1022,7 +1037,7 @@ def build_linkedin_discovery_task_application(
         raise ValueError("adaptive discovery task is missing its ingestion run")
     prepared_job["scrape_run_id"] = ingestion_run_id
 
-    candidates = run_context.candidates_for(provider)
+    candidates, candidate_set_revision = run_context.consistent_candidates_for(provider)
     match = (
         find_canonical_match(prepared_job, candidates)
         if getattr(config, "ENABLE_REPOST_DEDUP", True)
@@ -1125,8 +1140,8 @@ def build_linkedin_discovery_task_application(
         raise ValueError("adaptive discovery membership provenance revision must be non-negative")
 
     return {
-        "version": "linkedin-canonical-task-apply-v3",
-        "provider_candidate_set_revision": _provider_candidate_set_revision(candidates),
+        "version": "linkedin-canonical-task-apply-v4",
+        "provider_candidate_set_revision": candidate_set_revision,
         "membership_provenance_revision": membership_provenance_revision,
         "source": {
             "provider": provider,
@@ -1190,6 +1205,7 @@ def _refresh_context_after_task_apply(
     application: Mapping[str, Any],
     returned_canonical_job_id: str,
     returned_canonical_revision: Any,
+    returned_candidate_set_revision: Any,
 ) -> None:
     canonical = application["canonical"]
     planned_id = str(canonical["canonical_job_id"])
@@ -1205,10 +1221,18 @@ def _refresh_context_after_task_apply(
     if canonical_revision < 0:
         run_context.invalidate_provider("linkedin")
         return
+    if not isinstance(returned_candidate_set_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", returned_candidate_set_revision
+    ):
+        run_context.invalidate_provider("linkedin")
+        return
     payload["canonical_revision"] = canonical_revision
     if canonical["action"] == "insert":
         payload["job_id"] = returned_canonical_job_id
         run_context.add_candidate("linkedin", payload)
+        run_context.candidate_set_revision_by_provider["linkedin"] = (
+            returned_candidate_set_revision
+        )
         return
     candidates = run_context.candidates_for("linkedin")
     candidate = next(
@@ -1220,6 +1244,9 @@ def _refresh_context_after_task_apply(
         return
     candidate.update(payload)
     run_context.refresh_candidate("linkedin", candidate)
+    run_context.candidate_set_revision_by_provider["linkedin"] = (
+        returned_candidate_set_revision
+    )
 
 
 def apply_linkedin_discovery_task_canonical(
@@ -1305,6 +1332,7 @@ def apply_linkedin_discovery_task_canonical(
             _refresh_context_after_task_apply(
                 run_context, application, canonical_job_id,
                 result.get("canonical_revision"),
+                result.get("provider_candidate_set_revision"),
             )
         return canonical_job_id
     raise RuntimeError("canonical task application exhausted stale-plan retries")
@@ -1500,6 +1528,55 @@ def create_linkedin_discovery_cycle(
     if not isinstance(record.get("cycle_id"), int) or not isinstance(record.get("scopes"), list):
         raise RuntimeError("create_linkedin_discovery_cycle returned an incomplete response")
     return record
+
+
+def get_resumable_linkedin_discovery_cycle(
+    *, partial: bool, scope_keys: list[str] | None = None, db: Any = None
+) -> dict[str, Any] | None:
+    client = db or supabase
+    response = client.rpc("get_resumable_linkedin_discovery_cycle", {
+        "p_partial": partial,
+        "p_scope_keys": scope_keys,
+    }).execute()
+    if response.data is None:
+        return None
+    record = _single_rpc_record(
+        response.data, "get_resumable_linkedin_discovery_cycle"
+    )
+    if not record:
+        return None
+    if not isinstance(record.get("cycle_id"), int) or not isinstance(
+        record.get("scopes"), list
+    ):
+        raise RuntimeError(
+            "get_resumable_linkedin_discovery_cycle returned an incomplete response"
+        )
+    return record
+
+
+def prepare_linkedin_discovery_scope_state(
+    scope_keys: list[str], recovery_floor: str, *, db: Any = None
+) -> dict[str, dict[str, dict[str, Any]]]:
+    if not scope_keys:
+        return {"states": {}, "debt": {}}
+    client = db or supabase
+    response = client.rpc("prepare_linkedin_discovery_scope_state", {
+        "p_scope_keys": scope_keys,
+        "p_recovery_floor": recovery_floor,
+    }).execute()
+    record = _single_rpc_record(
+        response.data, "prepare_linkedin_discovery_scope_state"
+    )
+    states = record.get("states") or []
+    debt = record.get("debt") or []
+    if not isinstance(states, list) or not isinstance(debt, list):
+        raise RuntimeError(
+            "prepare_linkedin_discovery_scope_state returned invalid rows"
+        )
+    return {
+        "states": {str(row["scope_key"]): dict(row) for row in states},
+        "debt": {str(row["scope_key"]): dict(row) for row in debt},
+    }
 
 
 def get_linkedin_scope_coverage_states(

@@ -4498,7 +4498,14 @@ DECLARE
 BEGIN
     SELECT cycle.* INTO cycle_row
     FROM public.linkedin_discovery_cycles cycle
-    WHERE cycle.search_status = 'running'
+    WHERE (
+          cycle.search_status = 'running'
+          OR (
+              NOT p_partial
+              AND cycle.search_status = 'sealed'
+              AND cycle.canonical_status = 'pending'
+          )
+      )
       AND EXISTS (
           SELECT 1
           FROM public.linkedin_discovery_cycle_scopes scope
@@ -4518,7 +4525,10 @@ BEGIN
               ORDER BY requested.scope_key
           )
       )
-    ORDER BY cycle.discovery_sequence
+    ORDER BY
+        CASE WHEN cycle.search_status = 'running' THEN 0 ELSE 1 END,
+        CASE WHEN cycle.search_status = 'running' THEN cycle.discovery_sequence END,
+        CASE WHEN cycle.search_status = 'sealed' THEN cycle.discovery_sequence END DESC
     LIMIT 1;
     IF cycle_row.id IS NULL THEN
         RETURN NULL;

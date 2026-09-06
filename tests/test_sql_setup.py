@@ -129,6 +129,22 @@ def test_init_snapshot_contains_current_adaptive_linkedin_migration():
     assert snapshot == migration_body
 
 
+def test_resumable_discovery_drains_latest_sealed_cycle_before_new_search():
+    for path in (
+        ROOT / "supabase_setup" / "add_adaptive_linkedin_discovery.sql",
+        ROOT / "supabase_setup" / "init.sql",
+    ):
+        body = _function_body(
+            path.read_text(), "get_resumable_linkedin_discovery_cycle"
+        )
+        assert "cycle.search_status='sealed'" in body
+        assert "cycle.canonical_status='pending'" in body
+        assert (
+            "CASEWHENcycle.search_status='sealed'THEN"
+            "cycle.discovery_sequenceENDDESC"
+        ) in body
+
+
 def test_resumable_discovery_has_a_forward_production_migration():
     sql = (ROOT / "supabase_setup" / "resume_exhaustive_linkedin_discovery.sql").read_text().lower()
 

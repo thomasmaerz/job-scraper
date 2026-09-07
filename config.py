@@ -58,14 +58,11 @@ ARCHETYPE_CONFIGS = {
         "location": LINKEDIN_LOCATION,
         "filter_profile": "software_tpm_v1",
         "search_queries": [
-            "IT Project Manager",
-            "Technical Project Manager",
-            "Information Technology Project Manager",
-            "Technical Program Manager",
+            "technical program delivery manager",
+            "IT technology project manager",
+            "gestionnaire de projet informatique TI",
         ],
-        "company_blocklist": [
-            r"jobgether",
-        ],
+        "company_blocklist": [],
         "title_blocklist": [
             r"\bconstruction\b",
             r"\bland development\b",
@@ -79,7 +76,6 @@ ARCHETYPE_CONFIGS = {
             r"\bCNS\b",
         ],
         "title_entry_level_blocklist": [
-            r"\bcoordinator\b",
             r"\bjr\.?\s+(project|program)\b",
             r"\bjunior\b",
             r"\bassistant project manager\b",

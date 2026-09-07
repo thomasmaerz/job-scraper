@@ -238,7 +238,6 @@ BEGIN
               )
           )
       )
-      AND (freehire_compat_input_hash IS NULL OR freehire_compat_input_hash = p_expected_input_hash)
       AND p_expected_source_snapshot <@ to_jsonb(j);
     GET DIAGNOSTICS affected = ROW_COUNT;
     RETURN affected = 1;

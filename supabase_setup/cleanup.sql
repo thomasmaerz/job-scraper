@@ -55,6 +55,7 @@ DROP TABLE IF EXISTS "public"."base_resume" CASCADE;
 DROP FUNCTION IF EXISTS "public"."claim_freehire_compat_jobs"(jsonb, text, timestamptz) CASCADE;
 DROP FUNCTION IF EXISTS "public"."persist_freehire_compat_results"(jsonb, text) CASCADE;
 DROP FUNCTION IF EXISTS "public"."apply_freehire_compat_metadata_batch"(jsonb) CASCADE;
+DROP FUNCTION IF EXISTS "public"."claim_freehire_compat_job"(text, text, jsonb, text, timestamptz) CASCADE;
 DROP FUNCTION IF EXISTS "public"."replace_job_keyword_facts_and_refresh_aggregates"(text[], text, jsonb) CASCADE;
 DROP FUNCTION IF EXISTS "public"."rebuild_keyword_insights_atomic"() CASCADE;
 DROP FUNCTION IF EXISTS "public"."get_applied_jobs_sorted"(integer, integer) CASCADE;

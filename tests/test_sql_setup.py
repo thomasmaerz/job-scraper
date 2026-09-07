@@ -838,6 +838,16 @@ def test_freehire_batch_rpc_migration_is_private_and_uses_fenced_single_row_writ
     assert normalized.rstrip().endswith("commit;")
 
 
+def test_freehire_claim_allows_eligible_rows_to_replace_obsolete_input_hashes():
+    sql = (
+        ROOT / "supabase_setup" / "allow_freehire_compatibility_reclassification.sql"
+    ).read_text()
+    body = _function_body(sql, "claim_freehire_compat_job")
+
+    assert "p_expected_source_snapshot<@to_jsonb(j)" in body
+    assert "freehire_compat_input_hashISNULLORfreehire_compat_input_hash=p_expected_input_hash" not in body
+
+
 def test_same_id_repair_rpc_has_jsonb_cas_and_service_role_only_execute():
     init = (ROOT / "supabase_setup" / "init.sql").read_text()
     migration = (ROOT / "supabase_setup" / "add_same_id_relist_tracking.sql").read_text()

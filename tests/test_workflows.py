@@ -49,8 +49,8 @@ def test_hourly_pipeline_has_a_bounded_total_runtime():
         hourly["jobs"][name]["timeout-minutes"]
         for name in ("scrape", "freehire_compat", "publication_gate")
     ]
-    assert timeouts == [40, 12, 5]
-    assert sum(timeouts) < 60
+    assert timeouts == [40, 45, 5]
+    assert sum(timeouts) <= 90
 
 
 def test_scoring_and_resume_workflows_have_defense_in_depth_concurrency_groups():
@@ -109,7 +109,7 @@ def test_hourly_pipeline_serializes_runs_and_preserves_manual_lookback():
     assert scrape_step["env"]["LINKEDIN_DISCOVERY_MODE"] == "adaptive_queue"
 
 
-def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
+def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_drains_compatibility():
     workflow = load_workflow("scrape_jobs.yml")
     jobs = workflow["jobs"]
 
@@ -123,12 +123,12 @@ def test_hourly_pipeline_has_separate_strictly_dependent_jobs_and_caps():
         "${{ inputs.archetype == '' || inputs.archetype == null }}"
     )
     assert jobs["publication_gate"]["needs"] == ["scrape", "freehire_compat"]
-    assert jobs["freehire_compat"]["timeout-minutes"] == 12
+    assert jobs["freehire_compat"]["timeout-minutes"] == 45
     assert jobs["publication_gate"]["timeout-minutes"] == 5
 
     compat_step = jobs["freehire_compat"]["steps"][-1]
-    assert compat_step["env"]["FREEHIRE_CLASSIFY_LIMIT"] == "100"
-    assert compat_step["env"]["FREEHIRE_DRAIN_BACKLOG"] == "false"
+    assert compat_step["env"]["FREEHIRE_CLASSIFY_PAGE_SIZE"] == "500"
+    assert "FREEHIRE_CLASSIFY_LIMIT" not in compat_step["env"]
     assert compat_step["run"] == "python incremental_freehire_compat.py"
 
     analyze = load_workflow("analyze_jobs.yml")
@@ -174,7 +174,7 @@ def test_timezone_schedule_preserves_wall_clock_hours_across_dst():
     assert (summer.hour, summer.minute) == (21, 5)
 
 
-def test_freehire_recovery_is_manual_bounded_and_dry_run_by_default():
+def test_freehire_recovery_is_manual_batched_and_dry_run_by_default():
     workflow = load_workflow("freehire_compat.yml")
     event = triggers(workflow)
     inputs = event["workflow_dispatch"]["inputs"]
@@ -182,7 +182,7 @@ def test_freehire_recovery_is_manual_bounded_and_dry_run_by_default():
     assert "schedule" not in event
     assert workflow["concurrency"]["group"] == "linkedin-freehire-pipeline"
     assert workflow["permissions"] == {"contents": "read"}
-    assert inputs["limit"]["default"] == "1000"
+    assert inputs["limit"]["default"] == "500"
     assert "1000" in inputs["limit"]["options"]
     assert inputs["apply"]["default"] is False
     run = workflow["jobs"]["classify"]["steps"][-1]["run"]

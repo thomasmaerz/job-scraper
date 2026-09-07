@@ -133,33 +133,46 @@ def _expired_claim(row: dict) -> bool:
     return claimed_at < datetime.now(timezone.utc) - timedelta(minutes=30)
 
 
-def _claim(
+def _rpc_job_ids(data) -> set[str]:
+    if not data:
+        return set()
+    if isinstance(data, dict):
+        data = [data]
+    return {
+        str(row.get("job_id") if isinstance(row, dict) else row)
+        for row in data
+        if row is not None
+    }
+
+
+def _claim_many(
     db,
-    row: dict,
+    rows: list[dict],
     worker_id: str,
     replacement_before: datetime | None = None,
-) -> bool:
-    params = {
-        "p_job_id": str(row["job_id"]),
-        "p_expected_input_hash": freehire_compat.compute_classification_hash(row),
-        "p_expected_source_snapshot": freehire_compat.source_snapshot(row),
-        "p_worker_id": worker_id,
-    }
+) -> set[str]:
+    claims = [{
+        "job_id": str(row["job_id"]),
+        "expected_input_hash": freehire_compat.compute_classification_hash(row),
+        "expected_source_snapshot": freehire_compat.source_snapshot(row),
+    } for row in rows]
+    params = {"p_claims": claims, "p_worker_id": worker_id}
     if replacement_before is not None:
         params["p_replacement_before"] = replacement_before.isoformat()
-    response = db.rpc("claim_freehire_compat_job", params).execute()
-    return response.data is True or response.data == [True]
+    return _rpc_job_ids(db.rpc("claim_freehire_compat_jobs", params).execute().data)
 
 
-def _persist(db, job_id: str, input_hash: str, payload: dict, worker_id: str) -> bool:
-    response = db.rpc("persist_freehire_compat_result", {
-        "p_job_id": job_id,
-        "p_expected_input_hash": input_hash,
-        "p_expected_source_snapshot": payload.pop("_expected_source_snapshot"),
+def _persist_many(db, results: list[dict], worker_id: str) -> set[str]:
+    return _rpc_job_ids(db.rpc("persist_freehire_compat_results", {
+        "p_results": results,
         "p_worker_id": worker_id,
-        "p_payload": payload,
-    }).execute()
-    return response.data is True or response.data == [True]
+    }).execute().data)
+
+
+def _apply_metadata_many(db, updates: list[dict]) -> set[str]:
+    return _rpc_job_ids(db.rpc("apply_freehire_compat_metadata_batch", {
+        "p_updates": updates,
+    }).execute().data)
 
 
 def _retry_ready(row: dict) -> bool:
@@ -208,6 +221,40 @@ def run(
         from llm_client import freehire_classify_client
 
         client = freehire_classify_client
+    if drain_backlog and not replacement_backfill:
+        page_limit = limit or config.FREEHIRE_CLASSIFY_PAGE_SIZE
+        total = None
+        while True:
+            page_result = run(
+                apply=apply,
+                limit=page_limit,
+                drain_backlog=False,
+                db=db,
+                client=client,
+            )
+            if total is None:
+                total = {key: 0 for key in page_result}
+            for key, value in page_result.items():
+                total[key] += value
+            if not apply or page_result["scanned"] == 0:
+                break
+            progress = (
+                page_result["classified"]
+                + page_result["failed"]
+                + page_result["metadata_updated"]
+            )
+            if progress == 0:
+                logging.warning(
+                    "Freehire compatibility drain stopped because no candidate made progress"
+                )
+                break
+        return total or {
+            "scanned": 0, "unchanged": 0, "metadata_updated": 0,
+            "would_classify": 0, "classified": 0, "failed": 0,
+            "claimed_elsewhere": 0, "cooldown_or_exhausted": 0,
+            "remote_true": 0, "remote_false": 0, "llm_requests": 0,
+            "retries": 0, "splits": 0,
+        }
     limit = limit or config.FREEHIRE_CLASSIFY_LIMIT
     counts = {
         "scanned": 0,
@@ -230,6 +277,7 @@ def run(
     upper_bound = get_upper_bound(db) if full_scan else None
     last_job_id = None
     pending: list[dict] = []
+    metadata_updates: list[dict] = []
     while True:
         if full_scan:
             if upper_bound is None:
@@ -271,17 +319,18 @@ def run(
                 counts["unchanged"] += 1
                 continue
             if current:
-                counts["metadata_updated"] += 1
                 if apply:
-                    db.rpc("apply_freehire_compat_metadata", {
-                        "p_job_id": str(row["job_id"]),
-                        "p_expected_source_snapshot": freehire_compat.source_snapshot(row),
-                        "p_payload": {
+                    metadata_updates.append({
+                        "job_id": str(row["job_id"]),
+                        "expected_source_snapshot": freehire_compat.source_snapshot(row),
+                        "payload": {
                             "is_remote": is_remote,
                             "freehire_remote_evidence": evidence,
                             "freehire_compat_import_hash": import_hash,
                         },
-                    }).execute()
+                    })
+                else:
+                    counts["metadata_updated"] += 1
                 continue
             if row.get("freehire_compat_status") == "processing" and not _expired_claim(row):
                 counts["claimed_elsewhere"] += 1
@@ -298,30 +347,18 @@ def run(
         if len(page) < config.FREEHIRE_CLASSIFY_PAGE_SIZE:
             break
 
+    if apply and metadata_updates:
+        applied_metadata = _apply_metadata_many(db, metadata_updates)
+        counts["metadata_updated"] += len(applied_metadata)
+        counts["claimed_elsewhere"] += len(metadata_updates) - len(applied_metadata)
+
     if not apply or not pending:
         return counts
 
     worker_id = str(uuid.uuid4())
-    request_budget = config.FREEHIRE_CLASSIFY_REQUEST_BUDGET
     for pending_batch in freehire_compat.pack_batches(pending, model=freehire_compat.model_name(client)):
-        if request_budget <= 0:
-            break
-        claimed = [
-            row for row in pending_batch
-            if _claim(db, row, worker_id, replacement_cutoff)
-        ]
-        batch = []
-        for claimed_row in claimed:
-            fresh = (
-                db.table(config.SUPABASE_TABLE_NAME)
-                .select(SELECT_FIELDS)
-                .eq("job_id", str(claimed_row["job_id"]))
-                .eq("freehire_compat_status", "processing")
-                .limit(1)
-                .execute().data or []
-            )
-            if fresh:
-                batch.append(fresh[0])
+        claimed_ids = _claim_many(db, pending_batch, worker_id, replacement_cutoff)
+        batch = [row for row in pending_batch if str(row["job_id"]) in claimed_ids]
         counts["claimed_elsewhere"] += len(pending_batch) - len(batch)
         if not batch:
             continue
@@ -329,13 +366,13 @@ def run(
         outcome = freehire_compat.classify_batch(
             batch,
             client=client,
-            max_requests=request_budget,
         )
-        request_budget -= outcome.requests
         counts["llm_requests"] += outcome.requests
         counts["retries"] += outcome.retries
         counts["splits"] += outcome.splits
         by_id = {str(row["job_id"]): row for row in batch}
+        persistence = []
+        result_ids = set(outcome.results)
         for job_id, classification in outcome.results.items():
             row = by_id[job_id]
             attempts = int(row.get("freehire_compat_attempts") or 0) + 1
@@ -347,18 +384,26 @@ def run(
                 attempts=attempts,
                 result_model=outcome.result_models.get(job_id),
             )
-            payload["_expected_source_snapshot"] = freehire_compat.source_snapshot(row)
-            if _persist(db, job_id, freehire_compat.compute_classification_hash(row), payload, worker_id):
-                counts["classified"] += 1
-            else:
-                counts["claimed_elsewhere"] += 1
+            persistence.append({
+                "job_id": job_id,
+                "expected_input_hash": freehire_compat.compute_classification_hash(row),
+                "expected_source_snapshot": freehire_compat.source_snapshot(row),
+                "payload": payload,
+            })
         for job_id, error in outcome.failures.items():
             row = by_id[job_id]
             attempts = int(row.get("freehire_compat_attempts") or 0) + 1
             payload = freehire_compat.build_failure_payload(row, error, client=client, attempts=attempts)
-            payload["_expected_source_snapshot"] = freehire_compat.source_snapshot(row)
-            if _persist(db, job_id, freehire_compat.compute_classification_hash(row), payload, worker_id):
-                counts["failed"] += 1
+            persistence.append({
+                "job_id": job_id,
+                "expected_input_hash": freehire_compat.compute_classification_hash(row),
+                "expected_source_snapshot": freehire_compat.source_snapshot(row),
+                "payload": payload,
+            })
+        persisted = _persist_many(db, persistence, worker_id)
+        counts["classified"] += len(persisted & result_ids)
+        counts["failed"] += len(persisted - result_ids)
+        counts["claimed_elsewhere"] += len(persistence) - len(persisted)
 
     return counts
 

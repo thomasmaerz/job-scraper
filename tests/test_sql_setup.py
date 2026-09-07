@@ -808,11 +808,34 @@ def test_relist_and_freehire_security_and_snapshot_guards():
         "apply_linkedin_relist_projection",
         "apply_same_id_relist_repair",
         "claim_freehire_compat_job",
+        "claim_freehire_compat_jobs",
         "persist_freehire_compat_result",
+        "persist_freehire_compat_results",
         "apply_freehire_compat_metadata",
+        "apply_freehire_compat_metadata_batch",
         "jobs_invalidate_freehire_compat_input",
     ):
         assert required in init
+
+
+def test_freehire_batch_rpc_migration_is_private_and_uses_fenced_single_row_writers():
+    sql = (
+        ROOT / "supabase_setup" / "batch_freehire_compatibility.sql"
+    ).read_text()
+    normalized = re.sub(r"\s+", " ", sql.lower())
+
+    for function in (
+        "claim_freehire_compat_jobs",
+        "persist_freehire_compat_results",
+        "apply_freehire_compat_metadata_batch",
+    ):
+        assert f"create or replace function public.{function}" in normalized
+        assert f"revoke all on function public.{function}" in normalized
+    assert "public.claim_freehire_compat_job(" in normalized
+    assert "p_replacement_before timestamptz default null" in normalized
+    assert "public.persist_freehire_compat_result(" in normalized
+    assert "public.apply_freehire_compat_metadata(" in normalized
+    assert normalized.rstrip().endswith("commit;")
 
 
 def test_same_id_repair_rpc_has_jsonb_cas_and_service_role_only_execute():

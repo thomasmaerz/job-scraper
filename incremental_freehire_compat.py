@@ -6,25 +6,23 @@ import os
 import backfill_freehire_compat
 
 
-def classify_limit_from_env() -> int:
+def classify_page_size_from_env() -> int:
     try:
-        limit = int(os.getenv("FREEHIRE_CLASSIFY_LIMIT", "300"))
+        page_size = int(os.getenv("FREEHIRE_CLASSIFY_PAGE_SIZE", "500"))
     except ValueError as exc:
-        raise ValueError("FREEHIRE_CLASSIFY_LIMIT must be a positive integer") from exc
-    if limit <= 0:
-        raise ValueError("FREEHIRE_CLASSIFY_LIMIT must be a positive integer")
-    if limit > 300:
-        raise ValueError("FREEHIRE_CLASSIFY_LIMIT cannot exceed the hourly hard cap of 300")
-    return limit
+        raise ValueError("FREEHIRE_CLASSIFY_PAGE_SIZE must be a positive integer") from exc
+    if page_size <= 0:
+        raise ValueError("FREEHIRE_CLASSIFY_PAGE_SIZE must be a positive integer")
+    return page_size
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    limit = classify_limit_from_env()
+    page_size = classify_page_size_from_env()
     result = backfill_freehire_compat.run(
         apply=True,
-        limit=limit,
-        drain_backlog=os.getenv("FREEHIRE_DRAIN_BACKLOG", "false").lower() == "true",
+        limit=page_size,
+        drain_backlog=True,
     )
     logging.info(
         "Freehire compatibility status=%s stats=%s",

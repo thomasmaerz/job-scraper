@@ -103,16 +103,64 @@ class Db:
         self.updates = 0
         self.or_filters = []
         self.orders = []
+        self.rpc_names = []
 
     def table(self, name):
         assert name == "jobs"
         return Query(self)
 
     def rpc(self, name, params):
+        self.rpc_names.append(name)
         db = self
 
         class Rpc:
             def execute(self):
+                if name == "claim_freehire_compat_jobs":
+                    claimed = []
+                    for claim in params["p_claims"]:
+                        row = next(
+                            (item for item in db.rows if item["job_id"] == claim["job_id"]),
+                            None,
+                        )
+                        if row is None:
+                            continue
+                        row.update({
+                            "freehire_compat_status": "processing",
+                            "freehire_compat_input_hash": claim["expected_input_hash"],
+                            "freehire_compat_claimed_by": params["p_worker_id"],
+                        })
+                        db.updates += 1
+                        claimed.append({"job_id": row["job_id"]})
+                    return SimpleNamespace(data=claimed)
+                if name == "persist_freehire_compat_results":
+                    persisted = []
+                    for result in params["p_results"]:
+                        row = next(
+                            (item for item in db.rows if item["job_id"] == result["job_id"]),
+                            None,
+                        )
+                        if row is None or row.get("freehire_compat_claimed_by") != params["p_worker_id"]:
+                            continue
+                        row.update(result["payload"])
+                        db.updates += 1
+                        persisted.append({"job_id": row["job_id"]})
+                    return SimpleNamespace(data=persisted)
+                if name == "apply_freehire_compat_metadata_batch":
+                    applied = []
+                    for update in params["p_updates"]:
+                        row = next(
+                            (item for item in db.rows if item["job_id"] == update["job_id"]),
+                            None,
+                        )
+                        snapshot = update["expected_source_snapshot"]
+                        if row is None or any(
+                            row.get(key) != value for key, value in snapshot.items()
+                        ):
+                            continue
+                        row.update(update["payload"])
+                        db.updates += 1
+                        applied.append({"job_id": row["job_id"]})
+                    return SimpleNamespace(data=applied)
                 row = next((item for item in db.rows if item["job_id"] == params["p_job_id"]), None)
                 if row is None:
                     return SimpleNamespace(data=False)
@@ -198,6 +246,10 @@ def test_apply_is_resumable_and_unchanged_rerun_uses_zero_llm_calls():
     assert first_client.calls == 1
     assert db.rows[0]["job_id"] == "1"
     assert db.rows[0]["latest_job_id"] == "live"
+    assert db.rpc_names == [
+        "claim_freehire_compat_jobs",
+        "persist_freehire_compat_results",
+    ]
 
     second_client = Client()
     before_updates = db.updates
@@ -296,10 +348,59 @@ def test_non_drain_hard_caps_at_300_without_complete_keyset_scan(monkeypatch):
     assert result["would_classify"] == 300
 
 
-def test_hourly_incremental_worker_rejects_limit_above_300(monkeypatch):
-    monkeypatch.setenv("FREEHIRE_CLASSIFY_LIMIT", "301")
-    with pytest.raises(ValueError, match="hourly hard cap of 300"):
-        incremental_freehire_compat.classify_limit_from_env()
+def test_hourly_incremental_worker_accepts_batched_page_size_without_total_cap(monkeypatch):
+    monkeypatch.setenv("FREEHIRE_CLASSIFY_PAGE_SIZE", "500")
+
+    assert incremental_freehire_compat.classify_page_size_from_env() == 500
+
+
+def test_drain_backlog_repeats_batched_eligible_queries_until_empty(monkeypatch):
+    page_results = [
+        {
+            "scanned": 500, "unchanged": 0, "metadata_updated": 0,
+            "would_classify": 500, "classified": 500, "failed": 0,
+            "claimed_elsewhere": 0, "cooldown_or_exhausted": 0,
+            "remote_true": 0, "remote_false": 500, "llm_requests": 20,
+            "retries": 0, "splits": 0,
+        },
+        {
+            "scanned": 96, "unchanged": 0, "metadata_updated": 0,
+            "would_classify": 96, "classified": 96, "failed": 0,
+            "claimed_elsewhere": 0, "cooldown_or_exhausted": 0,
+            "remote_true": 0, "remote_false": 96, "llm_requests": 4,
+            "retries": 0, "splits": 0,
+        },
+        {
+            "scanned": 0, "unchanged": 0, "metadata_updated": 0,
+            "would_classify": 0, "classified": 0, "failed": 0,
+            "claimed_elsewhere": 0, "cooldown_or_exhausted": 0,
+            "remote_true": 0, "remote_false": 0, "llm_requests": 0,
+            "retries": 0, "splits": 0,
+        },
+    ]
+    original_run = backfill_freehire_compat.run
+
+    def fake_page_run(**kwargs):
+        assert kwargs["limit"] == 500
+        assert kwargs["drain_backlog"] is False
+        return page_results.pop(0)
+
+    monkeypatch.setattr(backfill_freehire_compat, "run", fake_page_run)
+    try:
+        result = original_run(
+            apply=True,
+            limit=500,
+            drain_backlog=True,
+            db=Db([]),
+            client=Client(),
+        )
+    finally:
+        monkeypatch.setattr(backfill_freehire_compat, "run", original_run)
+
+    assert result["scanned"] == 596
+    assert result["classified"] == 596
+    assert result["llm_requests"] == 24
+    assert page_results == []
 
 
 def test_capped_replacement_requires_cutoff_and_resumes_by_classified_timestamp():
